@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env*
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Neo4j local data
+neo4j_data/
+neo4j_logs/
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# User scan data
+data/scans/
+*.xml
+!data/samples/*.xml
+
+# Claude
+CLAUDE.md

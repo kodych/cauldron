@@ -1,0 +1,274 @@
+"""Import parsed scan results into Neo4j graph database.
+
+Key design principle: MERGE, don't CREATE.
+Re-importing the same scan updates existing nodes rather than creating duplicates.
+New scans from different sources enrich the graph incrementally.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+from datetime import datetime
+
+from neo4j import Session
+
+from cauldron.graph.connection import get_session, init_schema
+from cauldron.graph.models import Host, ScanResult, Service
+
+
+def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
+    """Import a complete scan result into Neo4j.
+
+    Args:
+        scan: Parsed scan result.
+        source_name: Name/IP of the scan source (where scan was run from).
+
+    Returns:
+        Dict with import statistics.
+    """
+    init_schema()
+
+    stats = {
+        "hosts_imported": 0,
+        "hosts_skipped": 0,
+        "services_imported": 0,
+        "segments_created": 0,
+        "relationships_created": 0,
+    }
+
+    source = source_name or scan.scan_source or "unknown"
+    timestamp = scan.start_time or datetime.now()
+
+    with get_session() as session:
+        # Create or update scan source
+        _upsert_scan_source(session, source, timestamp, scan.scan_args)
+
+        for host in scan.hosts_up:
+            if not host.ip:
+                stats["hosts_skipped"] += 1
+                continue
+
+            # Upsert host
+            _upsert_host(session, host, timestamp)
+            stats["hosts_imported"] += 1
+
+            # Link scan source to host
+            _link_scan_source(session, source, host.ip)
+            stats["relationships_created"] += 1
+
+            # Determine network segment and link
+            segment = _get_segment_cidr(host.ip)
+            if segment:
+                _upsert_segment(session, segment)
+                _link_host_to_segment(session, host.ip, segment)
+                stats["segments_created"] += 1  # may be duplicate, but that's ok for stats
+
+            # Upsert services
+            for service in host.services:
+                if service.state in ("open", "filtered"):
+                    _upsert_service(session, host.ip, service)
+                    stats["services_imported"] += 1
+
+            # Traceroute relationships
+            for hop in host.traceroute:
+                if hop.ip and hop.ip != host.ip:
+                    _upsert_traceroute_hop(session, host.ip, hop.ip, hop.ttl)
+                    stats["relationships_created"] += 1
+
+    return stats
+
+
+def _upsert_scan_source(session: Session, name: str, timestamp: datetime, args: str | None) -> None:
+    """Create or update a scan source node."""
+    session.run(
+        """
+        MERGE (s:ScanSource {name: $name})
+        ON CREATE SET s.first_seen = $ts, s.scan_args = $args
+        ON MATCH SET s.last_seen = $ts
+        """,
+        name=name,
+        ts=timestamp.isoformat(),
+        args=args,
+    )
+
+
+def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
+    """Create or update a host node."""
+    session.run(
+        """
+        MERGE (h:Host {ip: $ip})
+        ON CREATE SET
+            h.first_seen = $ts,
+            h.last_seen = $ts,
+            h.hostname = $hostname,
+            h.os_name = $os_name,
+            h.os_accuracy = $os_accuracy,
+            h.mac = $mac,
+            h.mac_vendor = $mac_vendor,
+            h.state = $state,
+            h.role = $role,
+            h.role_confidence = $role_confidence
+        ON MATCH SET
+            h.last_seen = $ts,
+            h.state = $state,
+            h.hostname = COALESCE($hostname, h.hostname),
+            h.os_name = COALESCE($os_name, h.os_name),
+            h.os_accuracy = CASE WHEN $os_accuracy > COALESCE(h.os_accuracy, 0) THEN $os_accuracy ELSE h.os_accuracy END,
+            h.mac = COALESCE($mac, h.mac),
+            h.mac_vendor = COALESCE($mac_vendor, h.mac_vendor)
+        """,
+        ip=host.ip,
+        ts=timestamp.isoformat(),
+        hostname=host.hostname,
+        os_name=host.os_name,
+        os_accuracy=host.os_accuracy,
+        mac=host.mac,
+        mac_vendor=host.mac_vendor,
+        state=host.state,
+        role=host.role.value,
+        role_confidence=host.role_confidence,
+    )
+
+
+def _link_scan_source(session: Session, source_name: str, host_ip: str) -> None:
+    """Create SCANNED_FROM relationship."""
+    session.run(
+        """
+        MATCH (s:ScanSource {name: $source})
+        MATCH (h:Host {ip: $ip})
+        MERGE (s)-[:SCANNED_FROM]->(h)
+        """,
+        source=source_name,
+        ip=host_ip,
+    )
+
+
+def _upsert_segment(session: Session, cidr: str) -> None:
+    """Create or update a network segment."""
+    session.run(
+        """
+        MERGE (s:NetworkSegment {cidr: $cidr})
+        """,
+        cidr=cidr,
+    )
+
+
+def _link_host_to_segment(session: Session, host_ip: str, segment_cidr: str) -> None:
+    """Link host to its network segment."""
+    session.run(
+        """
+        MATCH (h:Host {ip: $ip})
+        MATCH (s:NetworkSegment {cidr: $cidr})
+        MERGE (h)-[:IN_SEGMENT]->(s)
+        """,
+        ip=host_ip,
+        cidr=segment_cidr,
+    )
+
+
+def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
+    """Create or update a service node linked to a host.
+
+    Services are identified by host_ip + port + protocol combination.
+    """
+    session.run(
+        """
+        MATCH (h:Host {ip: $ip})
+        MERGE (svc:Service {host_ip: $ip, port: $port, protocol: $protocol})
+        ON CREATE SET
+            svc.state = $state,
+            svc.name = $name,
+            svc.product = $product,
+            svc.version = $version,
+            svc.extra_info = $extra_info,
+            svc.banner = $banner
+        ON MATCH SET
+            svc.state = $state,
+            svc.name = COALESCE($name, svc.name),
+            svc.product = COALESCE($product, svc.product),
+            svc.version = COALESCE($version, svc.version),
+            svc.extra_info = COALESCE($extra_info, svc.extra_info)
+        MERGE (h)-[:HAS_SERVICE]->(svc)
+        """,
+        ip=host_ip,
+        port=service.port,
+        protocol=service.protocol,
+        state=service.state,
+        name=service.name,
+        product=service.product,
+        version=service.version,
+        extra_info=service.extra_info,
+        banner=service.banner,
+    )
+
+
+def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: int) -> None:
+    """Create ROUTE_THROUGH relationship from traceroute data."""
+    # First ensure the hop host exists
+    session.run(
+        """
+        MERGE (h:Host {ip: $ip})
+        ON CREATE SET h.state = 'up', h.role = 'unknown', h.role_confidence = 0.0
+        """,
+        ip=hop_ip,
+    )
+    session.run(
+        """
+        MATCH (target:Host {ip: $target_ip})
+        MATCH (hop:Host {ip: $hop_ip})
+        MERGE (target)-[r:ROUTE_THROUGH]->(hop)
+        SET r.ttl = $ttl
+        """,
+        target_ip=target_ip,
+        hop_ip=hop_ip,
+        ttl=ttl,
+    )
+
+
+def _get_segment_cidr(ip: str) -> str | None:
+    """Determine the /24 network segment for an IP address."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        network = ipaddress.ip_network(f"{addr}/24", strict=False)
+        return str(network)
+    except ValueError:
+        return None
+
+
+def get_graph_stats() -> dict:
+    """Get statistics about the current graph."""
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host) WITH count(h) as hosts
+            OPTIONAL MATCH (s:Service) WITH hosts, count(s) as services
+            OPTIONAL MATCH (seg:NetworkSegment) WITH hosts, services, count(seg) as segments
+            OPTIONAL MATCH (v:Vulnerability) WITH hosts, services, segments, count(v) as vulns
+            OPTIONAL MATCH (src:ScanSource) WITH hosts, services, segments, vulns, count(src) as sources
+            RETURN hosts, services, segments, vulns, sources
+            """
+        )
+        record = result.single()
+        if record is None:
+            return {"hosts": 0, "services": 0, "segments": 0, "vulnerabilities": 0, "scan_sources": 0}
+
+        return {
+            "hosts": record["hosts"],
+            "services": record["services"],
+            "segments": record["segments"],
+            "vulnerabilities": record["vulns"],
+            "scan_sources": record["sources"],
+        }
+
+
+def get_host_role_distribution() -> dict[str, int]:
+    """Get count of hosts per role."""
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host)
+            RETURN h.role AS role, count(h) AS count
+            ORDER BY count DESC
+            """
+        )
+        return {record["role"]: record["count"] for record in result}
