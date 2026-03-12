@@ -11,32 +11,49 @@ Themed after brewing potions:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.table import Table
 
+# Force UTF-8 output on Windows to avoid cp1252 encoding errors
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 console = Console()
 
-BANNER = r"""
-[bold magenta]
-   .-'~~~'-.
-  /   .===.  \
+BANNER = """
+[bold magenta]   .-'~~~'-.
+  /   .===.  \\
   |  ( o o )  |
-  \   .---.  /     Cauldron 🜄
+  \\   .---.  /     Cauldron
    '-.....-'
    _|     |_       Network Attack Path Discovery
-  |  \___/  |
-  |_________|      Throw your scans in. Get attack paths out.
-[/bold magenta]
+  |  \\___/  |
+  |_________|      Throw your scans in. Get attack paths out.[/bold magenta]
 """
+
+ROLE_ICONS = {
+    "domain_controller": "[red]DC[/red]",
+    "web_server": "[blue]WEB[/blue]",
+    "database": "[yellow]DB[/yellow]",
+    "mail_server": "[magenta]MAIL[/magenta]",
+    "network_equipment": "[green]NET[/green]",
+    "printer": "[white]PRT[/white]",
+    "voip": "[cyan]VOIP[/cyan]",
+    "remote_access": "[bright_yellow]RDP[/bright_yellow]",
+    "file_server": "[bright_blue]FS[/bright_blue]",
+    "unknown": "[dim]?[/dim]",
+}
 
 
 @click.group()
 @click.version_option(version="0.1.0", prog_name="cauldron")
 def cli():
-    """🜄 Cauldron — Network Attack Path Discovery."""
+    """Cauldron -- Network Attack Path Discovery."""
     pass
 
 
@@ -55,8 +72,8 @@ def brew(file: Path, source: str | None, masscan: bool):
         console.print("[yellow]Masscan parser not yet implemented. Coming soon![/yellow]")
         raise SystemExit(1)
 
-    console.print(f"[bold cyan]🧪 Brewing:[/bold cyan] {file.name}")
-    console.print(f"[dim]   Source: {source or 'auto-detect'}[/dim]")
+    console.print(f"[bold cyan]Brewing:[/bold cyan] {file.name}")
+    console.print(f"[dim]  Source: {source or 'auto-detect'}[/dim]")
     console.print()
 
     # Parse
@@ -66,13 +83,13 @@ def brew(file: Path, source: str | None, masscan: bool):
         try:
             scan = parse_nmap_xml(file)
         except Exception as e:
-            console.print(f"[bold red]✗ Failed to parse:[/bold red] {e}")
+            console.print(f"[bold red]x Failed to parse:[/bold red] {e}")
             raise SystemExit(1)
 
-    console.print(f"  [green]✓[/green] Parsed {len(scan.hosts_up)} live hosts, {scan.total_services} services")
+    console.print(f"  [green]+[/green] Parsed {len(scan.hosts_up)} live hosts, {scan.total_services} services")
 
     if not scan.hosts_up:
-        console.print("[yellow]  ⚠ No live hosts found in scan. Nothing to import.[/yellow]")
+        console.print("[yellow]  ! No live hosts found in scan. Nothing to import.[/yellow]")
         return
 
     # Check Neo4j connection
@@ -80,11 +97,11 @@ def brew(file: Path, source: str | None, masscan: bool):
         from cauldron.graph.connection import verify_connection
 
         if not verify_connection():
-            console.print("[bold red]✗ Cannot connect to Neo4j.[/bold red]")
+            console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
             console.print("  Make sure Neo4j is running: [cyan]docker compose up -d[/cyan]")
             raise SystemExit(1)
 
-    console.print("  [green]✓[/green] Connected to Neo4j")
+    console.print("  [green]+[/green] Connected to Neo4j")
 
     # Ingest
     with console.status("[bold green]Importing into graph..."):
@@ -92,20 +109,20 @@ def brew(file: Path, source: str | None, masscan: bool):
 
         stats = ingest_scan(scan, source_name=source)
 
-    console.print(f"  [green]✓[/green] Imported {stats['hosts_imported']} hosts, {stats['services_imported']} services")
-    console.print(f"  [green]✓[/green] {stats['segments_created']} network segments")
+    console.print(f"  [green]+[/green] Imported {stats['hosts_imported']} hosts, {stats['services_imported']} services")
+    console.print(f"  [green]+[/green] {stats['segments_created']} network segments")
     console.print()
-    console.print("[bold green]🜄 Brew complete![/bold green] Run [cyan]cauldron taste[/cyan] to see the graph stats.")
+    console.print("[bold green]Brew complete![/bold green] Run [cyan]cauldron taste[/cyan] to see the graph stats.")
 
 
 @cli.command()
 def taste():
-    """Show graph statistics — what's in the cauldron."""
+    """Show graph statistics -- what's in the cauldron."""
     from cauldron.graph.connection import verify_connection
     from cauldron.graph.ingestion import get_graph_stats, get_host_role_distribution
 
     if not verify_connection():
-        console.print("[bold red]✗ Cannot connect to Neo4j.[/bold red]")
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
         console.print("  Make sure Neo4j is running: [cyan]docker compose up -d[/cyan]")
         raise SystemExit(1)
 
@@ -113,7 +130,7 @@ def taste():
     roles = get_host_role_distribution()
 
     console.print()
-    console.print("[bold magenta]🜄 Cauldron Contents[/bold magenta]")
+    console.print("[bold magenta]Cauldron Contents[/bold magenta]")
     console.print()
 
     # Main stats table
@@ -134,19 +151,8 @@ def taste():
         role_table.add_column(style="dim", width=25)
         role_table.add_column(style="bold")
 
-        role_icons = {
-            "domain_controller": "🔴",
-            "web_server": "🔵",
-            "database": "🟡",
-            "mail_server": "🟣",
-            "network_equipment": "🟢",
-            "printer": "⚪",
-            "voip": "📞",
-            "remote_access": "🔑",
-            "unknown": "❓",
-        }
         for role, count in roles.items():
-            icon = role_icons.get(role, "❓")
+            icon = ROLE_ICONS.get(role, "[dim]?[/dim]")
             role_display = role.replace("_", " ").title()
             role_table.add_row(f"  {icon} {role_display}", str(count))
         console.print(role_table)
@@ -157,30 +163,30 @@ def taste():
 @cli.command()
 @click.confirmation_option(prompt="This will delete ALL data in the cauldron. Are you sure?")
 def reset():
-    """Empty the cauldron — delete all graph data."""
+    """Empty the cauldron -- delete all graph data."""
     from cauldron.graph.connection import clear_database, verify_connection
 
     if not verify_connection():
-        console.print("[bold red]✗ Cannot connect to Neo4j.[/bold red]")
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
         raise SystemExit(1)
 
     with console.status("[bold red]Emptying the cauldron..."):
         clear_database()
 
-    console.print("[bold red]🜄 Cauldron emptied.[/bold red] All data has been deleted.")
+    console.print("[bold red]Cauldron emptied.[/bold red] All data has been deleted.")
 
 
 @cli.command()
 def boil():
-    """Run AI analysis on the graph (coming soon)."""
-    console.print("[yellow]🔥 AI analysis not yet implemented. Coming soon![/yellow]")
+    """Run analysis on the graph (coming soon)."""
+    console.print("[yellow]Analysis not yet implemented. Coming soon![/yellow]")
     console.print("  This will: classify hosts, enrich CVEs, discover attack paths.")
 
 
 @cli.command()
 def paths():
     """Show discovered attack paths (coming soon)."""
-    console.print("[yellow]⚔ Attack path discovery not yet implemented. Coming soon![/yellow]")
+    console.print("[yellow]Attack path discovery not yet implemented. Coming soon![/yellow]")
     console.print("  This will show ranked attack paths from your position to critical targets.")
 
 
@@ -188,4 +194,4 @@ def paths():
 @click.option("--format", "fmt", type=click.Choice(["pdf", "html", "json"]), default="html")
 def pour(fmt: str):
     """Export a report from the cauldron (coming soon)."""
-    console.print(f"[yellow]📄 Report generation ({fmt}) not yet implemented. Coming soon![/yellow]")
+    console.print(f"[yellow]Report generation ({fmt}) not yet implemented. Coming soon![/yellow]")

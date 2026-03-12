@@ -35,5 +35,9 @@ data/scans/
 *.xml
 !data/samples/*.xml
 
+# Documentation (not published yet)
+docs/
+
 # Claude
 CLAUDE.md
+.claude/
