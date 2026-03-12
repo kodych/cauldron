@@ -46,6 +46,10 @@ ROLE_ICONS = {
     "voip": "[cyan]VOIP[/cyan]",
     "remote_access": "[bright_yellow]RDP[/bright_yellow]",
     "file_server": "[bright_blue]FS[/bright_blue]",
+    "hypervisor": "[bright_green]VM[/bright_green]",
+    "dns_server": "[bright_cyan]DNS[/bright_cyan]",
+    "proxy": "[bright_magenta]PROXY[/bright_magenta]",
+    "monitoring": "[bright_white]MON[/bright_white]",
     "unknown": "[dim]?[/dim]",
 }
 
@@ -91,6 +95,13 @@ def brew(file: Path, source: str | None, masscan: bool):
     if not scan.hosts_up:
         console.print("[yellow]  ! No live hosts found in scan. Nothing to import.[/yellow]")
         return
+
+    # Classify hosts
+    from cauldron.ai.classifier import classify_hosts
+
+    classify_hosts(scan.hosts_up)
+    classified = sum(1 for h in scan.hosts_up if h.role.value != "unknown")
+    console.print(f"  [green]+[/green] Classified {classified}/{len(scan.hosts_up)} hosts")
 
     # Check Neo4j connection
     with console.status("[bold green]Connecting to Neo4j..."):
@@ -178,9 +189,30 @@ def reset():
 
 @cli.command()
 def boil():
-    """Run analysis on the graph (coming soon)."""
-    console.print("[yellow]Analysis not yet implemented. Coming soon![/yellow]")
-    console.print("  This will: classify hosts, enrich CVEs, discover attack paths.")
+    """Run analysis on the graph -- classify hosts, enrich data."""
+    from cauldron.graph.connection import verify_connection
+    from cauldron.graph.ingestion import classify_graph_hosts
+
+    if not verify_connection():
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
+        raise SystemExit(1)
+
+    console.print()
+    console.print("[bold magenta]Boiling the cauldron...[/bold magenta]")
+    console.print()
+
+    # Phase 1: Host classification
+    with console.status("[bold green]Classifying hosts..."):
+        result = classify_graph_hosts()
+
+    console.print(f"  [green]+[/green] Classified {result['classified']}/{result['total']} hosts")
+    if result["roles"]:
+        for role, count in sorted(result["roles"].items(), key=lambda x: -x[1]):
+            icon = ROLE_ICONS.get(role, "[dim]?[/dim]")
+            console.print(f"      {icon} {role.replace('_', ' ').title()}: {count}")
+
+    console.print()
+    console.print("[bold green]Boil complete![/bold green]")
 
 
 @cli.command()

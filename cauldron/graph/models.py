@@ -19,6 +19,10 @@ class HostRole(str, Enum):
     PRINTER = "printer"
     VOIP = "voip"
     REMOTE_ACCESS = "remote_access"
+    HYPERVISOR = "hypervisor"
+    DNS_SERVER = "dns_server"
+    PROXY = "proxy"
+    MONITORING = "monitoring"
     UNKNOWN = "unknown"
 
 

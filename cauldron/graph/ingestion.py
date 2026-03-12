@@ -272,3 +272,70 @@ def get_host_role_distribution() -> dict[str, int]:
             """
         )
         return {record["role"]: record["count"] for record in result}
+
+
+def classify_graph_hosts() -> dict:
+    """Classify all hosts in the graph using rule-based classifier.
+
+    Reads hosts and their services from Neo4j, runs the classifier,
+    and updates the role/role_confidence properties.
+
+    Returns:
+        Dict with classification stats.
+    """
+    from cauldron.ai.classifier import classify_host
+    from cauldron.graph.models import Host as HostModel
+    from cauldron.graph.models import Service as ServiceModel
+
+    stats: dict = {"total": 0, "classified": 0, "roles": {}}
+
+    with get_session() as session:
+        # Fetch all hosts with their services
+        result = session.run(
+            """
+            MATCH (h:Host)
+            OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
+            RETURN h.ip AS ip, h.hostname AS hostname,
+                   collect({port: s.port, protocol: s.protocol,
+                           state: s.state, name: s.name,
+                           product: s.product, version: s.version}) AS services
+            """
+        )
+
+        for record in result:
+            stats["total"] += 1
+            ip = record["ip"]
+
+            # Build Host model from Neo4j data
+            services = []
+            for svc_data in record["services"]:
+                if svc_data.get("port") is not None:
+                    services.append(ServiceModel(
+                        port=svc_data["port"],
+                        protocol=svc_data.get("protocol", "tcp"),
+                        state=svc_data.get("state", "open"),
+                        name=svc_data.get("name"),
+                        product=svc_data.get("product"),
+                        version=svc_data.get("version"),
+                    ))
+
+            host = HostModel(ip=ip, hostname=record.get("hostname"), services=services)
+            classification = classify_host(host)
+
+            # Update Neo4j
+            session.run(
+                """
+                MATCH (h:Host {ip: $ip})
+                SET h.role = $role, h.role_confidence = $confidence
+                """,
+                ip=ip,
+                role=classification.role.value,
+                confidence=classification.confidence,
+            )
+
+            if classification.role.value != "unknown":
+                stats["classified"] += 1
+                role_name = classification.role.value
+                stats["roles"][role_name] = stats["roles"].get(role_name, 0) + 1
+
+    return stats
