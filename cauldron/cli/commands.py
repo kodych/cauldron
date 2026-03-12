@@ -26,14 +26,19 @@ if sys.platform == "win32":
 console = Console()
 
 BANNER = """
-[bold magenta]   .-'~~~'-.
-  /   .===.  \\
-  |  ( o o )  |
-  \\   .---.  /     Cauldron
-   '-.....-'
-   _|     |_       Network Attack Path Discovery
-  |  \\___/  |
-  |_________|      Throw your scans in. Get attack paths out.[/bold magenta]
+[bold magenta]            ) (
+         ) (   ) (
+        ( o  O  o )
+       .~~~~~~~~~~~.
+      /    o    o   \\
+     |   CAULDRON    |       Cauldron
+     |   ~~~ * ~~~   |       Network Attack Path Discovery
+      \\    o    o   /        v0.1.0
+       .___________.
+         |||||||||
+       ^^^^^^^^^^^^
+       )  )  )  )  )
+      (__(__(__(__(__[/bold magenta]
 """
 
 ROLE_ICONS = {
