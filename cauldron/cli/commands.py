@@ -211,6 +211,22 @@ def boil():
             icon = ROLE_ICONS.get(role, "[dim]?[/dim]")
             console.print(f"      {icon} {role.replace('_', ' ').title()}: {count}")
 
+    # Phase 2: CVE enrichment
+    console.print()
+    console.print("[bold cyan]Phase 2: CVE Enrichment[/bold cyan]")
+
+    from cauldron.ai.cve_enricher import enrich_services_from_graph
+
+    with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
+        cve_stats = enrich_services_from_graph()
+
+    console.print(f"  [green]+[/green] Checked {cve_stats['services_checked']} product+version pairs")
+    console.print(f"  [green]+[/green] Found {cve_stats['total_cves_found']} CVEs across {cve_stats['services_with_cves']} services")
+    if cve_stats["from_cache"]:
+        console.print(f"  [dim]  ({cve_stats['from_cache']} from cache, {cve_stats['api_calls']} API calls)[/dim]")
+    if cve_stats["errors"]:
+        console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
+
     console.print()
     console.print("[bold green]Boil complete![/bold green]")
 
