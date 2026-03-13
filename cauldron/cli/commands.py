@@ -269,15 +269,112 @@ def boil():
     if topo_stats["gateway_hosts"]:
         console.print(f"  [green]+[/green] {topo_stats['gateway_hosts']} gateway/router hosts detected")
 
+    # Phase 4: Attack path pivots
     console.print()
-    console.print("[bold green]Boil complete![/bold green]")
+    console.print("[bold cyan]Phase 4: Attack Paths[/bold cyan]")
+
+    from cauldron.ai.attack_paths import build_pivot_relationships
+
+    with console.status("[bold green]Building pivot relationships..."):
+        pivot_stats = build_pivot_relationships()
+
+    console.print(f"  [green]+[/green] Analyzed {pivot_stats['pairs_analyzed']} host pairs")
+    console.print(f"  [green]+[/green] Created {pivot_stats['pivots_created']} pivot relationships")
+
+    console.print()
+    console.print("[bold green]Boil complete![/bold green] Run [cyan]cauldron paths[/cyan] to see attack paths.")
 
 
 @cli.command()
-def paths():
-    """Show discovered attack paths (coming soon)."""
-    console.print("[yellow]Attack path discovery not yet implemented. Coming soon![/yellow]")
-    console.print("  This will show ranked attack paths from your position to critical targets.")
+@click.option("--target", "-t", default=None, help="Target IP address")
+@click.option("--role", "-r", default=None, help="Target role (e.g. domain_controller)")
+@click.option("--top", "-n", default=10, help="Number of paths to show")
+def paths(target: str | None, role: str | None, top: int):
+    """Show discovered attack paths ranked by exploitability."""
+    from cauldron.graph.connection import verify_connection
+
+    if not verify_connection():
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
+        raise SystemExit(1)
+
+    from cauldron.ai.attack_paths import discover_attack_paths, get_path_summary
+
+    console.print()
+
+    # Show summary first
+    summary = get_path_summary()
+    if summary["total_pivots"] == 0:
+        console.print("[yellow]No pivot relationships found. Run [cyan]cauldron boil[/cyan] first.[/yellow]")
+        return
+
+    console.print("[bold magenta]Attack Path Analysis[/bold magenta]")
+    console.print()
+    console.print(f"  Pivot relationships: {summary['total_pivots']}", end="")
+    if summary["easy_pivots"]:
+        console.print(f"  ([red]{summary['easy_pivots']} easy[/red]", end="")
+        console.print(f", [yellow]{summary['medium_pivots']} medium[/yellow]", end="")
+        console.print(f", [dim]{summary['hard_pivots']} hard[/dim])", end="")
+    console.print()
+
+    if summary["high_value_targets"]:
+        targets_str = ", ".join(
+            f"{ROLE_ICONS.get(r, r)} x{c}"
+            for r, c in summary["high_value_targets"].items()
+        )
+        console.print(f"  High-value targets: {targets_str}")
+
+    console.print()
+
+    # Discover paths
+    with console.status("[bold green]Discovering attack paths..."):
+        attack_paths = discover_attack_paths(
+            target_role=role,
+            target_ip=target,
+        )
+
+    if not attack_paths:
+        console.print("[yellow]No attack paths found to the specified targets.[/yellow]")
+        return
+
+    # Display paths
+    path_table = Table(title=f"Top {min(top, len(attack_paths))} Attack Paths", padding=(0, 1))
+    path_table.add_column("#", style="dim", width=3)
+    path_table.add_column("Score", style="bold red", justify="right", width=6)
+    path_table.add_column("Path", style="white")
+    path_table.add_column("Target", style="bold")
+    path_table.add_column("CVSS", justify="right", width=5)
+    path_table.add_column("Exploit", justify="center", width=7)
+    path_table.add_column("Hops", justify="right", width=4)
+
+    for i, path in enumerate(attack_paths[:top], 1):
+        # Build path display string
+        path_parts = []
+        for node in path.nodes:
+            if node.role == "scan_source":
+                path_parts.append(f"[dim]{node.ip}[/dim]")
+            else:
+                icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
+                path_parts.append(f"{icon} {node.ip}")
+        path_str = " -> ".join(path_parts)
+
+        target_icon = ROLE_ICONS.get(path.target_role, "")
+        target_display = f"{target_icon} {path.target_role.replace('_', ' ').title()}"
+
+        cvss_str = f"{path.max_cvss:.1f}" if path.max_cvss > 0 else "[dim]-[/dim]"
+        exploit_str = "[red]YES[/red]" if path.has_exploits else "[dim]no[/dim]"
+
+        path_table.add_row(
+            str(i),
+            f"{path.score:.1f}",
+            path_str,
+            target_display,
+            cvss_str,
+            exploit_str,
+            str(path.hop_count),
+        )
+
+    console.print(path_table)
+    console.print()
 
 
 @cli.command()
