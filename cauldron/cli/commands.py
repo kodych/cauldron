@@ -216,7 +216,8 @@ def reset():
 
 
 @cli.command()
-def boil():
+@click.option("--ai", is_flag=True, default=False, help="Enable AI analysis (requires CAULDRON_ANTHROPIC_API_KEY)")
+def boil(ai: bool):
     """Run analysis on the graph -- classify hosts, enrich data."""
     from cauldron.graph.connection import verify_connection
     from cauldron.graph.ingestion import classify_graph_hosts
@@ -280,6 +281,30 @@ def boil():
 
     console.print(f"  [green]+[/green] Analyzed {pivot_stats['pairs_analyzed']} host pairs")
     console.print(f"  [green]+[/green] Created {pivot_stats['pivots_created']} pivot relationships")
+
+    # Phase 5: AI Analysis (optional)
+    if ai:
+        console.print()
+        console.print("[bold cyan]Phase 5: AI Analysis[/bold cyan]")
+
+        from cauldron.ai.analyzer import analyze_graph, is_ai_available, store_insights
+
+        if not is_ai_available():
+            console.print("  [yellow]! Skipped: CAULDRON_ANTHROPIC_API_KEY not set[/yellow]")
+        else:
+            with console.status("[bold green]Running AI analysis (this may take a while)..."):
+                ai_result = analyze_graph()
+
+            if ai_result.ambiguous_classified:
+                console.print(f"  [green]+[/green] AI re-classified {ai_result.ambiguous_classified} ambiguous hosts")
+            if ai_result.insights:
+                stored = store_insights(ai_result.insights)
+                console.print(f"  [green]+[/green] Found {len(ai_result.insights)} insights, stored {stored}")
+                for insight in ai_result.insights[:5]:
+                    prio_color = "red" if insight.priority <= 2 else "yellow" if insight.priority <= 3 else "dim"
+                    console.print(f"      [{prio_color}]P{insight.priority}[/{prio_color}] {insight.title}")
+            else:
+                console.print("  [dim]  No new insights found[/dim]")
 
     console.print()
     console.print("[bold green]Boil complete![/bold green] Run [cyan]cauldron paths[/cyan] to see attack paths.")
