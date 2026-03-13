@@ -410,36 +410,46 @@ def build_pivot_relationships() -> dict:
             h1_exploit = record["h1_exploit"]
             h2_exploit = record["h2_exploit"]
 
-            # Determine pivot method and difficulty
-            if h1_exploit or h1_cvss > 0:
-                method = "exploit" if h1_exploit else "vuln_service"
-                difficulty = PIVOT_DIFFICULTY.get(method, "hard")
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h1)-[p:PIVOT_TO]->(h2)
-                    SET p.method = $method, p.difficulty = $difficulty,
-                        p.cvss = $cvss
-                    """,
-                    ip1=ip1, ip2=ip2, method=method,
-                    difficulty=difficulty, cvss=h1_cvss,
-                )
-                stats["pivots_created"] += 1
+            # Determine pivot method: exploit > vuln_service > shared_segment
+            # h1 -> h2 direction
+            if h1_exploit:
+                method_fwd, diff_fwd = "exploit", "easy"
+            elif h1_cvss > 0:
+                method_fwd, diff_fwd = "vuln_service", "medium"
+            else:
+                method_fwd, diff_fwd = "shared_segment", "hard"
 
-            if h2_exploit or h2_cvss > 0:
-                method = "exploit" if h2_exploit else "vuln_service"
-                difficulty = PIVOT_DIFFICULTY.get(method, "hard")
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h2)-[p:PIVOT_TO]->(h1)
-                    SET p.method = $method, p.difficulty = $difficulty,
-                        p.cvss = $cvss
-                    """,
-                    ip1=ip1, ip2=ip2, method=method,
-                    difficulty=difficulty, cvss=h2_cvss,
-                )
-                stats["pivots_created"] += 1
+            session.run(
+                """
+                MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                MERGE (h1)-[p:PIVOT_TO]->(h2)
+                SET p.method = $method, p.difficulty = $difficulty,
+                    p.cvss = $cvss
+                """,
+                ip1=ip1, ip2=ip2, method=method_fwd,
+                difficulty=diff_fwd, cvss=h1_cvss,
+            )
+            stats["pivots_created"] += 1
+
+            # h2 -> h1 direction
+            if h2_exploit:
+                method_rev, diff_rev = "exploit", "easy"
+            elif h2_cvss > 0:
+                method_rev, diff_rev = "vuln_service", "medium"
+            else:
+                method_rev, diff_rev = "shared_segment", "hard"
+
+            session.run(
+                """
+                MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                MERGE (h2)-[p:PIVOT_TO]->(h1)
+                SET p.method = $method, p.difficulty = $difficulty,
+                    p.cvss = $cvss
+                """,
+                ip1=ip1, ip2=ip2, method=method_rev,
+                difficulty=diff_rev, cvss=h2_cvss,
+            )
+            stats["pivots_created"] += 1
 
     return stats
 

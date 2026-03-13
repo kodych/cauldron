@@ -305,13 +305,17 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
         )
         return message.content[0].text
     except anthropic.AuthenticationError:
-        logger.error("Invalid Anthropic API key")
+        logger.error("Invalid Anthropic API key. Check CAULDRON_ANTHROPIC_API_KEY.")
         return None
     except anthropic.RateLimitError:
         logger.warning("Anthropic API rate limit hit, skipping AI analysis")
         return None
+    except anthropic.BadRequestError as e:
+        # Covers: insufficient credits, invalid model, etc.
+        logger.error("Anthropic API error: %s", e.message)
+        return None
     except Exception:
-        logger.exception("Claude API call failed")
+        logger.error("Claude API call failed unexpectedly")
         return None
 
 

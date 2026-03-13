@@ -38,6 +38,7 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
 
     source = source_name or scan.scan_source or "unknown"
     timestamp = scan.start_time or datetime.now()
+    seen_segments: set[str] = set()
 
     with get_session() as session:
         # Create or update scan source
@@ -61,7 +62,9 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
             if segment:
                 _upsert_segment(session, segment)
                 _link_host_to_segment(session, host.ip, segment)
-                stats["segments_created"] += 1  # may be duplicate, but that's ok for stats
+                if segment not in seen_segments:
+                    seen_segments.add(segment)
+                    stats["segments_created"] += 1
 
             # Upsert services
             for service in host.services:
