@@ -1,9 +1,11 @@
 """AI-powered network analysis using Claude API.
 
-Uses Claude to find non-obvious attack chains, correlate vulnerabilities
-across hosts, and prioritize paths that a pentester should check first.
-This is the "second pair of eyes" — AI processes the large graph and
-highlights what's interesting, the pentester validates.
+Three integrated AI phases that directly affect the graph:
+1. CVE discovery — find vulnerabilities NVD missed based on product+version
+2. Host classification — re-classify ambiguous hosts
+3. Attack chain discovery — find non-obvious paths, create PIVOT_TO relationships
+
+Each phase writes results back to Neo4j so that `cauldron paths` reflects AI findings.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 class AIInsight:
     """A single insight discovered by AI analysis."""
 
-    insight_type: str  # "attack_chain", "correlation", "classification"
+    insight_type: str  # "attack_chain", "correlation", "chokepoint"
     confidence: float  # 0.0 - 1.0
     title: str
     details: str
@@ -35,11 +37,11 @@ class AIInsight:
 class AnalysisResult:
     """Result of AI analysis run."""
 
-    insights: list[AIInsight] = field(default_factory=list)
-    hosts_analyzed: int = 0
-    paths_analyzed: int = 0
+    cves_found: int = 0
+    services_enriched: int = 0
     ambiguous_classified: int = 0
-    errors: int = 0
+    insights: list[AIInsight] = field(default_factory=list)
+    pivots_created: int = 0
 
 
 def is_ai_available() -> bool:
@@ -47,20 +49,15 @@ def is_ai_available() -> bool:
     return bool(settings.anthropic_api_key)
 
 
-def analyze_graph(
-    classify_ambiguous: bool = True,
-    find_chains: bool = True,
-    max_hosts_per_batch: int = 20,
-) -> AnalysisResult:
-    """Run AI analysis on the current graph.
+def analyze_graph() -> AnalysisResult:
+    """Run all AI analysis phases on the current graph.
 
-    Args:
-        classify_ambiguous: Re-classify hosts with low confidence using AI.
-        find_chains: Find non-obvious attack chains.
-        max_hosts_per_batch: Max hosts to send per API call.
+    Phase 1: Find CVEs that NVD missed (based on product+version).
+    Phase 2: Re-classify ambiguous hosts.
+    Phase 3: Discover attack chains → create PIVOT_TO relationships.
 
     Returns:
-        AnalysisResult with discovered insights.
+        AnalysisResult with all findings.
     """
     if not is_ai_available():
         logger.warning("AI analysis skipped: CAULDRON_ANTHROPIC_API_KEY not set")
@@ -68,20 +65,145 @@ def analyze_graph(
 
     result = AnalysisResult()
 
-    if classify_ambiguous:
-        classified = _classify_ambiguous_hosts(max_hosts_per_batch)
-        result.ambiguous_classified = classified
-        result.hosts_analyzed += classified
+    # Phase 1: AI CVE enrichment (most impactful — fills the CVSS/exploit columns)
+    cves, services = _ai_enrich_cves()
+    result.cves_found = cves
+    result.services_enriched = services
 
-    if find_chains:
-        insights = _find_attack_chains(max_hosts_per_batch)
-        result.insights.extend(insights)
-        result.paths_analyzed = len(insights)
+    # Phase 2: Re-classify ambiguous hosts
+    result.ambiguous_classified = _classify_ambiguous_hosts()
+
+    # Phase 3: Attack chain discovery → PIVOT_TO
+    insights, pivots = _discover_and_create_pivots()
+    result.insights = insights
+    result.pivots_created = pivots
 
     return result
 
 
-def _classify_ambiguous_hosts(max_hosts: int) -> int:
+# ---------------------------------------------------------------------------
+# Phase 1: AI CVE Enrichment
+# ---------------------------------------------------------------------------
+
+
+def _ai_enrich_cves() -> tuple[int, int]:
+    """Ask AI to identify CVEs for services that NVD couldn't match.
+
+    Only sends services WITHOUT existing vulnerabilities — efficient,
+    no redundant work.
+
+    Returns:
+        (total_cves_created, services_enriched)
+    """
+    # Get services with product+version but no CVEs
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)
+            WHERE s.product IS NOT NULL AND s.version IS NOT NULL
+            AND NOT (s)-[:HAS_VULN]->(:Vulnerability)
+            RETURN DISTINCT s.product AS product, s.version AS version
+            """
+        )
+        pairs = [(r["product"], r["version"]) for r in result]
+
+    if not pairs:
+        return 0, 0
+
+    # Build compact prompt — just product+version list
+    lines = [f"- {p} {v}" for p, v in pairs]
+    prompt = f"""You are a vulnerability researcher. For each software product+version below, list known CVEs with CVSS scores.
+
+Products:
+{chr(10).join(lines)}
+
+Respond with ONLY a JSON array:
+[{{"product": "exact product name", "version": "exact version", "cves": [{{"cve_id": "CVE-YYYY-NNNNN", "cvss": 7.5, "severity": "HIGH", "has_exploit": true, "description": "brief"}}]}}]
+
+Rules:
+- Only include REAL, published CVEs (no guessing)
+- Include CVSS v3.1 score
+- has_exploit = true only if public exploit exists (ExploitDB, Metasploit, GitHub PoC)
+- If no known CVEs for a product+version, omit it from the array
+- Respond with ONLY the JSON, no other text"""
+
+    response = _call_claude(prompt, max_tokens=2048)
+    if not response:
+        return 0, 0
+
+    return _apply_ai_cves(response)
+
+
+def _apply_ai_cves(response: str) -> tuple[int, int]:
+    """Parse AI CVE response and create Vulnerability nodes."""
+    data = _parse_json_response(response)
+    if not isinstance(data, list):
+        return 0, 0
+
+    total_cves = 0
+    services_enriched = 0
+
+    with get_session() as session:
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            product = item.get("product")
+            version = item.get("version")
+            cves = item.get("cves", [])
+            if not product or not version or not cves:
+                continue
+
+            svc_cve_count = 0
+            for cve in cves:
+                if not isinstance(cve, dict):
+                    continue
+                cve_id = cve.get("cve_id", "")
+                if not cve_id.startswith("CVE-"):
+                    continue
+
+                cvss = float(cve.get("cvss", 0))
+                severity = cve.get("severity", "MEDIUM")
+                has_exploit = bool(cve.get("has_exploit", False))
+                description = cve.get("description", "")
+
+                # Create Vulnerability node
+                session.run(
+                    """
+                    MERGE (v:Vulnerability {cve_id: $cve_id})
+                    ON CREATE SET
+                        v.cvss = $cvss, v.severity = $severity,
+                        v.has_exploit = $has_exploit, v.description = $description,
+                        v.source = 'ai'
+                    """,
+                    cve_id=cve_id, cvss=cvss, severity=severity,
+                    has_exploit=has_exploit, description=description,
+                )
+
+                # Link to matching services
+                session.run(
+                    """
+                    MATCH (s:Service)
+                    WHERE s.product = $product AND s.version = $version
+                    MATCH (v:Vulnerability {cve_id: $cve_id})
+                    MERGE (s)-[:HAS_VULN]->(v)
+                    """,
+                    product=product, version=version, cve_id=cve_id,
+                )
+                svc_cve_count += 1
+                total_cves += 1
+
+            if svc_cve_count > 0:
+                services_enriched += 1
+
+    return total_cves, services_enriched
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Host Classification
+# ---------------------------------------------------------------------------
+
+
+def _classify_ambiguous_hosts() -> int:
     """Use AI to classify hosts where rule-based classifier has low confidence."""
     with get_session() as session:
         result = session.run(
@@ -89,203 +211,250 @@ def _classify_ambiguous_hosts(max_hosts: int) -> int:
             MATCH (h:Host)
             WHERE h.role_confidence < 0.6 AND h.role_confidence > 0
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
-            WITH h, collect({
-                port: s.port, protocol: s.protocol, name: s.name,
-                product: s.product, version: s.version
-            }) AS services
+            WITH h, collect({port: s.port, protocol: s.protocol,
+                            name: s.name, product: s.product, version: s.version}) AS services
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS current_role,
                    h.role_confidence AS confidence, services
-            LIMIT $limit
-            """,
-            limit=max_hosts,
+            LIMIT 15
+            """
         )
         hosts = list(result)
 
     if not hosts:
         return 0
 
-    prompt = _build_classification_prompt(hosts)
-    response = _call_claude(prompt, max_tokens=2048)
+    # Compact prompt — only what's needed
+    lines = []
+    for h in hosts:
+        svcs = [f"{s['port']}/{s.get('protocol', 'tcp')} {s.get('product', s.get('name', ''))}"
+                for s in h["services"] if s.get("port")]
+        lines.append(f"{h['ip']}: {', '.join(svcs[:10]) if svcs else 'no services'}")
+
+    prompt = f"""Classify these network hosts by role based on their services.
+
+Roles: domain_controller, web_server, database, mail_server, file_server, network_equipment, printer, voip, remote_access, hypervisor, dns_server, proxy, monitoring, unknown
+
+Hosts:
+{chr(10).join(lines)}
+
+Respond with ONLY JSON: [{{"ip": "x.x.x.x", "role": "role_name", "confidence": 0.0-1.0}}]
+Only include hosts where confidence > 0.6."""
+
+    response = _call_claude(prompt, max_tokens=1024)
     if not response:
         return 0
 
     classifications = _parse_classification_response(response)
-    updated = _apply_classifications(classifications)
-    return updated
+    return _apply_classifications(classifications)
 
 
-def _find_attack_chains(max_hosts: int) -> list[AIInsight]:
-    """Use AI to find non-obvious attack chains in the graph."""
-    subgraph = _extract_subgraph(max_hosts)
-    if not subgraph:
-        return []
+# ---------------------------------------------------------------------------
+# Phase 3: Attack Chain Discovery → PIVOT_TO
+# ---------------------------------------------------------------------------
 
-    prompt = _build_chain_discovery_prompt(subgraph)
-    response = _call_claude(prompt, max_tokens=4096)
+
+def _discover_and_create_pivots() -> tuple[list[AIInsight], int]:
+    """Discover attack chains and create PIVOT_TO relationships for them.
+
+    Returns:
+        (insights, pivots_created)
+    """
+    # Get full network summary — AI needs complete picture to find hidden paths
+    summary = _get_network_summary()
+    if not summary:
+        return [], 0
+
+    prompt = f"""You are a penetration tester. Analyze this network and find non-obvious attack chains.
+
+{summary}
+
+Find:
+1. Multi-step attack chains through unexpected pivots (printers, VoIP, monitoring → DC)
+2. Service correlations that enable lateral movement
+3. Chokepoint hosts (compromising one = access to many)
+
+Respond with ONLY JSON array:
+[{{
+  "type": "attack_chain",
+  "title": "short description",
+  "path": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+  "priority": 1-5,
+  "confidence": 0.0-1.0
+}}]
+
+"path" = ordered list of IPs in the attack chain. Priority 1 = most interesting.
+Only include findings with confidence > 0.5. Respond with ONLY the JSON."""
+
+    response = _call_claude(prompt, max_tokens=2048)
     if not response:
-        return []
+        return [], 0
 
-    return _parse_chain_response(response)
+    insights, pivots = _parse_and_create_chain_pivots(response)
+    return insights, pivots
 
 
-def _extract_subgraph(max_hosts: int) -> dict | None:
-    """Extract relevant subgraph data for AI analysis."""
+def _get_network_summary() -> str | None:
+    """Build a detailed network summary for AI attack chain discovery.
+
+    Includes full service details, all CVEs, banners, and existing pivots
+    so AI has complete picture to find non-obvious attack paths.
+    """
     with get_session() as session:
-        # Get hosts with services and vulns
-        host_result = session.run(
+        # Get all up hosts with their services and vulns — no limits
+        result = session.run(
             """
             MATCH (h:Host)
             WHERE h.state = 'up'
+            OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
             OPTIONAL MATCH (s)-[:HAS_VULN]->(v:Vulnerability)
-            OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
-            WITH h, seg,
+            WITH h, seg.cidr AS segment,
                  collect(DISTINCT {
                      port: s.port, protocol: s.protocol, name: s.name,
-                     product: s.product, version: s.version,
-                     cve: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit
-                 }) AS services
+                     product: s.product, version: s.version, banner: s.banner
+                 }) AS services,
+                 collect(DISTINCT {
+                     cve_id: v.cve_id, cvss: v.cvss, severity: v.severity,
+                     has_exploit: v.has_exploit
+                 }) AS vulns
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
-                   h.role_confidence AS confidence, seg.cidr AS segment,
-                   services
-            LIMIT $limit
-            """,
-            limit=max_hosts,
+                   h.os_name AS os, segment, services, vulns
+            ORDER BY segment, h.ip
+            """
         )
-        hosts = [dict(r) for r in host_result]
+        hosts = list(result)
 
         if not hosts:
             return None
 
         # Get segment connectivity
-        seg_result = session.run(
-            """
-            MATCH (s1:NetworkSegment)-[:CAN_REACH]->(s2:NetworkSegment)
-            RETURN s1.cidr AS from_segment, s2.cidr AS to_segment
-            """
+        conn = session.run(
+            "MATCH (s1:NetworkSegment)-[:CAN_REACH]->(s2:NetworkSegment) "
+            "RETURN s1.cidr AS src, s2.cidr AS dst"
         )
-        connectivity = [dict(r) for r in seg_result]
+        connectivity = list(conn)
 
-        # Get existing pivots
-        pivot_result = session.run(
-            """
-            MATCH (h1:Host)-[p:PIVOT_TO]->(h2:Host)
-            RETURN h1.ip AS from_ip, h2.ip AS to_ip,
-                   p.method AS method, p.difficulty AS difficulty
-            """
+        # Get existing pivots so AI knows what's already discovered
+        pivots = session.run(
+            "MATCH (h1:Host)-[p:PIVOT_TO]->(h2:Host) "
+            "RETURN h1.ip AS src, h2.ip AS dst, p.method AS method, "
+            "p.difficulty AS difficulty"
         )
-        pivots = [dict(r) for r in pivot_result]
+        existing_pivots = list(pivots)
 
-        return {
-            "hosts": hosts,
-            "connectivity": connectivity,
-            "pivots": pivots,
-        }
+    lines = ["=== NETWORK MAP ===", ""]
 
-
-def _build_classification_prompt(hosts: list[dict]) -> str:
-    """Build prompt for AI host classification."""
-    hosts_text = ""
+    # Group by segment for readability
+    current_segment = None
     for h in hosts:
-        services = h["services"]
-        svc_list = []
+        seg = h["segment"] or "unknown"
+        if seg != current_segment:
+            current_segment = seg
+            lines.append(f"--- Segment: {seg} ---")
+
+        # Host header
+        role = h["role"] or "unknown"
+        header = f"  {h['ip']} [{role}]"
+        if h.get("hostname"):
+            header += f" ({h['hostname']})"
+        if h.get("os"):
+            header += f" OS:{h['os']}"
+        lines.append(header)
+
+        # Services — full detail
+        services = [s for s in (h["services"] or []) if s.get("port")]
         for s in services:
-            if s.get("port"):
-                parts = [f"{s['port']}/{s.get('protocol', 'tcp')}"]
-                if s.get("product"):
-                    parts.append(s["product"])
+            svc_line = f"    {s['port']}/{s.get('protocol', 'tcp')}"
+            if s.get("product"):
+                svc_line += f" {s['product']}"
                 if s.get("version"):
-                    parts.append(s["version"])
-                elif s.get("name"):
-                    parts.append(s["name"])
-                svc_list.append(" ".join(parts))
+                    svc_line += f" {s['version']}"
+            elif s.get("name"):
+                svc_line += f" {s['name']}"
+            if s.get("banner"):
+                svc_line += f" | {s['banner'][:80]}"
+            lines.append(svc_line)
 
-        hosts_text += f"\nHost: {h['ip']}"
-        if h.get("hostname"):
-            hosts_text += f" ({h['hostname']})"
-        hosts_text += f"\n  Current role: {h['current_role']} (confidence: {h['confidence']:.2f})"
-        hosts_text += f"\n  Services: {', '.join(svc_list) if svc_list else 'none'}\n"
+        # Vulnerabilities — all of them
+        vulns = [v for v in (h["vulns"] or []) if v.get("cve_id")]
+        for v in vulns:
+            vuln_line = f"    VULN: {v['cve_id']} CVSS:{v.get('cvss', '?')}"
+            if v.get("has_exploit"):
+                vuln_line += " EXPLOIT"
+            lines.append(vuln_line)
 
-    return f"""You are a network security analyst. Classify each host by its most likely role based on the open services.
+        lines.append("")
 
-Possible roles: domain_controller, web_server, database, mail_server, file_server, network_equipment, printer, voip, remote_access, hypervisor, dns_server, proxy, monitoring, unknown
+    if connectivity:
+        lines.append("=== SEGMENT CONNECTIVITY ===")
+        for c in connectivity:
+            lines.append(f"  {c['src']} -> {c['dst']}")
+        lines.append("")
 
-For each host, respond with JSON array:
-[{{"ip": "x.x.x.x", "role": "role_name", "confidence": 0.0-1.0}}]
+    if existing_pivots:
+        lines.append("=== EXISTING PIVOTS (already discovered) ===")
+        for p in existing_pivots:
+            lines.append(f"  {p['src']} -> {p['dst']} [{p['method']}] {p['difficulty']}")
+        lines.append("")
 
-Only include hosts where you are reasonably confident (>0.6). Omit uncertain ones.
-
-Hosts to classify:
-{hosts_text}
-
-Respond with ONLY the JSON array, no other text."""
+    return "\n".join(lines)
 
 
-def _build_chain_discovery_prompt(subgraph: dict) -> str:
-    """Build prompt for attack chain discovery."""
-    hosts_text = ""
-    for h in subgraph["hosts"]:
-        hosts_text += f"\n  {h['ip']}"
-        if h.get("hostname"):
-            hosts_text += f" ({h['hostname']})"
-        hosts_text += f" [{h.get('role', 'unknown')}]"
-        if h.get("segment"):
-            hosts_text += f" in {h['segment']}"
+def _parse_and_create_chain_pivots(response: str) -> tuple[list[AIInsight], int]:
+    """Parse chain response and create PIVOT_TO for discovered paths."""
+    data = _parse_json_response(response)
+    if not isinstance(data, list):
+        return [], 0
 
-        for s in h.get("services", []):
-            if s.get("port"):
-                svc_str = f"    - {s['port']}/{s.get('protocol', 'tcp')}"
-                if s.get("product"):
-                    svc_str += f" {s['product']}"
-                if s.get("version"):
-                    svc_str += f" {s['version']}"
-                if s.get("cve"):
-                    svc_str += f" [CVE: {s['cve']}, CVSS: {s.get('cvss', '?')}]"
-                    if s.get("has_exploit"):
-                        svc_str += " EXPLOIT AVAILABLE"
-                hosts_text += f"\n{svc_str}"
-        hosts_text += "\n"
+    insights = []
+    pivots_created = 0
 
-    connectivity_text = ""
-    for c in subgraph.get("connectivity", []):
-        connectivity_text += f"\n  {c['from_segment']} -> {c['to_segment']}"
+    with get_session() as session:
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path", [])
+            title = item.get("title", "")
+            priority = int(item.get("priority", 3))
+            confidence = float(item.get("confidence", 0.5))
 
-    pivots_text = ""
-    for p in subgraph.get("pivots", []):
-        pivots_text += f"\n  {p['from_ip']} -> {p['to_ip']} ({p.get('method', '?')}, {p.get('difficulty', '?')})"
+            if not title or confidence <= 0.5 or len(path) < 2:
+                continue
 
-    return f"""You are a senior penetration tester analyzing a network graph. Your task is to find non-obvious, creative attack chains that a human might miss when looking at this data.
+            insight = AIInsight(
+                insight_type=item.get("type", "attack_chain"),
+                confidence=confidence,
+                title=title,
+                details=item.get("details", ""),
+                hosts=path,
+                priority=priority,
+            )
+            insights.append(insight)
 
-Focus on:
-1. Multi-step chains through unexpected pivot points (printers, VoIP phones, monitoring systems)
-2. Vulnerability correlations: CVE on host A + CVE on host B = chain exploitation opportunity
-3. Paths to high-value targets (Domain Controllers, databases) through low-priority hosts
-4. Hosts that serve as "chokepoints" — compromising one gives access to many segments
+            # Create PIVOT_TO for each consecutive pair in the chain
+            for i in range(len(path) - 1):
+                result = session.run(
+                    """
+                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                    MERGE (h1)-[p:PIVOT_TO]->(h2)
+                    ON CREATE SET p.method = 'ai_chain', p.difficulty = $diff,
+                                  p.ai_title = $title
+                    RETURN h1.ip AS ip
+                    """,
+                    ip1=path[i], ip2=path[i + 1],
+                    diff="easy" if priority <= 2 else "medium" if priority <= 3 else "hard",
+                    title=title,
+                )
+                if result.single():
+                    pivots_created += 1
 
-Do NOT explain why things are dangerous (the pentester knows). Just identify the chains and their components.
+    insights.sort(key=lambda i: (i.priority, -i.confidence))
+    return insights, pivots_created
 
-Network data:
-{hosts_text}
 
-Segment connectivity:
-{connectivity_text if connectivity_text else "  (none found)"}
-
-Existing pivot relationships:
-{pivots_text if pivots_text else "  (none found)"}
-
-Respond with ONLY a JSON array. Each item:
-[{{
-  "type": "attack_chain" | "correlation" | "chokepoint",
-  "title": "short description of the finding",
-  "details": "specific steps or details",
-  "hosts": ["ip1", "ip2", ...],
-  "cves": ["CVE-xxxx-yyyy", ...],
-  "priority": 1-5,
-  "confidence": 0.0-1.0
-}}]
-
-Order by priority (1=highest). Include only findings with confidence > 0.5.
-Respond with ONLY the JSON array, no other text."""
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
 
 
 def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
@@ -311,7 +480,6 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
         logger.warning("Anthropic API rate limit hit, skipping AI analysis")
         return None
     except anthropic.BadRequestError as e:
-        # Covers: insufficient credits, invalid model, etc.
         logger.error("Anthropic API error: %s", e.message)
         return None
     except Exception:
@@ -319,82 +487,45 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
         return None
 
 
+def _parse_json_response(response: str) -> list | dict | None:
+    """Parse JSON from AI response, stripping markdown fences."""
+    try:
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+        return json.loads(text)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning("Failed to parse AI JSON response")
+        return None
+
+
 def _parse_classification_response(response: str) -> list[dict]:
     """Parse AI classification response into list of {ip, role, confidence}."""
-    try:
-        # Strip markdown code fences if present
-        text = response.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
-
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return []
-
-        valid_roles = {
-            "domain_controller", "web_server", "database", "mail_server",
-            "file_server", "network_equipment", "printer", "voip",
-            "remote_access", "hypervisor", "dns_server", "proxy",
-            "monitoring", "unknown",
-        }
-
-        results = []
-        for item in data:
-            if (
-                isinstance(item, dict)
-                and item.get("ip")
-                and item.get("role") in valid_roles
-                and isinstance(item.get("confidence"), (int, float))
-                and item["confidence"] > 0.6
-            ):
-                results.append(item)
-        return results
-    except (json.JSONDecodeError, KeyError, TypeError):
-        logger.warning("Failed to parse AI classification response")
+    data = _parse_json_response(response)
+    if not isinstance(data, list):
         return []
 
+    valid_roles = {
+        "domain_controller", "web_server", "database", "mail_server",
+        "file_server", "network_equipment", "printer", "voip",
+        "remote_access", "hypervisor", "dns_server", "proxy",
+        "monitoring", "unknown",
+    }
 
-def _parse_chain_response(response: str) -> list[AIInsight]:
-    """Parse AI chain discovery response into AIInsight objects."""
-    try:
-        text = response.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
-
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return []
-
-        insights = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            try:
-                insight = AIInsight(
-                    insight_type=item.get("type", "attack_chain"),
-                    confidence=float(item.get("confidence", 0.5)),
-                    title=item.get("title", ""),
-                    details=item.get("details", ""),
-                    hosts=item.get("hosts", []),
-                    cves=item.get("cves", []),
-                    priority=int(item.get("priority", 3)),
-                )
-                if insight.title and insight.confidence > 0.5:
-                    insights.append(insight)
-            except (ValueError, TypeError):
-                continue
-
-        insights.sort(key=lambda i: (i.priority, -i.confidence))
-        return insights
-    except (json.JSONDecodeError, KeyError, TypeError):
-        logger.warning("Failed to parse AI chain response")
-        return []
+    results = []
+    for item in data:
+        if (
+            isinstance(item, dict)
+            and item.get("ip")
+            and item.get("role") in valid_roles
+            and isinstance(item.get("confidence"), (int, float))
+            and item["confidence"] > 0.6
+        ):
+            results.append(item)
+    return results
 
 
 def _apply_classifications(classifications: list[dict]) -> int:
@@ -419,33 +550,5 @@ def _apply_classifications(classifications: list[dict]) -> int:
             )
             if result.single():
                 updated += 1
-                logger.info("AI classified %s as %s (%.2f)", c["ip"], c["role"], c["confidence"])
 
     return updated
-
-
-def store_insights(insights: list[AIInsight]) -> int:
-    """Store AI insights as properties on relevant graph nodes."""
-    if not insights:
-        return 0
-
-    stored = 0
-    with get_session() as session:
-        for insight in insights:
-            # Store insight on the first host in the chain
-            if insight.hosts:
-                session.run(
-                    """
-                    MATCH (h:Host {ip: $ip})
-                    SET h.ai_insight_type = $type,
-                        h.ai_insight_title = $title,
-                        h.ai_insight_priority = $priority
-                    """,
-                    ip=insight.hosts[0],
-                    type=insight.insight_type,
-                    title=insight.title,
-                    priority=insight.priority,
-                )
-                stored += 1
-
-    return stored

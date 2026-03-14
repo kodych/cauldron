@@ -105,10 +105,23 @@ def discover_attack_paths(
                 role_paths = _find_paths_to_role(session, role, max_depth)
                 paths.extend(role_paths)
 
-    # Score and sort
+    # Add paths discovered via PIVOT_TO chains (including AI-created)
+    with get_session() as session:
+        pivot_paths = _find_pivot_chain_paths(session, target_ip, target_role)
+        paths.extend(pivot_paths)
+
+    # Score all paths
     for path in paths:
         path.score = _score_path(path)
 
+    # Deduplicate by full path (sequence of IPs), keep highest scoring
+    seen: dict[tuple, AttackPath] = {}
+    for path in paths:
+        key = tuple(n.ip for n in path.nodes)
+        if key not in seen or path.score > seen[key].score:
+            seen[key] = path
+
+    paths = list(seen.values())
     paths.sort(key=lambda p: p.score, reverse=True)
     return paths
 
@@ -272,6 +285,81 @@ def _build_path(
         return path  # Return first (shortest) path found
 
     return None
+
+
+def _find_pivot_chain_paths(
+    session, target_ip: str | None, target_role: str | None
+) -> list[AttackPath]:
+    """Find multi-hop attack paths by traversing PIVOT_TO relationships.
+
+    This picks up AI-created chains and exploit-based pivots that
+    segment-level path discovery misses.
+    """
+    # Build target filter
+    if target_ip:
+        target_clause = "AND target.ip = $target_ip"
+        params = {"target_ip": target_ip, "roles": HIGH_VALUE_ROLES}
+    elif target_role:
+        target_clause = "AND target.role = $target_role"
+        params = {"target_role": target_role, "roles": [target_role]}
+    else:
+        target_clause = "AND target.role IN $roles"
+        params = {"roles": HIGH_VALUE_ROLES}
+
+    result = session.run(
+        f"""
+        MATCH (src:ScanSource)-[:SCANNED_FROM]->(entry:Host)
+        MATCH path = (entry)-[:PIVOT_TO*1..4]->(target:Host)
+        WHERE target.role IN $roles {target_clause}
+        AND entry.ip <> target.ip
+        WITH src, entry, target, path,
+             [n IN nodes(path) | n.ip] AS ips,
+             [r IN relationships(path) | r.method] AS methods,
+             [r IN relationships(path) | r.difficulty] AS difficulties
+        RETURN DISTINCT
+            src.name AS source,
+            ips,
+            methods,
+            difficulties,
+            target.role AS target_role
+        ORDER BY size(ips)
+        LIMIT 20
+        """,
+        **params,
+    )
+
+    paths = []
+    for record in result:
+        ips = record["ips"]
+        methods = record["methods"]
+        source_name = record["source"]
+
+        # Build path nodes with enriched info
+        nodes = [PathNode(ip=source_name, role="scan_source")]
+        max_cvss = 0.0
+        has_exploits = False
+
+        for ip in ips:
+            info = _get_host_info(session, ip)
+            if info:
+                nodes.append(info)
+                max_cvss = max(max_cvss, info.max_cvss)
+                if info.has_exploit:
+                    has_exploits = True
+            else:
+                nodes.append(PathNode(ip=ip))
+
+        path = AttackPath(
+            nodes=nodes,
+            target_role=record["target_role"] or "unknown",
+            hop_count=len(ips),  # source->entry is 1 hop + PIVOT_TO hops
+            max_cvss=max_cvss,
+            has_exploits=has_exploits or any(m == "exploit" for m in methods),
+            pivot_methods=methods,
+        )
+        paths.append(path)
+
+    return paths
 
 
 def _get_host_info(session, ip: str) -> PathNode | None:

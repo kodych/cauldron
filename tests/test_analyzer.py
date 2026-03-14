@@ -8,19 +8,37 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cauldron.ai.analyzer import (
-    AIInsight,
     AnalysisResult,
-    _build_chain_discovery_prompt,
-    _build_classification_prompt,
-    _parse_chain_response,
     _parse_classification_response,
+    _parse_json_response,
     analyze_graph,
     is_ai_available,
-    store_insights,
 )
 from cauldron.graph.connection import clear_database, get_session, verify_connection
 
 # --- Unit tests (no Neo4j needed) ---
+
+
+class TestParseJsonResponse:
+    def test_valid_json_array(self):
+        result = _parse_json_response('[{"a": 1}]')
+        assert result == [{"a": 1}]
+
+    def test_valid_json_object(self):
+        result = _parse_json_response('{"a": 1}')
+        assert result == {"a": 1}
+
+    def test_strips_markdown_fences(self):
+        result = _parse_json_response('```json\n[{"a": 1}]\n```')
+        assert result == [{"a": 1}]
+
+    def test_invalid_json(self):
+        result = _parse_json_response("not json")
+        assert result is None
+
+    def test_empty_string(self):
+        result = _parse_json_response("")
+        assert result is None
 
 
 class TestParseClassificationResponse:
@@ -80,145 +98,6 @@ class TestParseClassificationResponse:
         result = _parse_classification_response(response)
         assert len(result) == 1
         assert result[0]["ip"] == "10.0.0.3"
-
-
-class TestParseChainResponse:
-    def test_valid_chain(self):
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "Printer pivot to DC",
-            "details": "Exploit printer, pivot to DC via shared segment",
-            "hosts": ["10.0.0.5", "10.0.1.10"],
-            "cves": ["CVE-2021-1234"],
-            "priority": 1,
-            "confidence": 0.85,
-        }])
-        result = _parse_chain_response(response)
-        assert len(result) == 1
-        assert result[0].title == "Printer pivot to DC"
-        assert result[0].priority == 1
-        assert "10.0.0.5" in result[0].hosts
-
-    def test_filters_low_confidence(self):
-        response = json.dumps([
-            {"type": "attack_chain", "title": "Good", "details": "x",
-             "priority": 1, "confidence": 0.8},
-            {"type": "attack_chain", "title": "Bad", "details": "x",
-             "priority": 2, "confidence": 0.3},
-        ])
-        result = _parse_chain_response(response)
-        assert len(result) == 1
-        assert result[0].title == "Good"
-
-    def test_sorts_by_priority(self):
-        response = json.dumps([
-            {"type": "attack_chain", "title": "Low prio", "details": "x",
-             "priority": 4, "confidence": 0.9},
-            {"type": "attack_chain", "title": "High prio", "details": "x",
-             "priority": 1, "confidence": 0.9},
-            {"type": "correlation", "title": "Mid prio", "details": "x",
-             "priority": 2, "confidence": 0.8},
-        ])
-        result = _parse_chain_response(response)
-        assert len(result) == 3
-        assert result[0].title == "High prio"
-        assert result[1].title == "Mid prio"
-        assert result[2].title == "Low prio"
-
-    def test_handles_markdown_fences(self):
-        response = "```json\n" + json.dumps([{
-            "type": "chokepoint", "title": "Gateway host", "details": "x",
-            "hosts": ["10.0.0.1"], "priority": 2, "confidence": 0.7,
-        }]) + "\n```"
-        result = _parse_chain_response(response)
-        assert len(result) == 1
-
-    def test_handles_invalid_json(self):
-        result = _parse_chain_response("broken {json")
-        assert result == []
-
-    def test_handles_empty_array(self):
-        result = _parse_chain_response("[]")
-        assert result == []
-
-    def test_skips_items_without_title(self):
-        response = json.dumps([
-            {"type": "attack_chain", "details": "x", "priority": 1, "confidence": 0.9},
-            {"type": "attack_chain", "title": "Has title", "details": "x",
-             "priority": 1, "confidence": 0.9},
-        ])
-        result = _parse_chain_response(response)
-        assert len(result) == 1
-
-
-class TestBuildPrompts:
-    def test_classification_prompt_includes_host_data(self):
-        hosts = [{
-            "ip": "10.0.0.1",
-            "hostname": "web01.corp",
-            "current_role": "unknown",
-            "confidence": 0.3,
-            "services": [
-                {"port": 80, "protocol": "tcp", "name": "http",
-                 "product": "Apache", "version": "2.4.49"},
-            ],
-        }]
-        prompt = _build_classification_prompt(hosts)
-        assert "10.0.0.1" in prompt
-        assert "web01.corp" in prompt
-        assert "Apache" in prompt
-        assert "JSON array" in prompt
-
-    def test_classification_prompt_handles_no_services(self):
-        hosts = [{
-            "ip": "10.0.0.2",
-            "hostname": None,
-            "current_role": "unknown",
-            "confidence": 0.1,
-            "services": [{"port": None}],
-        }]
-        prompt = _build_classification_prompt(hosts)
-        assert "10.0.0.2" in prompt
-        assert "none" in prompt
-
-    def test_chain_prompt_includes_graph_data(self):
-        subgraph = {
-            "hosts": [{
-                "ip": "10.0.1.10",
-                "hostname": "dc01.corp",
-                "role": "domain_controller",
-                "confidence": 0.95,
-                "segment": "10.0.1.0/24",
-                "services": [
-                    {"port": 389, "protocol": "tcp", "name": "ldap",
-                     "product": "MS LDAP", "version": None,
-                     "cve": "CVE-2021-9999", "cvss": 9.8, "has_exploit": True},
-                ],
-            }],
-            "connectivity": [
-                {"from_segment": "10.0.2.0/24", "to_segment": "10.0.1.0/24"},
-            ],
-            "pivots": [
-                {"from_ip": "10.0.2.20", "to_ip": "10.0.1.10",
-                 "method": "exploit", "difficulty": "easy"},
-            ],
-        }
-        prompt = _build_chain_discovery_prompt(subgraph)
-        assert "10.0.1.10" in prompt
-        assert "dc01.corp" in prompt
-        assert "domain_controller" in prompt
-        assert "CVE-2021-9999" in prompt
-        assert "EXPLOIT AVAILABLE" in prompt
-        assert "10.0.2.0/24 -> 10.0.1.0/24" in prompt
-
-    def test_chain_prompt_handles_empty_connectivity(self):
-        subgraph = {
-            "hosts": [{"ip": "10.0.0.1", "role": "unknown", "services": []}],
-            "connectivity": [],
-            "pivots": [],
-        }
-        prompt = _build_chain_discovery_prompt(subgraph)
-        assert "(none found)" in prompt
 
 
 class TestIsAiAvailable:
@@ -313,7 +192,136 @@ class TestAnalyzeGraph:
             result = analyze_graph()
             assert isinstance(result, AnalysisResult)
             assert result.insights == []
-            assert result.hosts_analyzed == 0
+            assert result.cves_found == 0
+            assert result.pivots_created == 0
+
+
+class TestApplyAiCves:
+    def test_valid_cve_response(self):
+        from cauldron.ai.analyzer import _apply_ai_cves
+
+        response = json.dumps([{
+            "product": "Apache",
+            "version": "2.4.49",
+            "cves": [{
+                "cve_id": "CVE-2021-41773",
+                "cvss": 7.5,
+                "severity": "HIGH",
+                "has_exploit": True,
+                "description": "Path traversal",
+            }],
+        }])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            cves, services = _apply_ai_cves(response)
+            assert cves == 1
+            assert services == 1
+            assert mock_session.run.call_count == 2  # MERGE vuln + link to service
+
+    def test_skips_invalid_cve_ids(self):
+        from cauldron.ai.analyzer import _apply_ai_cves
+
+        response = json.dumps([{
+            "product": "Apache",
+            "version": "2.4.49",
+            "cves": [{"cve_id": "NOT-A-CVE", "cvss": 5.0}],
+        }])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            cves, services = _apply_ai_cves(response)
+            assert cves == 0
+            assert services == 0
+
+    def test_handles_invalid_json(self):
+        from cauldron.ai.analyzer import _apply_ai_cves
+
+        cves, services = _apply_ai_cves("not json")
+        assert cves == 0
+        assert services == 0
+
+
+class TestParseAndCreateChainPivots:
+    def test_valid_chain(self):
+        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+
+        response = json.dumps([{
+            "type": "attack_chain",
+            "title": "Printer pivot to DC",
+            "path": ["10.0.0.5", "10.0.1.10"],
+            "priority": 1,
+            "confidence": 0.85,
+        }])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_result = MagicMock()
+            mock_result.single.return_value = {"ip": "10.0.0.5"}
+            mock_session.run.return_value = mock_result
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            insights, pivots = _parse_and_create_chain_pivots(response)
+            assert len(insights) == 1
+            assert insights[0].title == "Printer pivot to DC"
+            assert pivots == 1
+
+    def test_filters_low_confidence(self):
+        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+
+        response = json.dumps([{
+            "type": "attack_chain",
+            "title": "Bad chain",
+            "path": ["10.0.0.1", "10.0.0.2"],
+            "priority": 1,
+            "confidence": 0.3,
+        }])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            insights, pivots = _parse_and_create_chain_pivots(response)
+            assert len(insights) == 0
+            assert pivots == 0
+
+    def test_handles_invalid_json(self):
+        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+
+        insights, pivots = _parse_and_create_chain_pivots("broken")
+        assert insights == []
+        assert pivots == 0
+
+    def test_sorts_by_priority(self):
+        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+
+        response = json.dumps([
+            {"type": "attack_chain", "title": "Low", "path": ["10.0.0.1", "10.0.0.2"],
+             "priority": 4, "confidence": 0.9},
+            {"type": "attack_chain", "title": "High", "path": ["10.0.0.3", "10.0.0.4"],
+             "priority": 1, "confidence": 0.9},
+        ])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_result = MagicMock()
+            mock_result.single.return_value = {"ip": "10.0.0.1"}
+            mock_session.run.return_value = mock_result
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            insights, _ = _parse_and_create_chain_pivots(response)
+            assert len(insights) == 2
+            assert insights[0].title == "High"
+            assert insights[1].title == "Low"
 
 
 # --- Integration tests (require Neo4j) ---
@@ -383,59 +391,3 @@ class TestApplyClassifications:
         from cauldron.ai.analyzer import _apply_classifications
 
         assert _apply_classifications([]) == 0
-
-
-@pytestmark_neo4j
-class TestStoreInsights:
-    def test_stores_insight_on_host(self, clean_db):
-        with get_session() as session:
-            session.run("CREATE (:Host {ip: '10.0.0.1', state: 'up'})")
-
-        insights = [AIInsight(
-            insight_type="attack_chain",
-            confidence=0.9,
-            title="Printer pivot to DC",
-            details="test",
-            hosts=["10.0.0.1"],
-            priority=1,
-        )]
-        stored = store_insights(insights)
-        assert stored == 1
-
-        with get_session() as session:
-            result = session.run(
-                "MATCH (h:Host {ip: '10.0.0.1'}) RETURN h.ai_insight_title AS title"
-            )
-            assert result.single()["title"] == "Printer pivot to DC"
-
-    def test_empty_insights(self, clean_db):
-        assert store_insights([]) == 0
-
-
-@pytestmark_neo4j
-class TestExtractSubgraph:
-    def test_extracts_hosts_and_connectivity(self, clean_db):
-        from cauldron.ai.analyzer import _extract_subgraph
-
-        with get_session() as session:
-            session.run("""
-                CREATE (h:Host {ip: '10.0.0.1', hostname: 'web01', state: 'up',
-                               role: 'web_server', role_confidence: 0.9})
-                CREATE (seg:NetworkSegment {cidr: '10.0.0.0/24'})
-                CREATE (h)-[:IN_SEGMENT]->(seg)
-                CREATE (h)-[:HAS_SERVICE]->(:Service {
-                    port: 80, protocol: 'tcp', name: 'http',
-                    product: 'Apache', version: '2.4.49', host_ip: '10.0.0.1'
-                })
-            """)
-
-        subgraph = _extract_subgraph(max_hosts=10)
-        assert subgraph is not None
-        assert len(subgraph["hosts"]) == 1
-        assert subgraph["hosts"][0]["ip"] == "10.0.0.1"
-
-    def test_empty_graph(self, clean_db):
-        from cauldron.ai.analyzer import _extract_subgraph
-
-        subgraph = _extract_subgraph(max_hosts=10)
-        assert subgraph is None

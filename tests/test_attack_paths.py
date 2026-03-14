@@ -324,6 +324,109 @@ class TestGetPathSummary:
         assert summary["high_value_targets"] == {}
 
 
+class TestAIPivotIntegration:
+    """Test that AI-created PIVOT_TO relationships appear in path discovery."""
+
+    def test_ai_pivot_appears_in_paths(self):
+        """AI creates PIVOT_TO between printer and DC → paths should find it."""
+        _setup_attack_graph()
+
+        # Add a printer host in a different segment (not directly reachable)
+        with get_session() as session:
+            session.run("""
+                CREATE (seg:NetworkSegment {cidr: '10.0.3.0/24'})
+                CREATE (h:Host {ip: '10.0.3.50', hostname: 'printer01',
+                               state: 'up', role: 'printer', role_confidence: 0.9})
+                CREATE (h)-[:IN_SEGMENT]->(seg)
+            """)
+            # Scan source scanned the printer
+            session.run("""
+                MATCH (src:ScanSource {name: '192.168.1.100'}), (h:Host {ip: '10.0.3.50'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # AI discovers: printer → DC (method=ai_chain)
+            session.run("""
+                MATCH (h1:Host {ip: '10.0.3.50'}), (h2:Host {ip: '10.0.1.10'})
+                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'medium',
+                                        ai_title: 'Printer SNMP to DC'}]->(h2)
+            """)
+
+        paths = discover_attack_paths(target_role="domain_controller")
+
+        # Should find the AI chain path (printer → DC)
+        ai_paths = [p for p in paths if any(
+            n.ip == "10.0.3.50" for n in p.nodes
+        )]
+        assert len(ai_paths) >= 1
+        assert ai_paths[0].target_role == "domain_controller"
+
+    def test_ai_cves_upgrade_pivot_difficulty(self):
+        """AI-found CVEs should upgrade shared_segment pivots to exploit."""
+        _setup_attack_graph()
+        build_pivot_relationships()
+
+        # Before AI: WEB01→DC should exist (via CAN_REACH segments)
+        paths_before = discover_attack_paths(target_role="domain_controller")
+        dc_path_before = next(
+            (p for p in paths_before if p.target_ip == "10.0.1.10"), None
+        )
+        score_before = dc_path_before.score if dc_path_before else 0
+
+        # AI finds CVE on DC's LDAP service
+        with get_session() as session:
+            session.run("""
+                MERGE (v:Vulnerability {cve_id: 'CVE-2022-99999'})
+                SET v.cvss = 9.8, v.severity = 'CRITICAL',
+                    v.has_exploit = true, v.source = 'ai'
+            """)
+            session.run("""
+                MATCH (s:Service {host_ip: '10.0.1.10', port: 389})
+                MATCH (v:Vulnerability {cve_id: 'CVE-2022-99999'})
+                MERGE (s)-[:HAS_VULN]->(v)
+            """)
+
+        # Rebuild pivots with new CVE data
+        build_pivot_relationships()
+        paths_after = discover_attack_paths(target_role="domain_controller")
+        dc_path_after = next(
+            (p for p in paths_after if p.target_ip == "10.0.1.10"), None
+        )
+
+        assert dc_path_after is not None
+        assert dc_path_after.score > score_before
+        assert dc_path_after.max_cvss >= 9.8
+
+    def test_multiple_paths_to_same_target_preserved(self):
+        """Different paths to same target should NOT be deduplicated."""
+        _setup_attack_graph()
+        build_pivot_relationships()
+
+        # Create two different AI chains to DC
+        with get_session() as session:
+            # Chain 1: WEB02 → DC (ai_chain)
+            session.run("""
+                MATCH (h1:Host {ip: '10.0.2.21'}), (h2:Host {ip: '10.0.1.10'})
+                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'easy',
+                                        ai_title: 'Tomcat to DC'}]->(h2)
+            """)
+            # Chain 2: DB01 → DC (ai_chain)
+            session.run("""
+                MATCH (h1:Host {ip: '10.0.1.30'}), (h2:Host {ip: '10.0.1.10'})
+                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'medium',
+                                        ai_title: 'DB to DC lateral'}]->(h2)
+            """)
+
+        paths = discover_attack_paths(target_role="domain_controller")
+
+        # Should have multiple distinct paths to DC (not just one)
+        dc_paths = [p for p in paths if p.target_ip == "10.0.1.10"]
+        assert len(dc_paths) >= 2
+
+        # Paths should have different intermediate nodes
+        path_signatures = {tuple(n.ip for n in p.nodes) for p in dc_paths}
+        assert len(path_signatures) >= 2
+
+
 class TestFullPipeline:
     def test_brew_boil_paths_pipeline(self):
         """Test the complete pipeline with corporate_network.xml."""
