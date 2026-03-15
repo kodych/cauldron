@@ -55,6 +55,10 @@ ROLE_ICONS = {
     "dns_server": "[bright_cyan]DNS[/bright_cyan]",
     "proxy": "[bright_magenta]PROXY[/bright_magenta]",
     "monitoring": "[bright_white]MON[/bright_white]",
+    "siem": "[bold red]SIEM[/bold red]",
+    "ci_cd": "[bold yellow]CI/CD[/bold yellow]",
+    "vpn_gateway": "[bold green]VPN[/bold green]",
+    "backup": "[bright_blue]BAK[/bright_blue]",
     "unknown": "[dim]?[/dim]",
 }
 
@@ -240,9 +244,32 @@ def boil(ai: bool):
             icon = ROLE_ICONS.get(role, "[dim]?[/dim]")
             console.print(f"      {icon} {role.replace('_', ' ').title()}: {count}")
 
-    # Phase 2: CVE enrichment
+    # Phase 1.5: Local Exploit DB matching
     console.print()
-    console.print("[bold cyan]Phase 2: CVE Enrichment[/bold cyan]")
+    console.print("[bold cyan]Phase 2: Local Exploit Database[/bold cyan]")
+
+    from cauldron.exploits.matcher import ExploitDB
+
+    with console.status("[bold green]Matching services against exploit database..."):
+        exploit_db = ExploitDB()
+        exploit_stats = exploit_db.match_from_graph()
+
+    if exploit_stats["exploits_found"]:
+        console.print(
+            f"  [bold red]![/bold red] Found [bold red]{exploit_stats['exploits_found']}[/bold red] "
+            f"known exploits on [bold]{exploit_stats['hosts_matched']}[/bold] hosts"
+        )
+        if exploit_stats["guaranteed_wins"]:
+            console.print(
+                f"  [bold red]![/bold red] [bold red]{exploit_stats['guaranteed_wins']} guaranteed wins[/bold red] "
+                f"(easy difficulty)"
+            )
+    else:
+        console.print("  [dim]  No matches in local exploit database[/dim]")
+
+    # Phase 3: CVE enrichment (NVD API)
+    console.print()
+    console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")
 
     from cauldron.ai.cve_enricher import enrich_services_from_graph
 
@@ -256,9 +283,9 @@ def boil(ai: bool):
     if cve_stats["errors"]:
         console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
 
-    # Phase 3: Network topology
+    # Phase 4: Network topology
     console.print()
-    console.print("[bold cyan]Phase 3: Network Topology[/bold cyan]")
+    console.print("[bold cyan]Phase 4: Network Topology[/bold cyan]")
 
     from cauldron.graph.topology import build_segment_connectivity
 
@@ -270,9 +297,9 @@ def boil(ai: bool):
     if topo_stats["gateway_hosts"]:
         console.print(f"  [green]+[/green] {topo_stats['gateway_hosts']} gateway/router hosts detected")
 
-    # Phase 4: Attack path pivots
+    # Phase 5: Attack path pivots
     console.print()
-    console.print("[bold cyan]Phase 4: Attack Paths[/bold cyan]")
+    console.print("[bold cyan]Phase 5: Attack Paths[/bold cyan]")
 
     from cauldron.ai.attack_paths import build_pivot_relationships
 
@@ -282,10 +309,10 @@ def boil(ai: bool):
     console.print(f"  [green]+[/green] Analyzed {pivot_stats['pairs_analyzed']} host pairs")
     console.print(f"  [green]+[/green] Created {pivot_stats['pivots_created']} pivot relationships")
 
-    # Phase 5: AI Analysis (optional)
+    # Phase 6: AI Analysis (optional)
     if ai:
         console.print()
-        console.print("[bold cyan]Phase 5: AI Analysis[/bold cyan]")
+        console.print("[bold cyan]Phase 6: AI Analysis[/bold cyan]")
 
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
 
@@ -409,6 +436,60 @@ def paths(target: str | None, role: str | None, top: int):
         )
 
     console.print(path_table)
+    console.print()
+
+
+@cli.command()
+def exploits():
+    """Show guaranteed exploits found by the local exploit database."""
+    from cauldron.graph.connection import verify_connection
+
+    if not verify_connection():
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
+        raise SystemExit(1)
+
+    from cauldron.exploits.matcher import ExploitDB
+
+    console.print()
+    console.print("[bold magenta]Exploit Database Matches[/bold magenta]")
+    console.print()
+
+    exploit_db = ExploitDB()
+    reports = exploit_db.get_host_reports()
+
+    if not reports:
+        console.print("[yellow]No exploit matches found. Run [cyan]cauldron boil[/cyan] first to import services.[/yellow]")
+        return
+
+    total_exploits = sum(len(r.exploits) for r in reports)
+    total_easy = sum(r.guaranteed_wins for r in reports)
+    total_rce = sum(1 for r in reports if r.has_rce)
+
+    console.print(f"  [bold red]{total_exploits}[/bold red] exploits on [bold]{len(reports)}[/bold] hosts")
+    console.print(f"  [bold red]{total_easy}[/bold red] guaranteed wins (easy difficulty)")
+    if total_rce:
+        console.print(f"  [bold red]{total_rce}[/bold red] hosts with RCE")
+    console.print()
+
+    for report in reports:
+        host_label = report.ip
+        if report.hostname:
+            host_label += f" ({report.hostname})"
+        if report.os_name:
+            host_label += f" [{report.os_name}]"
+
+        console.print(f"  [bold]{host_label}[/bold]")
+        for exploit in report.exploits:
+            diff_color = "red" if exploit.difficulty == "easy" else "yellow" if exploit.difficulty == "medium" else "dim"
+            cve_str = f" {exploit.cve}" if exploit.cve else ""
+            module_str = f" | {exploit.module}" if exploit.module else ""
+            console.print(
+                f"    [{diff_color}]{exploit.difficulty.upper():6s}[/{diff_color}] "
+                f"{exploit.title}{cve_str}{module_str}"
+            )
+        console.print()
+
+    console.print(f"[dim]Database: {exploit_db.size} rules loaded[/dim]")
     console.print()
 
 

@@ -210,6 +210,126 @@ class TestScorePath:
         assert _score_path(high_cvss) > _score_path(low_cvss)
 
 
+class TestScorePathNewRoles:
+    """Test scoring for new target roles (siem, ci_cd, backup)."""
+
+    def test_siem_scores_high(self):
+        siem_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="siem", role="siem")],
+            target_role="siem",
+            hop_count=1,
+            max_cvss=7.0,
+            has_exploits=True,
+        )
+        web_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="web", role="web_server")],
+            target_role="web_server",
+            hop_count=1,
+            max_cvss=7.0,
+            has_exploits=True,
+        )
+        assert _score_path(siem_path) > _score_path(web_path)
+
+    def test_ci_cd_scores_above_web(self):
+        ci_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="ci", role="ci_cd")],
+            target_role="ci_cd",
+            hop_count=1,
+        )
+        web_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="web", role="web_server")],
+            target_role="web_server",
+            hop_count=1,
+        )
+        assert _score_path(ci_path) > _score_path(web_path)
+
+    def test_backup_scores_above_dns(self):
+        backup_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="bk", role="backup")],
+            target_role="backup",
+            hop_count=1,
+        )
+        dns_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="dns", role="dns_server")],
+            target_role="dns_server",
+            hop_count=1,
+        )
+        assert _score_path(backup_path) > _score_path(dns_path)
+
+
+class TestScorePathNonLinearCVSS:
+    """Test the non-linear CVSS scoring curve."""
+
+    def test_critical_cvss_max_score(self):
+        path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt", max_cvss=9.8)],
+            target_role="web_server",
+            hop_count=1,
+            max_cvss=9.8,
+        )
+        score = _score_path(path)
+        # CVSS 9.8 should contribute 35 points
+        # target_value(web_server)=10 + cvss=35 + hop(1)=15 = 60
+        assert score >= 55
+
+    def test_low_cvss_scores_low(self):
+        path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt", max_cvss=2.0)],
+            target_role="web_server",
+            hop_count=1,
+            max_cvss=2.0,
+        )
+        score = _score_path(path)
+        # CVSS 2.0 → 2.0*2.5=5, target=10, hop=15 → ~30
+        assert score < 35
+
+    def test_medium_cvss_middle_range(self):
+        path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt", max_cvss=5.5)],
+            target_role="web_server",
+            hop_count=1,
+            max_cvss=5.5,
+        )
+        score = _score_path(path)
+        # CVSS 5.5: 10 + (5.5-4)*5 = 17.5, target=10, hop=15 → ~42.5
+        assert 35 < score < 50
+
+
+class TestScorePathPivotMethods:
+    def test_exploit_pivot_adds_bonus(self):
+        with_exploit_pivot = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            pivot_methods=["exploit"],
+        )
+        with_shared_segment = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            pivot_methods=["shared_segment"],
+        )
+        assert _score_path(with_exploit_pivot) > _score_path(with_shared_segment)
+
+    def test_pivot_method_bonus_capped(self):
+        many_exploits = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            pivot_methods=["exploit"] * 10,  # 30 points worth
+        )
+        score_many = _score_path(many_exploits)
+        few_exploits = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            pivot_methods=["exploit"] * 3,  # 9 points
+        )
+        score_few = _score_path(few_exploits)
+        # Cap is 10, so 10 exploits shouldn't score much more than 4
+        assert score_many - score_few <= 2
+
+
 class TestBuildPivotRelationships:
     def test_creates_pivots(self):
         _setup_attack_graph()

@@ -203,6 +203,89 @@ class TestVoIP:
         assert result.role == HostRole.VOIP
 
 
+class TestSIEM:
+    def test_splunk_ports(self):
+        host = _host([8000, 8089])
+        result = classify_host(host)
+        assert result.role == HostRole.SIEM
+        assert result.confidence >= 0.85
+
+    def test_elk_stack(self):
+        host = _host([9200, 5601])
+        result = classify_host(host)
+        assert result.role == HostRole.SIEM
+        assert result.confidence >= 0.80
+
+    def test_wazuh_product(self):
+        host = _host([1514, 1515], {1514: "Wazuh manager"})
+        result = classify_host(host)
+        assert result.role == HostRole.SIEM
+
+    def test_syslog_alone_low_confidence(self):
+        host = _host([514])
+        result = classify_host(host)
+        assert result.role == HostRole.SIEM
+        assert result.confidence <= 0.70
+
+
+class TestCICD:
+    def test_jenkins_ports(self):
+        host = _host([8080, 50000])
+        result = classify_host(host)
+        assert result.role == HostRole.CI_CD
+        assert result.confidence >= 0.80
+
+    def test_jenkins_product_with_agent_port(self):
+        host = _host([8080, 50000], {8080: "Jenkins"})
+        result = classify_host(host)
+        assert result.role == HostRole.CI_CD
+
+    def test_ci_cd_suppresses_web(self):
+        """CI/CD with high confidence should suppress web_server."""
+        host = _host([8080, 50000])
+        result = classify_host(host)
+        assert result.role == HostRole.CI_CD
+        assert HostRole.WEB_SERVER not in result.secondary_roles
+
+
+class TestVPNGateway:
+    def test_openvpn(self):
+        host = _host([1194])
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+        assert result.confidence >= 0.80
+
+    def test_ipsec(self):
+        host = _host([500, 4500])
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+        assert result.confidence >= 0.85
+
+    def test_wireguard_product(self):
+        host = _host([51820], {51820: "WireGuard"})
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+
+    def test_vpn_suppresses_remote_access(self):
+        host = _host([1194, 3389])
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+        assert HostRole.REMOTE_ACCESS not in result.secondary_roles
+
+
+class TestBackup:
+    def test_bacula_ports(self):
+        host = _host([9102, 9103])
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+        assert result.confidence >= 0.75
+
+    def test_veeam_product(self):
+        host = _host([9392], {9392: "Veeam Backup"})
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+
+
 class TestEdgeCases:
     def test_no_open_ports(self):
         host = _host([])

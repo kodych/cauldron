@@ -21,6 +21,9 @@ HIGH_VALUE_ROLES = [
     "mail_server",
     "file_server",
     "hypervisor",
+    "siem",
+    "ci_cd",
+    "backup",
 ]
 
 # Roles that are good pivot points
@@ -418,39 +421,53 @@ def _determine_pivot_methods(pivot: PathNode, target: PathNode) -> list[str]:
 def _score_path(path: AttackPath) -> float:
     """Score an attack path. Higher = more dangerous / easier to exploit.
 
-    Scoring factors:
-    - CVSS of vulnerabilities along the path (higher = easier to exploit)
-    - Exploit availability (big bonus)
-    - Fewer hops = easier path
-    - Target value (DC > DB > mail > file_server)
+    Scoring factors (max ~115):
+    - Target value (0-30): DC highest, then DB, SIEM, CI/CD, etc.
+    - CVSS contribution (0-35): non-linear — critical vulns score much higher
+    - Exploit availability (0-25): bonus for known exploits
+    - Hop bonus (0-15): fewer hops = easier path
+    - Pivot method quality (0-10): exploit pivots > shared_segment
     """
     score = 0.0
 
-    # Target value score (0-30 points)
+    # 1. Target value (0-30 points)
     target_value = {
         "domain_controller": 30.0,
         "database": 25.0,
+        "siem": 24.0,
+        "ci_cd": 23.0,
         "hypervisor": 22.0,
         "mail_server": 20.0,
+        "backup": 18.0,
         "file_server": 15.0,
         "web_server": 10.0,
         "dns_server": 8.0,
     }
     score += target_value.get(path.target_role, 5.0)
 
-    # CVSS score contribution (0-30 points)
-    # Max CVSS across all nodes in the path
+    # 2. CVSS contribution (0-35 points) — non-linear curve
     max_cvss = max((n.max_cvss for n in path.nodes), default=0.0)
-    score += max_cvss * 3.0  # Scale: 10.0 CVSS → 30 points
+    if max_cvss >= 9.0:
+        score += 35.0
+    elif max_cvss >= 7.0:
+        score += 25.0 + (max_cvss - 7.0) * 5.0
+    elif max_cvss >= 4.0:
+        score += 10.0 + (max_cvss - 4.0) * 5.0
+    else:
+        score += max_cvss * 2.5
 
-    # Exploit availability (0-25 points)
+    # 3. Exploit availability (0-25 points)
     if path.has_exploits:
         score += 25.0
 
-    # Hop penalty (fewer hops = better)
-    # 1 hop = 15 bonus, 2 hops = 10, 3 = 5, 4+ = 0
-    hop_bonus = max(0.0, 15.0 - (path.hop_count - 1) * 5.0)
+    # 4. Hop bonus (0-15 points) — steeper penalty for multi-hop
+    hop_bonus = {1: 15.0, 2: 8.0, 3: 3.0}.get(path.hop_count, 0.0)
     score += hop_bonus
+
+    # 5. Pivot method quality (0-10 points)
+    method_scores = {"exploit": 3.0, "ai_chain": 2.0, "vuln_service": 1.0}
+    method_bonus = sum(method_scores.get(m, 0.0) for m in path.pivot_methods)
+    score += min(method_bonus, 10.0)
 
     return round(score, 1)
 
