@@ -1,12 +1,13 @@
 """Cauldron CLI commands.
 
 Themed after brewing potions:
-  brew   — import scan files (throw ingredients in)
-  boil   — run AI analysis
-  taste  — view graph statistics
-  paths  — show attack paths
-  pour   — export report
-  reset  — clear the cauldron
+  brew       — import scan files (throw ingredients in)
+  boil       — run analysis (classify, exploit DB, CVE, topology, pivots)
+  taste      — view graph statistics
+  paths      — show attack paths with exploit details
+  condiments — quick reference: guaranteed exploits per host
+  pour       — export report
+  reset      — clear the cauldron
 """
 
 from __future__ import annotations
@@ -398,50 +399,45 @@ def paths(target: str | None, role: str | None, top: int):
         console.print("[yellow]No attack paths found to the specified targets.[/yellow]")
         return
 
-    # Display paths
-    path_table = Table(title=f"Top {min(top, len(attack_paths))} Attack Paths", padding=(0, 1))
-    path_table.add_column("#", style="dim", width=3)
-    path_table.add_column("Score", style="bold red", justify="right", width=6)
-    path_table.add_column("Path", style="white")
-    path_table.add_column("Target", style="bold")
-    path_table.add_column("CVSS", justify="right", width=5)
-    path_table.add_column("Exploit", justify="center", width=7)
-    path_table.add_column("Hops", justify="right", width=4)
-
+    # Display paths with exploit details
     for i, path in enumerate(attack_paths[:top], 1):
-        # Build path display string
+        # Header line: score + path chain
         path_parts = []
         for node in path.nodes:
             if node.role == "scan_source":
                 path_parts.append(f"[dim]{node.ip}[/dim]")
             else:
                 icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
-                path_parts.append(f"{icon} {node.ip}")
+                label = node.hostname or node.ip
+                path_parts.append(f"{icon} {label}")
         path_str = " -> ".join(path_parts)
 
-        target_icon = ROLE_ICONS.get(path.target_role, "")
-        target_display = f"{target_icon} {path.target_role.replace('_', ' ').title()}"
+        score_color = "bold red" if path.score >= 60 else "bold yellow" if path.score >= 40 else "white"
+        console.print(f"  [{score_color}]#{i}  Score {path.score:.0f}[/{score_color}]  {path_str}")
 
-        cvss_str = f"{path.max_cvss:.1f}" if path.max_cvss > 0 else "[dim]-[/dim]"
-        exploit_str = "[red]YES[/red]" if path.has_exploits else "[dim]no[/dim]"
+        # Details: exploits along the path (skip scan_source)
+        for node in path.nodes:
+            if node.role == "scan_source" or not node.vulns:
+                continue
+            icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
+            for vuln in node.vulns[:3]:  # Top 3 vulns per node
+                expl_marker = "[red]EXPLOIT[/red]" if vuln.has_exploit else f"[yellow]CVSS {vuln.cvss:.1f}[/yellow]"
+                title = vuln.title.split(":")[0].strip() if vuln.title else ""
+                title_str = f" {title}" if title else ""
+                console.print(f"       {icon} {node.ip}  {expl_marker} {vuln.cve_id}{title_str}")
 
-        path_table.add_row(
-            str(i),
-            f"{path.score:.1f}",
-            path_str,
-            target_display,
-            cvss_str,
-            exploit_str,
-            str(path.hop_count),
-        )
+        # Show pivot methods if available
+        methods = [m for m in path.pivot_methods if m != "direct"]
+        if methods:
+            method_str = " -> ".join(methods)
+            console.print(f"       [dim]pivot: {method_str}[/dim]")
 
-    console.print(path_table)
-    console.print()
+        console.print()
 
 
 @cli.command()
-def exploits():
-    """Show guaranteed exploits found by the local exploit database."""
+def condiments():
+    """Show guaranteed exploits per host (quick reference)."""
     from cauldron.graph.connection import verify_connection
 
     if not verify_connection():

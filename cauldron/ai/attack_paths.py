@@ -45,6 +45,16 @@ PIVOT_DIFFICULTY = {
 
 
 @dataclass
+class VulnInfo:
+    """Lightweight vulnerability info attached to a path node."""
+
+    cve_id: str
+    cvss: float = 0.0
+    has_exploit: bool = False
+    title: str = ""
+
+
+@dataclass
 class PathNode:
     """A single node in an attack path."""
 
@@ -55,6 +65,7 @@ class PathNode:
     max_cvss: float = 0.0
     has_exploit: bool = False
     service_count: int = 0
+    vulns: list[VulnInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -366,7 +377,7 @@ def _find_pivot_chain_paths(
 
 
 def _get_host_info(session, ip: str) -> PathNode | None:
-    """Get enriched info about a host."""
+    """Get enriched info about a host including vulnerability details."""
     result = session.run(
         """
         MATCH (h:Host {ip: $ip})
@@ -377,13 +388,28 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                seg.cidr AS segment,
                count(DISTINCT s) AS service_count,
                max(v.cvss) AS max_cvss,
-               max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
+               max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
+               collect(DISTINCT {cve: v.cve_id, cvss: v.cvss,
+                       has_exploit: v.has_exploit, desc: v.description}) AS vulns
         """,
         ip=ip,
     )
     record = result.single()
     if not record or not record["ip"]:
         return None
+
+    # Parse vulnerability details (filter out nulls from OPTIONAL MATCH)
+    vulns = []
+    for v in record["vulns"]:
+        if v["cve"]:
+            vulns.append(VulnInfo(
+                cve_id=v["cve"],
+                cvss=v["cvss"] or 0.0,
+                has_exploit=bool(v["has_exploit"]),
+                title=(v["desc"] or "")[:80],
+            ))
+    # Sort by CVSS descending, exploitable first
+    vulns.sort(key=lambda v: (-int(v.has_exploit), -v.cvss))
 
     return PathNode(
         ip=record["ip"],
@@ -393,6 +419,7 @@ def _get_host_info(session, ip: str) -> PathNode | None:
         max_cvss=record["max_cvss"] or 0.0,
         has_exploit=bool(record["has_exploit"]),
         service_count=record["service_count"] or 0,
+        vulns=vulns,
     )
 
 
