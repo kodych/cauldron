@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # NVD API (optional, for higher rate limits)
     nvd_api_key: str = ""
 
+    # Network segmentation (default /24, adjust for non-standard subnets)
+    segment_prefix_len: int = 24
+
     model_config = {"env_prefix": "CAULDRON_", "env_file": ".env"}
 
 

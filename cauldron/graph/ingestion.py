@@ -229,10 +229,15 @@ def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: i
 
 
 def _get_segment_cidr(ip: str) -> str | None:
-    """Determine the /24 network segment for an IP address."""
+    """Determine the network segment for an IP address.
+
+    Uses configurable prefix length (default from settings.segment_prefix_len).
+    """
+    from cauldron.config import settings
+
     try:
         addr = ipaddress.ip_address(ip)
-        network = ipaddress.ip_network(f"{addr}/24", strict=False)
+        network = ipaddress.ip_network(f"{addr}/{settings.segment_prefix_len}", strict=False)
         return str(network)
     except ValueError:
         return None

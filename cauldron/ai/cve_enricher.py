@@ -68,17 +68,26 @@ class EnrichmentResult:
 
 
 class CVECache:
-    """Simple JSON file cache for CVE lookups."""
+    """Simple JSON file cache for CVE lookups with TTL support."""
 
-    def __init__(self, cache_file: Path = CACHE_FILE):
+    DEFAULT_TTL = 7 * 24 * 3600  # 7 days in seconds
+
+    def __init__(self, cache_file: Path = CACHE_FILE, ttl: int | None = None):
         self._file = cache_file
-        self._data: dict[str, list[dict]] = {}
+        self._ttl = ttl if ttl is not None else self.DEFAULT_TTL
+        self._data: dict[str, dict] = {}
         self._load()
 
     def _load(self) -> None:
         if self._file.exists():
             try:
-                self._data = json.loads(self._file.read_text(encoding="utf-8"))
+                raw = json.loads(self._file.read_text(encoding="utf-8"))
+                # Migrate old format (list) to new format (dict with _cached_at)
+                for key, value in raw.items():
+                    if isinstance(value, list):
+                        self._data[key] = {"cves": value, "_cached_at": 0}
+                    elif isinstance(value, dict):
+                        self._data[key] = value
             except (json.JSONDecodeError, OSError):
                 self._data = {}
 
@@ -87,14 +96,22 @@ class CVECache:
         self._file.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
 
     def get(self, key: str) -> list[CVEInfo] | None:
-        """Get cached CVEs for a product+version key."""
-        if key in self._data:
-            return [CVEInfo.from_dict(d) for d in self._data[key]]
-        return None
+        """Get cached CVEs for a product+version key. Returns None if expired."""
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        cached_at = entry.get("_cached_at", 0)
+        if self._ttl > 0 and time.time() - cached_at > self._ttl:
+            del self._data[key]
+            return None
+        return [CVEInfo.from_dict(d) for d in entry.get("cves", [])]
 
     def put(self, key: str, cves: list[CVEInfo]) -> None:
-        """Cache CVEs for a product+version key."""
-        self._data[key] = [c.to_dict() for c in cves]
+        """Cache CVEs for a product+version key with timestamp."""
+        self._data[key] = {
+            "cves": [c.to_dict() for c in cves],
+            "_cached_at": time.time(),
+        }
         self._save()
 
     @property
@@ -273,11 +290,12 @@ def enrich_services_from_graph() -> dict:
     cache = CVECache()
 
     with get_session() as session:
-        # Get all services with product+version
+        # Get services with product+version that have no CVEs yet
         result = session.run(
             """
             MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)
             WHERE s.product IS NOT NULL AND s.version IS NOT NULL
+            AND NOT (s)-[:HAS_VULN]->(:Vulnerability)
             RETURN DISTINCT s.product AS product, s.version AS version
             """
         )

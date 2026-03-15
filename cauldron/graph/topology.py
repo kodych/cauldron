@@ -182,11 +182,17 @@ def _count_gateway_hosts(session) -> int:
     return record["cnt"] if record else 0
 
 
-def _ip_to_segment(ip: str) -> str | None:
-    """Convert an IP address to its /24 segment CIDR."""
+def _ip_to_segment(ip: str, prefix_len: int | None = None) -> str | None:
+    """Convert an IP address to its network segment CIDR.
+
+    Uses configurable prefix length (default from settings.segment_prefix_len).
+    """
+    if prefix_len is None:
+        from cauldron.config import settings
+        prefix_len = settings.segment_prefix_len
     try:
         addr = ipaddress.ip_address(ip)
-        network = ipaddress.ip_network(f"{addr}/24", strict=False)
+        network = ipaddress.ip_network(f"{addr}/{prefix_len}", strict=False)
         return str(network)
     except ValueError:
         return None

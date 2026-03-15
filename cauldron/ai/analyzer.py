@@ -161,7 +161,8 @@ def _apply_ai_cves(response: str) -> tuple[int, int]:
                 if not cve_id.startswith("CVE-"):
                     continue
 
-                cvss = float(cve.get("cvss", 0))
+                cvss_raw = cve.get("cvss")
+                cvss = float(cvss_raw) if cvss_raw is not None else 0.0
                 severity = cve.get("severity", "MEDIUM")
                 has_exploit = bool(cve.get("has_exploit", False))
                 description = cve.get("description", "")
@@ -232,7 +233,7 @@ def _classify_ambiguous_hosts() -> int:
 
     prompt = f"""Classify these network hosts by role based on their services.
 
-Roles: domain_controller, web_server, database, mail_server, file_server, network_equipment, printer, voip, remote_access, hypervisor, dns_server, proxy, monitoring, unknown
+Roles: domain_controller, web_server, database, mail_server, file_server, network_equipment, printer, voip, remote_access, hypervisor, dns_server, proxy, monitoring, siem, ci_cd, vpn_gateway, backup, unknown
 
 Hosts:
 {chr(10).join(lines)}
@@ -415,8 +416,10 @@ def _parse_and_create_chain_pivots(response: str) -> tuple[list[AIInsight], int]
                 continue
             path = item.get("path", [])
             title = item.get("title", "")
-            priority = int(item.get("priority", 3))
-            confidence = float(item.get("confidence", 0.5))
+            priority_raw = item.get("priority")
+            priority = int(priority_raw) if priority_raw is not None else 3
+            confidence_raw = item.get("confidence")
+            confidence = float(confidence_raw) if confidence_raw is not None else 0.5
 
             if not title or confidence <= 0.5 or len(path) < 2:
                 continue
@@ -512,7 +515,8 @@ def _parse_classification_response(response: str) -> list[dict]:
         "domain_controller", "web_server", "database", "mail_server",
         "file_server", "network_equipment", "printer", "voip",
         "remote_access", "hypervisor", "dns_server", "proxy",
-        "monitoring", "unknown",
+        "monitoring", "siem", "ci_cd", "vpn_gateway", "backup",
+        "unknown",
     }
 
     results = []
