@@ -52,6 +52,7 @@ class VulnInfo:
     cvss: float = 0.0
     has_exploit: bool = False
     title: str = ""
+    confidence: str = "check"  # confirmed | likely | check
 
 
 @dataclass
@@ -87,6 +88,17 @@ class AttackPath:
     @property
     def target_ip(self) -> str:
         return self.nodes[-1].ip if self.nodes else ""
+
+    @property
+    def max_confidence(self) -> str:
+        """Best confidence level across all vulns in the path."""
+        best = "check"
+        order = {"confirmed": 0, "likely": 1, "check": 2}
+        for node in self.nodes:
+            for vuln in node.vulns:
+                if order.get(vuln.confidence, 2) < order.get(best, 2):
+                    best = vuln.confidence
+        return best
 
 
 def discover_attack_paths(
@@ -392,7 +404,8 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                max(v.cvss) AS max_cvss,
                max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
                collect(DISTINCT {cve: v.cve_id, cvss: v.cvss,
-                       has_exploit: v.has_exploit, desc: v.description}) AS vulns
+                       has_exploit: v.has_exploit, desc: v.description,
+                       confidence: v.confidence}) AS vulns
         """,
         ip=ip,
     )
@@ -409,9 +422,11 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                 cvss=v["cvss"] or 0.0,
                 has_exploit=bool(v["has_exploit"]),
                 title=(v["desc"] or "")[:80],
+                confidence=v.get("confidence") or "check",
             ))
-    # Sort by CVSS descending, exploitable first
-    vulns.sort(key=lambda v: (-int(v.has_exploit), -v.cvss))
+    # Sort by confidence (confirmed first), then exploitable, then CVSS
+    conf_order = {"confirmed": 0, "likely": 1, "check": 2}
+    vulns.sort(key=lambda v: (conf_order.get(v.confidence, 2), -int(v.has_exploit), -v.cvss))
 
     return PathNode(
         ip=record["ip"],
@@ -485,9 +500,15 @@ def _score_path(path: AttackPath) -> float:
     else:
         score += max_cvss * 2.5
 
-    # 3. Exploit availability (0-25 points)
+    # 3. Exploit availability (0-25 points) — scaled by confidence
     if path.has_exploits:
-        score += 25.0
+        confidence = path.max_confidence
+        if confidence == "confirmed":
+            score += 25.0
+        elif confidence == "likely":
+            score += 15.0
+        else:  # check
+            score += 5.0
 
     # 4. Hop bonus (0-15 points) — steeper penalty for multi-hop
     hop_bonus = {1: 15.0, 2: 8.0, 3: 3.0}.get(path.hop_count, 0.0)

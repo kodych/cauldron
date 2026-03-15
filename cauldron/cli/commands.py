@@ -268,6 +268,18 @@ def boil(ai: bool):
     else:
         console.print("  [dim]  No matches in local exploit database[/dim]")
 
+    # Phase 2.5: Script-based confidence upgrade
+    from cauldron.exploits.matcher import upgrade_confidence_from_scripts
+
+    with console.status("[bold green]Checking nmap scripts for confirmed vulnerabilities..."):
+        script_stats = upgrade_confidence_from_scripts()
+
+    if script_stats["upgrades"] or script_stats["new_vulns"]:
+        console.print(
+            f"  [green]+[/green] Scripts: {script_stats['upgrades']} confidence upgrades, "
+            f"{script_stats['new_vulns']} new confirmed findings"
+        )
+
     # Phase 3: CVE enrichment (NVD API)
     console.print()
     console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")
@@ -352,7 +364,8 @@ def boil(ai: bool):
 @click.option("--target", "-t", default=None, help="Target IP address")
 @click.option("--role", "-r", default=None, help="Target role (e.g. domain_controller)")
 @click.option("--top", "-n", default=10, help="Number of paths to show")
-def paths(target: str | None, role: str | None, top: int):
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include check-level paths (default: confirmed/likely only)")
+def paths(target: str | None, role: str | None, top: int, show_all: bool):
     """Show discovered attack paths ranked by exploitability."""
     from cauldron.graph.connection import verify_connection
 
@@ -404,7 +417,23 @@ def paths(target: str | None, role: str | None, top: int):
     if not actionable:
         console.print("[yellow]No exploitable attack paths found. Hosts exist but no known vulnerabilities.[/yellow]")
         return
-    display_paths = actionable[:top]
+
+    # Default: only confirmed/likely paths. --all includes check-level too
+    if not show_all:
+        confirmed_likely = [p for p in actionable if p.max_confidence in ("confirmed", "likely")]
+        check_only = [p for p in actionable if p.max_confidence == "check"]
+        display_paths = confirmed_likely[:top]
+        hidden_check = len(check_only)
+    else:
+        display_paths = actionable[:top]
+        hidden_check = 0
+
+    if not display_paths and not show_all:
+        # No confirmed/likely but there are check paths
+        console.print("[yellow]No confirmed/likely attack paths found.[/yellow]")
+        if hidden_check:
+            console.print(f"[dim]  {hidden_check} check-level paths available. Use --all to see them.[/dim]")
+        return
 
     # Display paths with exploit details
     for i, path in enumerate(display_paths, 1):
@@ -428,7 +457,13 @@ def paths(target: str | None, role: str | None, top: int):
                 continue
             icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
             for vuln in node.vulns[:3]:  # Top 3 vulns per node
-                expl_marker = "[red]EXPLOIT[/red]" if vuln.has_exploit else f"[yellow]CVSS {vuln.cvss:.1f}[/yellow]"
+                # Label: EXPLOIT for confirmed/likely, CHECK for check
+                if vuln.confidence == "check":
+                    expl_marker = "[dim]CHECK[/dim]"
+                elif vuln.has_exploit:
+                    expl_marker = "[red]EXPLOIT[/red]"
+                else:
+                    expl_marker = f"[yellow]CVSS {vuln.cvss:.1f}[/yellow]"
                 # Clean title: first sentence, max 60 chars
                 title = _truncate_title(vuln.title)
                 title_str = f" {title}" if title else ""
@@ -440,6 +475,11 @@ def paths(target: str | None, role: str | None, top: int):
             method_str = " -> ".join(methods)
             console.print(f"       [dim]pivot: {method_str}[/dim]")
 
+        console.print()
+
+    # Show hint about hidden check paths
+    if hidden_check and not show_all:
+        console.print(f"[dim]  + {hidden_check} check-level paths hidden. Use --all to see them.[/dim]")
         console.print()
 
 

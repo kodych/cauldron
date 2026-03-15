@@ -66,11 +66,14 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
                     seen_segments.add(segment)
                     stats["segments_created"] += 1
 
-            # Upsert services
+            # Upsert services and their scripts
             for service in host.services:
                 if service.state in ("open", "filtered"):
                     _upsert_service(session, host.ip, service)
                     stats["services_imported"] += 1
+                    # Store script results on the service node
+                    for script in service.scripts:
+                        _upsert_script_result(session, host.ip, service.port, service.protocol, script)
 
             # Traceroute relationships
             for hop in host.traceroute:
@@ -202,6 +205,34 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
         version=service.version,
         extra_info=service.extra_info,
         banner=service.banner,
+    )
+
+
+def _upsert_script_result(
+    session: Session, host_ip: str, port: int, protocol: str, script
+) -> None:
+    """Store nmap script result as a property on the Service node.
+
+    Scripts are stored as a JSON-like string list in svc.scripts property,
+    and key scripts (vuln confirmations) are stored as individual properties.
+    """
+    from cauldron.graph.models import ScriptResult
+
+    if not isinstance(script, ScriptResult):
+        return
+
+    # Store script output as property: script_<id> = output
+    # Sanitize script_id for use as property name
+    prop_name = f"script_{script.script_id.replace('-', '_')}"
+    session.run(
+        f"""
+        MATCH (svc:Service {{host_ip: $ip, port: $port, protocol: $protocol}})
+        SET svc.`{prop_name}` = $output
+        """,
+        ip=host_ip,
+        port=port,
+        protocol=protocol,
+        output=script.output[:2000],  # Limit output size
     )
 
 

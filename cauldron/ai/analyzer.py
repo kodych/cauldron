@@ -168,13 +168,14 @@ def _apply_ai_cves(response: str) -> tuple[int, int]:
                 description = cve.get("description", "")
 
                 # Create Vulnerability node
+                # AI-found CVEs are "likely" — real CVE but unverified on target
                 session.run(
                     """
                     MERGE (v:Vulnerability {cve_id: $cve_id})
                     ON CREATE SET
                         v.cvss = $cvss, v.severity = $severity,
                         v.has_exploit = $has_exploit, v.description = $description,
-                        v.source = 'ai'
+                        v.source = 'ai', v.confidence = 'likely'
                     """,
                     cve_id=cve_id, cvss=cvss, severity=severity,
                     has_exploit=has_exploit, description=description,
@@ -273,6 +274,15 @@ Find:
 1. Multi-step attack chains through unexpected pivots (printers, VoIP, monitoring → DC)
 2. Service correlations that enable lateral movement
 3. Chokepoint hosts (compromising one = access to many)
+
+IMPORTANT: Only report chains that involve real exploitable vulnerabilities or confirmed misconfigurations.
+Do NOT suggest checking for default credentials, null sessions, or anonymous access as attack chains —
+those are basic checks, not attack paths. Focus on paths where the exploit or vulnerability is known.
+
+Use confidence levels:
+- 0.9+ = confirmed (version-matched CVE with known exploit)
+- 0.7-0.9 = likely (CVE exists, exploit probable but unverified)
+- 0.5-0.7 = check (needs manual verification)
 
 Respond with ONLY JSON array:
 [{{
