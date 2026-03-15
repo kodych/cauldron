@@ -111,22 +111,37 @@ def build_segment_connectivity() -> dict:
             source_segment = _ip_to_segment(source_name)
 
             if source_segment and len(segments) > 0:
+                # Ensure the scan source segment node exists
+                session.run(
+                    "MERGE (:NetworkSegment {cidr: $cidr})",
+                    cidr=source_segment,
+                )
                 for seg in segments:
                     if seg != source_segment:
                         segment_pairs.add((source_segment, seg))
 
+            # Also: all scanned segments can reach each other
+            # (the scanner proved connectivity between them)
+            for i, seg_a in enumerate(segments):
+                for seg_b in segments[i + 1:]:
+                    if seg_a != seg_b:
+                        segment_pairs.add((seg_a, seg_b))
+                        segment_pairs.add((seg_b, seg_a))
+
         # Step 4: Write CAN_REACH relationships
         for src_seg, dst_seg in segment_pairs:
-            session.run(
+            result = session.run(
                 """
                 MATCH (s1:NetworkSegment {cidr: $src})
                 MATCH (s2:NetworkSegment {cidr: $dst})
                 MERGE (s1)-[:CAN_REACH]->(s2)
+                RETURN s1.cidr AS src
                 """,
                 src=src_seg,
                 dst=dst_seg,
             )
-            stats["can_reach_created"] += 1
+            if result.single():
+                stats["can_reach_created"] += 1
 
         # Step 5: Ensure traceroute hop hosts have segments
         _ensure_hop_segments(session)
