@@ -399,8 +399,11 @@ def paths(target: str | None, role: str | None, top: int):
         console.print("[yellow]No attack paths found to the specified targets.[/yellow]")
         return
 
+    # Ensure diversity: pick top paths but guarantee each target role appears
+    display_paths = _select_diverse_paths(attack_paths, top)
+
     # Display paths with exploit details
-    for i, path in enumerate(attack_paths[:top], 1):
+    for i, path in enumerate(display_paths, 1):
         # Header line: score + path chain
         path_parts = []
         for node in path.nodes:
@@ -422,7 +425,8 @@ def paths(target: str | None, role: str | None, top: int):
             icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
             for vuln in node.vulns[:3]:  # Top 3 vulns per node
                 expl_marker = "[red]EXPLOIT[/red]" if vuln.has_exploit else f"[yellow]CVSS {vuln.cvss:.1f}[/yellow]"
-                title = vuln.title.split(":")[0].strip() if vuln.title else ""
+                # Clean title: first sentence, max 60 chars
+                title = _truncate_title(vuln.title)
                 title_str = f" {title}" if title else ""
                 console.print(f"       {icon} {node.ip}  {expl_marker} {vuln.cve_id}{title_str}")
 
@@ -433,6 +437,53 @@ def paths(target: str | None, role: str | None, top: int):
             console.print(f"       [dim]pivot: {method_str}[/dim]")
 
         console.print()
+
+
+def _truncate_title(title: str, max_len: int = 60) -> str:
+    """Truncate a vulnerability title to a readable length."""
+    if not title:
+        return ""
+    # Take first sentence
+    for sep in (".", ";", ","):
+        idx = title.find(sep)
+        if 10 < idx < max_len:
+            return title[:idx]
+    if len(title) > max_len:
+        return title[:max_len].rsplit(" ", 1)[0] + "..."
+    return title
+
+
+def _select_diverse_paths(paths: list, top: int) -> list:
+    """Select top paths ensuring each target role is represented.
+
+    Without this, paths output can be flooded by one role (e.g., 10 DB paths).
+    Guarantees at least 1 path per target role before filling remaining slots.
+    """
+    if len(paths) <= top:
+        return paths
+
+    selected = []
+    seen_roles: set[str] = set()
+    remaining = []
+
+    # First pass: pick best path per target role
+    for path in paths:
+        if path.target_role not in seen_roles:
+            selected.append(path)
+            seen_roles.add(path.target_role)
+        else:
+            remaining.append(path)
+
+        if len(selected) >= top:
+            return selected[:top]
+
+    # Fill remaining slots with highest-scoring paths
+    for path in remaining:
+        if len(selected) >= top:
+            break
+        selected.append(path)
+
+    return selected
 
 
 @cli.command()

@@ -542,46 +542,55 @@ def build_pivot_relationships() -> dict:
             h1_exploit = record["h1_exploit"]
             h2_exploit = record["h2_exploit"]
 
-            # Determine pivot method: exploit > vuln_service > shared_segment
-            # h1 -> h2 direction
+            # Only create pivots when there's a real reason to pivot
+            # (exploit, vuln, or at least one side is a high-value target)
+            has_reason = (h1_exploit or h2_exploit or h1_cvss > 0 or h2_cvss > 0)
+
+            # h1 -> h2: needs h1 to have exploit/vuln OR h2 to be high-value
             if h1_exploit:
                 method_fwd, diff_fwd = "exploit", "easy"
             elif h1_cvss > 0:
                 method_fwd, diff_fwd = "vuln_service", "medium"
-            else:
+            elif has_reason:
                 method_fwd, diff_fwd = "shared_segment", "hard"
+            else:
+                method_fwd = None  # Skip — no reason to pivot
 
-            session.run(
-                """
-                MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                MERGE (h1)-[p:PIVOT_TO]->(h2)
-                SET p.method = $method, p.difficulty = $difficulty,
-                    p.cvss = $cvss
-                """,
-                ip1=ip1, ip2=ip2, method=method_fwd,
-                difficulty=diff_fwd, cvss=h1_cvss,
-            )
-            stats["pivots_created"] += 1
+            if method_fwd:
+                session.run(
+                    """
+                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                    MERGE (h1)-[p:PIVOT_TO]->(h2)
+                    SET p.method = $method, p.difficulty = $difficulty,
+                        p.cvss = $cvss
+                    """,
+                    ip1=ip1, ip2=ip2, method=method_fwd,
+                    difficulty=diff_fwd, cvss=h1_cvss,
+                )
+                stats["pivots_created"] += 1
 
-            # h2 -> h1 direction
+            # h2 -> h1: needs h2 to have exploit/vuln
             if h2_exploit:
                 method_rev, diff_rev = "exploit", "easy"
             elif h2_cvss > 0:
                 method_rev, diff_rev = "vuln_service", "medium"
-            else:
+            elif has_reason:
                 method_rev, diff_rev = "shared_segment", "hard"
+            else:
+                method_rev = None
 
-            session.run(
-                """
-                MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                MERGE (h2)-[p:PIVOT_TO]->(h1)
-                SET p.method = $method, p.difficulty = $difficulty,
-                    p.cvss = $cvss
-                """,
-                ip1=ip1, ip2=ip2, method=method_rev,
-                difficulty=diff_rev, cvss=h2_cvss,
-            )
-            stats["pivots_created"] += 1
+            if method_rev:
+                session.run(
+                    """
+                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                    MERGE (h2)-[p:PIVOT_TO]->(h1)
+                    SET p.method = $method, p.difficulty = $difficulty,
+                        p.cvss = $cvss
+                    """,
+                    ip1=ip1, ip2=ip2, method=method_rev,
+                    difficulty=diff_rev, cvss=h2_cvss,
+                )
+                stats["pivots_created"] += 1
 
     return stats
 
