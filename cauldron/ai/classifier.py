@@ -116,6 +116,28 @@ ROLE_RULES: dict[HostRole, list[tuple[set[int], int, float]]] = {
         ({9090,}, 1, 0.60),             # Prometheus
         ({3000,}, 1, 0.50),             # Grafana
     ],
+    HostRole.SIEM: [
+        ({514,}, 1, 0.60),              # Syslog
+        ({1514, 1515}, 1, 0.80),        # Wazuh/OSSEC
+        ({9200, 5601}, 2, 0.85),        # ELK (Elasticsearch + Kibana)
+        ({8089,}, 1, 0.80),             # Splunk management
+        ({8000, 8089}, 2, 0.90),        # Splunk web + mgmt
+    ],
+    HostRole.CI_CD: [
+        ({8080, 50000}, 2, 0.85),       # Jenkins (web + agent)
+        ({8929, 9418}, 1, 0.80),        # GitLab runner + git
+    ],
+    HostRole.VPN_GATEWAY: [
+        ({1194,}, 1, 0.85),             # OpenVPN
+        ({500, 4500}, 2, 0.90),         # IPSec (IKE + NAT-T)
+        ({1723,}, 1, 0.80),             # PPTP
+        ({51820,}, 1, 0.85),            # WireGuard
+    ],
+    HostRole.BACKUP: [
+        ({9102, 9103}, 1, 0.80),        # Bacula
+        ({6106,}, 1, 0.75),             # BackupPC
+        ({10000,}, 1, 0.50),            # Webmin (often on backup servers)
+    ],
 }
 
 # Product/banner keywords that strongly indicate a role
@@ -153,6 +175,24 @@ PRODUCT_KEYWORDS: dict[str, HostRole] = {
     "tomcat": HostRole.WEB_SERVER,
     "lighttpd": HostRole.WEB_SERVER,
     "squid": HostRole.PROXY,
+    # SIEM
+    "splunk": HostRole.SIEM,
+    "wazuh": HostRole.SIEM,
+    "ossec": HostRole.SIEM,
+    "kibana": HostRole.SIEM,
+    "logstash": HostRole.SIEM,
+    # CI/CD
+    "jenkins": HostRole.CI_CD,
+    "gitlab": HostRole.CI_CD,
+    "teamcity": HostRole.CI_CD,
+    # VPN
+    "openvpn": HostRole.VPN_GATEWAY,
+    "wireguard": HostRole.VPN_GATEWAY,
+    "strongswan": HostRole.VPN_GATEWAY,
+    # Backup
+    "bacula": HostRole.BACKUP,
+    "veeam": HostRole.BACKUP,
+    "backuppc": HostRole.BACKUP,
 }
 
 # Roles that take priority when there's a conflict.
@@ -165,10 +205,14 @@ ROLE_PRIORITY: dict[HostRole, int] = {
     HostRole.VOIP: 70,
     HostRole.NETWORK_EQUIPMENT: 65,
     HostRole.PRINTER: 60,
+    HostRole.SIEM: 58,
     HostRole.MONITORING: 55,
+    HostRole.CI_CD: 52,
     HostRole.FILE_SERVER: 50,
     HostRole.DNS_SERVER: 40,
+    HostRole.VPN_GATEWAY: 38,
     HostRole.PROXY: 35,
+    HostRole.BACKUP: 32,
     HostRole.WEB_SERVER: 30,
     HostRole.REMOTE_ACCESS: 10,
     HostRole.UNKNOWN: 0,
@@ -245,6 +289,18 @@ def classify_host(host: Host) -> ClassificationResult:
     if HostRole.HYPERVISOR in scores and scores[HostRole.HYPERVISOR] >= 0.80:
         for suppress in (HostRole.WEB_SERVER, HostRole.REMOTE_ACCESS):
             if suppress in scores and scores[suppress] < scores[HostRole.HYPERVISOR]:
+                del scores[suppress]
+                reasons.pop(suppress, None)
+
+    if HostRole.VPN_GATEWAY in scores and scores[HostRole.VPN_GATEWAY] >= 0.80:
+        for suppress in (HostRole.REMOTE_ACCESS,):
+            if suppress in scores and scores[suppress] < scores[HostRole.VPN_GATEWAY]:
+                del scores[suppress]
+                reasons.pop(suppress, None)
+
+    if HostRole.CI_CD in scores and scores[HostRole.CI_CD] >= 0.80:
+        for suppress in (HostRole.WEB_SERVER,):
+            if suppress in scores and scores[suppress] < scores[HostRole.CI_CD]:
                 del scores[suppress]
                 reasons.pop(suppress, None)
 

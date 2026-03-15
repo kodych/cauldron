@@ -23,6 +23,10 @@ class HostRole(str, Enum):
     DNS_SERVER = "dns_server"
     PROXY = "proxy"
     MONITORING = "monitoring"
+    SIEM = "siem"
+    CI_CD = "ci_cd"
+    VPN_GATEWAY = "vpn_gateway"
+    BACKUP = "backup"
     UNKNOWN = "unknown"
 
 
