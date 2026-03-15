@@ -230,8 +230,9 @@ def _build_path(
     # If target is directly scanned by this source
     if target_ip in all_hosts:
         source_node = PathNode(ip=source_name, role="scan_source")
+        # Use target_info (from _get_host_info) which includes vulns
         path = AttackPath(
-            nodes=[source_node, all_hosts[target_ip]],
+            nodes=[source_node, target_info],
             target_role=target_info.role,
             hop_count=1,
             max_cvss=target_info.max_cvss,
@@ -247,8 +248,9 @@ def _build_path(
     # Check if any scanned host is in the same segment as target
     same_segment_hosts = hosts_by_segment.get(target_segment, [])
     if same_segment_hosts:
-        # Direct segment access — pick best pivot
+        # Direct segment access — pick best pivot, enrich with vulns
         pivot = _pick_best_pivot(same_segment_hosts)
+        pivot = _get_host_info(session, pivot.ip) or pivot
         source_node = PathNode(ip=source_name, role="scan_source")
         path = AttackPath(
             nodes=[source_node, pivot, target_info],

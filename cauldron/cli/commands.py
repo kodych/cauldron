@@ -443,10 +443,15 @@ def _truncate_title(title: str, max_len: int = 60) -> str:
     """Truncate a vulnerability title to a readable length."""
     if not title:
         return ""
-    # Take first sentence
-    for sep in (".", ";", ","):
+    import re
+    # Find first real sentence boundary (skip periods in version numbers like "8.7")
+    m = re.search(r"(?<!\d)\.(?!\d)", title)
+    if m and 10 < m.start() < max_len:
+        return title[:m.start()]
+    # Try semicolon or comma after a reasonable length
+    for sep in (";", ","):
         idx = title.find(sep)
-        if 10 < idx < max_len:
+        if 20 < idx < max_len:
             return title[:idx]
     if len(title) > max_len:
         return title[:max_len].rsplit(" ", 1)[0] + "..."
