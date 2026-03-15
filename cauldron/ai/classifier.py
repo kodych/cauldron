@@ -64,8 +64,6 @@ ROLE_RULES: dict[HostRole, list[tuple[set[int], int, float]]] = {
         ({443,}, 1, 0.50),
         ({8080,}, 1, 0.60),
         ({8443,}, 1, 0.60),
-        # WSUS
-        ({8530, 8531}, 2, 0.65),
     ],
     HostRole.FILE_SERVER: [
         # NFS
@@ -136,7 +134,14 @@ ROLE_RULES: dict[HostRole, list[tuple[set[int], int, float]]] = {
     HostRole.BACKUP: [
         ({9102, 9103}, 1, 0.80),        # Bacula
         ({6106,}, 1, 0.75),             # BackupPC
-        ({10000,}, 1, 0.50),            # Webmin (often on backup servers)
+        ({10000,}, 1, 0.50),            # ndmp/Webmin (often on backup servers)
+        ({111, 2049, 10000}, 3, 0.85),  # NFS + ndmp = likely backup
+    ],
+    HostRole.MANAGEMENT: [
+        ({8530, 8531}, 2, 0.90),        # WSUS
+        ({8530,}, 1, 0.70),             # WSUS (single port)
+        ({2701,}, 1, 0.80),             # SCCM/MECM remote control
+        ({2701, 8530}, 2, 0.95),        # SCCM + WSUS = definitely management
     ],
 }
 
@@ -193,6 +198,17 @@ PRODUCT_KEYWORDS: dict[str, HostRole] = {
     "bacula": HostRole.BACKUP,
     "veeam": HostRole.BACKUP,
     "backuppc": HostRole.BACKUP,
+    "backup exec": HostRole.BACKUP,
+    "storagecraft": HostRole.BACKUP,
+    "veritas": HostRole.BACKUP,
+    "ndmp": HostRole.BACKUP,
+    "acronis": HostRole.BACKUP,
+    "commvault": HostRole.BACKUP,
+    # Management (WSUS, SCCM, MECM)
+    "wsus": HostRole.MANAGEMENT,
+    "sccm": HostRole.MANAGEMENT,
+    "mecm": HostRole.MANAGEMENT,
+    "configuration manager": HostRole.MANAGEMENT,
 }
 
 # Roles that take priority when there's a conflict.
@@ -212,6 +228,7 @@ ROLE_PRIORITY: dict[HostRole, int] = {
     HostRole.DNS_SERVER: 40,
     HostRole.VPN_GATEWAY: 38,
     HostRole.PROXY: 35,
+    HostRole.MANAGEMENT: 56,
     HostRole.BACKUP: 32,
     HostRole.WEB_SERVER: 30,
     HostRole.REMOTE_ACCESS: 10,
@@ -301,6 +318,18 @@ def classify_host(host: Host) -> ClassificationResult:
     if HostRole.CI_CD in scores and scores[HostRole.CI_CD] >= 0.80:
         for suppress in (HostRole.WEB_SERVER,):
             if suppress in scores and scores[suppress] < scores[HostRole.CI_CD]:
+                del scores[suppress]
+                reasons.pop(suppress, None)
+
+    if HostRole.BACKUP in scores and scores[HostRole.BACKUP] >= 0.70:
+        for suppress in (HostRole.FILE_SERVER,):
+            if suppress in scores and scores[suppress] < scores[HostRole.BACKUP]:
+                del scores[suppress]
+                reasons.pop(suppress, None)
+
+    if HostRole.MANAGEMENT in scores and scores[HostRole.MANAGEMENT] >= 0.70:
+        for suppress in (HostRole.WEB_SERVER, HostRole.REMOTE_ACCESS):
+            if suppress in scores and scores[suppress] < scores[HostRole.MANAGEMENT]:
                 del scores[suppress]
                 reasons.pop(suppress, None)
 

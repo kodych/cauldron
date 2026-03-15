@@ -547,6 +547,101 @@ class TestAIPivotIntegration:
         assert len(path_signatures) >= 2
 
 
+class TestCrossSegmentPivots:
+    """Test cross-segment pivot creation for hosts scanned by same source."""
+
+    def test_cross_segment_pivot_created(self):
+        """Hosts in different segments but scanned by same source should get cross-segment pivots."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: 'scanner1'})")
+            session.run("""
+                CREATE (seg1:NetworkSegment {cidr: '10.1.0.0/24'})
+                CREATE (seg2:NetworkSegment {cidr: '10.2.0.0/24'})
+            """)
+            # Two hosts in different segments
+            session.run("""
+                CREATE (h1:Host {ip: '10.1.0.10', state: 'up', role: 'web_server', role_confidence: 0.9})
+                CREATE (h2:Host {ip: '10.2.0.20', state: 'up', role: 'database', role_confidence: 0.9})
+            """)
+            for ip, cidr in [("10.1.0.10", "10.1.0.0/24"), ("10.2.0.20", "10.2.0.0/24")]:
+                session.run(
+                    "MATCH (h:Host {ip: $ip}), (s:NetworkSegment {cidr: $cidr}) CREATE (h)-[:IN_SEGMENT]->(s)",
+                    ip=ip, cidr=cidr,
+                )
+            for ip in ["10.1.0.10", "10.2.0.20"]:
+                session.run(
+                    "MATCH (src:ScanSource {name: 'scanner1'}), (h:Host {ip: $ip}) CREATE (src)-[:SCANNED_FROM]->(h)",
+                    ip=ip,
+                )
+            # Add a vuln to h1 so there's a reason to pivot
+            session.run("""
+                MATCH (h:Host {ip: '10.1.0.10'})
+                CREATE (h)-[:HAS_SERVICE]->(:Service {host_ip: '10.1.0.10', port: 80, protocol: 'tcp', state: 'open'})
+            """)
+            session.run("""
+                MATCH (s:Service {host_ip: '10.1.0.10', port: 80})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true})
+            """)
+
+        stats = build_pivot_relationships()
+        assert stats.get("cross_segment_pairs", 0) > 0
+
+        with get_session() as session:
+            result = session.run(
+                "MATCH (h1:Host {ip: '10.1.0.10'})-[p:PIVOT_TO]->(h2:Host {ip: '10.2.0.20'}) RETURN p"
+            )
+            pivot = result.single()
+            assert pivot is not None
+            assert pivot["p"]["cross_segment"] is True
+
+    def test_cross_segment_no_pivot_without_vuln(self):
+        """Cross-segment pivots should NOT be created if neither side has vulns."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: 'scanner1'})")
+            session.run("""
+                CREATE (seg1:NetworkSegment {cidr: '10.1.0.0/24'})
+                CREATE (seg2:NetworkSegment {cidr: '10.2.0.0/24'})
+            """)
+            session.run("""
+                CREATE (h1:Host {ip: '10.1.0.10', state: 'up', role: 'web_server', role_confidence: 0.9})
+                CREATE (h2:Host {ip: '10.2.0.20', state: 'up', role: 'database', role_confidence: 0.9})
+            """)
+            for ip, cidr in [("10.1.0.10", "10.1.0.0/24"), ("10.2.0.20", "10.2.0.0/24")]:
+                session.run(
+                    "MATCH (h:Host {ip: $ip}), (s:NetworkSegment {cidr: $cidr}) CREATE (h)-[:IN_SEGMENT]->(s)",
+                    ip=ip, cidr=cidr,
+                )
+            for ip in ["10.1.0.10", "10.2.0.20"]:
+                session.run(
+                    "MATCH (src:ScanSource {name: 'scanner1'}), (h:Host {ip: $ip}) CREATE (src)-[:SCANNED_FROM]->(h)",
+                    ip=ip,
+                )
+
+        stats = build_pivot_relationships()
+        assert stats.get("cross_segment_pairs", 0) == 0
+
+        with get_session() as session:
+            result = session.run("MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt")
+            assert result.single()["cnt"] == 0
+
+
+class TestManagementTargetValue:
+    """Test that management role is scored properly in paths."""
+
+    def test_management_scores_above_backup(self):
+        mgmt_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="mgmt", role="management")],
+            target_role="management",
+            hop_count=1,
+        )
+        backup_path = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="bk", role="backup")],
+            target_role="backup",
+            hop_count=1,
+        )
+        assert _score_path(mgmt_path) > _score_path(backup_path)
+
+
 class TestFullPipeline:
     def test_brew_boil_paths_pipeline(self):
         """Test the complete pipeline with corporate_network.xml."""

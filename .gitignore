@@ -29,6 +29,7 @@ neo4j_logs/
 .pytest_cache/
 htmlcov/
 .coverage
+tests/private/
 
 # User scan data
 data/scans/

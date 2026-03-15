@@ -258,12 +258,12 @@ class TestRealNmapFile:
         scan = parse_nmap_xml("data/samples/corporate_network.xml")
         stats = ingest_scan(scan, source_name="pentest-laptop")
 
-        assert stats["hosts_imported"] == 13  # 14 total, 1 down
-        assert stats["services_imported"] > 40
+        assert stats["hosts_imported"] == 17  # 18 total, 1 down
+        assert stats["services_imported"] > 50
 
         graph_stats = get_graph_stats()
-        # 13 scanned hosts + 2 traceroute hops (gateway + DMZ switch)
-        assert graph_stats["hosts"] == 15
+        # 17 scanned hosts + 2 traceroute hops (gateway + DMZ switch)
+        assert graph_stats["hosts"] == 19
         assert graph_stats["scan_sources"] == 1
 
     def test_corporate_network_segments(self):
@@ -275,9 +275,10 @@ class TestRealNmapFile:
                 "MATCH (seg:NetworkSegment) RETURN seg.cidr AS cidr ORDER BY cidr"
             )
             segments = [r["cidr"] for r in result]
-            # Should have 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24
+            # Should have 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24
             assert "10.0.1.0/24" in segments
             assert "10.0.2.0/24" in segments
+            assert "10.0.3.0/24" in segments
 
     def test_corporate_network_dc_services(self):
         scan = parse_nmap_xml("data/samples/corporate_network.xml")

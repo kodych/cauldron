@@ -27,6 +27,7 @@ class HostRole(str, Enum):
     CI_CD = "ci_cd"
     VPN_GATEWAY = "vpn_gateway"
     BACKUP = "backup"
+    MANAGEMENT = "management"
     UNKNOWN = "unknown"
 
 
@@ -89,6 +90,7 @@ class Host:
     ttl: int | None = None
     services: list[Service] = field(default_factory=list)
     traceroute: list[TracerouteHop] = field(default_factory=list)
+    host_scripts: list[ScriptResult] = field(default_factory=list)
 
     # Enrichment fields (populated later)
     role: HostRole = HostRole.UNKNOWN

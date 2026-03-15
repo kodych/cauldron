@@ -60,6 +60,7 @@ ROLE_ICONS = {
     "ci_cd": "[bold yellow]CI/CD[/bold yellow]",
     "vpn_gateway": "[bold green]VPN[/bold green]",
     "backup": "[bright_blue]BAK[/bright_blue]",
+    "management": "[bold cyan]MGMT[/bold cyan]",
     "unknown": "[dim]?[/dim]",
 }
 
@@ -86,8 +87,12 @@ def brew(file: Path, source: str | None, masscan: bool):
         console.print("[yellow]Masscan parser not yet implemented. Coming soon![/yellow]")
         raise SystemExit(1)
 
+    # Auto-detect scan source from filename if not provided
+    if not source:
+        source = file.stem
+
     console.print(f"[bold cyan]Brewing:[/bold cyan] {file.name}")
-    console.print(f"[dim]  Source: {source or 'auto-detect'}[/dim]")
+    console.print(f"[dim]  Source: {source}[/dim]")
     console.print()
 
     # Parse

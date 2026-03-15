@@ -324,3 +324,64 @@ class TestEdgeCases:
         result = classify_host(host)
         # Should pick something, not stay unknown
         assert result.role in (HostRole.FILE_SERVER, HostRole.REMOTE_ACCESS)
+
+
+class TestManagement:
+    """Test MANAGEMENT role detection (WSUS, SCCM/MECM)."""
+
+    def test_wsus_server(self):
+        host = _host([80, 8530, 8531, 135, 445, 3389])
+        result = classify_host(host)
+        assert result.role == HostRole.MANAGEMENT
+
+    def test_sccm_server(self):
+        host = _host([80, 443, 2701, 135, 445, 3389])
+        result = classify_host(host)
+        assert result.role == HostRole.MANAGEMENT
+
+    def test_sccm_wsus_combo(self):
+        host = _host([80, 443, 2701, 8530, 8531, 135, 445, 3389])
+        result = classify_host(host)
+        assert result.role == HostRole.MANAGEMENT
+        assert result.confidence >= 0.90
+
+    def test_management_suppresses_web(self):
+        host = _host([80, 443, 8530, 8531, 135, 445])
+        result = classify_host(host)
+        assert result.role == HostRole.MANAGEMENT
+        assert HostRole.WEB_SERVER not in result.secondary_roles
+
+    def test_management_product_keyword(self):
+        host = _host([80, 443, 8530], products={80: "Microsoft WSUS"})
+        result = classify_host(host)
+        assert result.role == HostRole.MANAGEMENT
+
+
+class TestBackupImproved:
+    """Test BACKUP role improvements."""
+
+    def test_backup_exec_keyword(self):
+        host = _host([10000, 135, 445], products={10000: "Symantec Backup Exec ndmp"})
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+
+    def test_storagecraft_keyword(self):
+        host = _host([9392, 135, 445], products={9392: "StorageCraft Image Manager"})
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+
+    def test_ndmp_keyword(self):
+        host = _host([10000, 135, 445], products={10000: "ndmp"})
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+
+    def test_nfs_plus_ndmp(self):
+        host = _host([111, 2049, 10000, 135, 445])
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+
+    def test_backup_suppresses_file_server(self):
+        host = _host([111, 2049, 10000, 135, 445], products={10000: "Veritas Backup Exec"})
+        result = classify_host(host)
+        assert result.role == HostRole.BACKUP
+        assert HostRole.FILE_SERVER not in result.secondary_roles

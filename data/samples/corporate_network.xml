@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet href="file:///usr/share/nmap/nmap.xsl" type="text/xsl"?>
-<nmaprun scanner="nmap" args="nmap -sV -sC -A -oX corporate_network.xml 10.0.1.0/24 10.0.2.0/24" start="1710000000" startstr="Sat Mar 09 2024 12:00:00" version="7.94" xmloutputversion="1.05">
+<nmaprun scanner="nmap" args="nmap -sV -sC -A -oX corporate_network.xml 10.0.1.0/24 10.0.2.0/24 10.0.3.0/24" start="1710000000" startstr="Sat Mar 09 2024 12:00:00" version="7.94" xmloutputversion="1.05">
 <scaninfo type="syn" protocol="tcp" numservices="1000" services="1-1000"/>
 
 <!-- DC01 - Primary Domain Controller -->
@@ -15,19 +15,22 @@
     <port protocol="tcp" portid="88"><state state="open" reason="syn-ack"/><service name="kerberos-sec" product="Microsoft Windows Kerberos"/></port>
     <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc" product="Microsoft Windows RPC"/></port>
     <port protocol="tcp" portid="139"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Microsoft Windows netbios-ssn"/></port>
-    <port protocol="tcp" portid="389"><state state="open" reason="syn-ack"/><service name="ldap" product="Microsoft Windows Active Directory LDAP" version="10.0.17763"/>
+    <port protocol="tcp" portid="389"><state state="open" reason="syn-ack"/><service name="ldap" product="Microsoft Windows Active Directory LDAP" version="10.0.17763">
       <script id="ldap-rootdse" output="domainFunctionality: 7; forestFunctionality: 7; domainControllerFunctionality: 7"/>
-    </port>
-    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds" product="Microsoft Windows Server 2019 microsoft-ds"/>
+    </service></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds" product="Microsoft Windows Server 2019 microsoft-ds">
       <script id="smb-os-discovery" output="OS: Windows Server 2019 Standard 17763; Computer name: DC01; Domain: corp.local"/>
-      <script id="smb2-security-mode" output="Message signing enabled and required"/>
-    </port>
+    </service></port>
     <port protocol="tcp" portid="464"><state state="open" reason="syn-ack"/><service name="kpasswd5"/></port>
     <port protocol="tcp" portid="636"><state state="open" reason="syn-ack"/><service name="ldapssl" tunnel="ssl"/></port>
     <port protocol="tcp" portid="3268"><state state="open" reason="syn-ack"/><service name="globalcatLDAP"/></port>
     <port protocol="tcp" portid="3269"><state state="open" reason="syn-ack"/><service name="globalcatLDAPssl" tunnel="ssl"/></port>
     <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server" product="Microsoft Terminal Services"/></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled and required"/>
+    <script id="smb-os-discovery" output="OS: Windows Server 2019 Standard 17763; Computer name: DC01; Domain: corp.local; FQDN: DC01.corp.local"/>
+  </hostscript>
   <trace>
     <hop ttl="1" ipaddr="10.0.0.1" rtt="0.50" host="gw.corp.local"/>
     <hop ttl="2" ipaddr="10.0.1.10" rtt="1.20"/>
@@ -46,13 +49,15 @@
     <port protocol="tcp" portid="88"><state state="open" reason="syn-ack"/><service name="kerberos-sec"/></port>
     <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
     <port protocol="tcp" portid="389"><state state="open" reason="syn-ack"/><service name="ldap" product="Microsoft Windows Active Directory LDAP"/></port>
-    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/>
-      <script id="smb-os-discovery" output="OS: Windows Server 2019 Standard; Computer name: DC02; Domain: corp.local"/>
-    </port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
     <port protocol="tcp" portid="636"><state state="open" reason="syn-ack"/><service name="ldapssl"/></port>
     <port protocol="tcp" portid="3268"><state state="open" reason="syn-ack"/><service name="globalcatLDAP"/></port>
     <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server"/></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled and required"/>
+    <script id="smb-os-discovery" output="OS: Windows Server 2019 Standard; Computer name: DC02; Domain: corp.local"/>
+  </hostscript>
   <trace>
     <hop ttl="1" ipaddr="10.0.0.1" rtt="0.45" host="gw.corp.local"/>
     <hop ttl="2" ipaddr="10.0.1.11" rtt="1.10"/>
@@ -68,13 +73,13 @@
   <os><osmatch name="Linux 5.4" accuracy="92"/></os>
   <ports>
     <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="7.4p1" extrainfo="Debian 10"/></port>
-    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.4.49"/>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.4.49">
       <script id="http-server-header" output="Apache/2.4.49 (Debian)"/>
       <script id="http-title" output="Corporate Portal"/>
-    </port>
-    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Apache httpd" version="2.4.49" tunnel="ssl"/>
+    </service></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Apache httpd" version="2.4.49" tunnel="ssl">
       <script id="ssl-cert" output="Subject: CN=web01.corp.local"/>
-    </port>
+    </service></port>
     <port protocol="tcp" portid="3306"><state state="filtered" reason="no-response"/><service name="mysql"/></port>
   </ports>
   <trace>
@@ -84,7 +89,7 @@
   </trace>
 </host>
 
-<!-- WEB02 - Internal Web App -->
+<!-- WEB02 - Internal Web App (Tomcat) -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.2.21" addrtype="ipv4"/>
@@ -121,19 +126,27 @@
   </trace>
 </host>
 
-<!-- DB02 - PostgreSQL Database -->
+<!-- MSSQL01 - Microsoft SQL Server -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.1.31" addrtype="ipv4"/>
-  <hostnames><hostname name="db02.corp.local" type="PTR"/></hostnames>
-  <os><osmatch name="Linux 5.15" accuracy="85"/></os>
+  <address addr="00:50:56:A1:01:31" addrtype="mac" vendor="VMware"/>
+  <hostnames><hostname name="mssql01.corp.local" type="PTR"/></hostnames>
+  <os><osmatch name="Microsoft Windows Server 2019" accuracy="93"/></os>
   <ports>
-    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.0p1"/></port>
-    <port protocol="tcp" portid="5432"><state state="open" reason="syn-ack"/><service name="postgresql" product="PostgreSQL" version="14.5"/></port>
+    <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
+    <port protocol="tcp" portid="1433"><state state="open" reason="syn-ack"/><service name="ms-sql-s" product="Microsoft SQL Server" version="2019">
+      <script id="ms-sql-info" output="Instance: MSSQLSERVER; Version: 15.0.2000.5; TCP port: 1433"/>
+    </service></port>
+    <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server"/></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled but not required"/>
+  </hostscript>
 </host>
 
-<!-- MAIL01 - Mail Server -->
+<!-- MAIL01 - Postfix/Dovecot Mail Server -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.2.40" addrtype="ipv4"/>
@@ -153,25 +166,105 @@
   </trace>
 </host>
 
-<!-- FS01 - File Server -->
+<!-- EX01 - Exchange Server -->
+<host starttime="1710000001" endtime="1710000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="10.0.1.40" addrtype="ipv4"/>
+  <address addr="00:50:56:A1:01:40" addrtype="mac" vendor="VMware"/>
+  <hostnames><hostname name="EX01.corp.local" type="PTR"/></hostnames>
+  <os><osmatch name="Microsoft Windows Server 2019" accuracy="95"/></os>
+  <ports>
+    <port protocol="tcp" portid="25"><state state="open" reason="syn-ack"/><service name="smtp" product="Microsoft Exchange smtpd" version="15.02.0922"/></port>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Microsoft IIS httpd" version="10.0"/></port>
+    <port protocol="tcp" portid="110"><state state="open" reason="syn-ack"/><service name="pop3" product="Microsoft Exchange 2019 pop3d"/></port>
+    <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Microsoft IIS httpd" version="10.0" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
+    <port protocol="tcp" portid="465"><state state="open" reason="syn-ack"/><service name="smtps" product="Microsoft Exchange smtpd" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="587"><state state="open" reason="syn-ack"/><service name="submission" product="Microsoft Exchange smtpd"/></port>
+    <port protocol="tcp" portid="995"><state state="open" reason="syn-ack"/><service name="pop3s" tunnel="ssl"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled but not required"/>
+  </hostscript>
+</host>
+
+<!-- FS01 - File Server (SMB signing disabled!) -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.1.50" addrtype="ipv4"/>
   <hostnames><hostname name="fs01.corp.local" type="PTR"/></hostnames>
   <os><osmatch name="Microsoft Windows Server 2016" accuracy="91"/></os>
   <ports>
+    <port protocol="tcp" portid="21"><state state="open" reason="syn-ack"/><service name="ftp" product="Microsoft ftpd"/></port>
     <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
     <port protocol="tcp" portid="139"><state state="open" reason="syn-ack"/><service name="netbios-ssn"/></port>
-    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/>
-      <script id="smb-os-discovery" output="OS: Windows Server 2016 Standard; Computer name: FS01"/>
-      <script id="smb2-security-mode" output="Message signing enabled but not required"/>
-    </port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
     <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server"/></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.0.2: Message signing enabled but not required"/>
+    <script id="smb-security-mode" output="account_used: guest; authentication_level: user; challenge_response: supported; message_signing: disabled"/>
+    <script id="smb-os-discovery" output="OS: Windows Server 2016 Standard; Computer name: FS01"/>
+  </hostscript>
   <trace>
     <hop ttl="1" ipaddr="10.0.0.1" rtt="0.40" host="gw.corp.local"/>
     <hop ttl="2" ipaddr="10.0.1.50" rtt="1.00"/>
   </trace>
+</host>
+
+<!-- ESXI01 - VMware ESXi Hypervisor -->
+<host starttime="1710000001" endtime="1710000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="10.0.3.10" addrtype="ipv4"/>
+  <address addr="00:50:56:A1:03:10" addrtype="mac" vendor="VMware"/>
+  <hostnames><hostname name="esxi01.corp.local" type="PTR"/></hostnames>
+  <os><osmatch name="VMware ESXi 8.0" accuracy="97"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="8.4"/></port>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="VMware ESXi" extrainfo="redirect to HTTPS"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="VMware ESXi SOAP API" version="8.0.2" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="902"><state state="open" reason="syn-ack"/><service name="ssl" product="VMware Authentication Daemon" version="1.10"/></port>
+    <port protocol="tcp" portid="8000"><state state="open" reason="syn-ack"/><service name="http-alt" product="VMware vMotion"/></port>
+  </ports>
+</host>
+
+<!-- BAK01 - Backup Server -->
+<host starttime="1710000001" endtime="1710000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="10.0.3.20" addrtype="ipv4"/>
+  <hostnames><hostname name="bak01.corp.local" type="PTR"/></hostnames>
+  <os><osmatch name="Microsoft Windows Server 2019" accuracy="90"/></os>
+  <ports>
+    <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
+    <port protocol="tcp" portid="9102"><state state="open" reason="syn-ack"/><service name="bacula-fd" product="Bacula File Daemon" version="9.6.7"/></port>
+    <port protocol="tcp" portid="9103"><state state="open" reason="syn-ack"/><service name="bacula-sd" product="Bacula Storage Daemon"/></port>
+    <port protocol="tcp" portid="10000"><state state="open" reason="syn-ack"/><service name="ndmp" product="ndmp"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled but not required"/>
+  </hostscript>
+</host>
+
+<!-- WSUS01 - WSUS/SCCM Management Server -->
+<host starttime="1710000001" endtime="1710000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="10.0.1.60" addrtype="ipv4"/>
+  <hostnames><hostname name="wsus01.corp.local" type="PTR"/></hostnames>
+  <os><osmatch name="Microsoft Windows Server 2019" accuracy="92"/></os>
+  <ports>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Microsoft WSUS"/></port>
+    <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
+    <port protocol="tcp" portid="8530"><state state="open" reason="syn-ack"/><service name="http" product="Microsoft WSUS" extrainfo="WSUS 10.0"/></port>
+    <port protocol="tcp" portid="8531"><state state="open" reason="syn-ack"/><service name="https" product="Microsoft WSUS" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.1.1: Message signing enabled but not required"/>
+  </hostscript>
 </host>
 
 <!-- PRINT01 - Network Printer -->
@@ -196,9 +289,9 @@
   <ports>
     <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="Cisco SSH" version="2.0"/></port>
     <port protocol="tcp" portid="23"><state state="open" reason="syn-ack"/><service name="telnet" product="Cisco router telnetd"/></port>
-    <port protocol="udp" portid="161"><state state="open" reason="udp-response"/><service name="snmp" product="SNMPv2c"/>
+    <port protocol="udp" portid="161"><state state="open" reason="udp-response"/><service name="snmp" product="SNMPv2c">
       <script id="snmp-info" output="community: public"/>
-    </port>
+    </service></port>
   </ports>
 </host>
 
@@ -214,7 +307,7 @@
   </ports>
 </host>
 
-<!-- WKS01 - Workstation with RDP -->
+<!-- WKS01 - Workstation (SMB signing disabled!) -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.1.100" addrtype="ipv4"/>
@@ -223,13 +316,17 @@
   <ports>
     <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
     <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
-    <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server" product="Microsoft Terminal Services"/>
+    <port protocol="tcp" portid="3389"><state state="open" reason="syn-ack"/><service name="ms-wbt-server" product="Microsoft Terminal Services">
       <script id="rdp-ntlm-info" output="Target_Name: CORP; DNS_Domain_Name: corp.local"/>
-    </port>
+    </service></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.0.2: Message signing enabled but not required"/>
+    <script id="smb-security-mode" output="account_used: guest; authentication_level: user; challenge_response: supported; message_signing: disabled"/>
+  </hostscript>
 </host>
 
-<!-- WKS02 - Workstation -->
+<!-- WKS02 - Workstation (SMB signing disabled!) -->
 <host starttime="1710000001" endtime="1710000060">
   <status state="up" reason="syn-ack"/>
   <address addr="10.0.1.101" addrtype="ipv4"/>
@@ -239,6 +336,10 @@
     <port protocol="tcp" portid="135"><state state="open" reason="syn-ack"/><service name="msrpc"/></port>
     <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="microsoft-ds"/></port>
   </ports>
+  <hostscript>
+    <script id="smb2-security-mode" output="3.0.2: Message signing enabled but not required"/>
+    <script id="smb-security-mode" output="account_used: guest; authentication_level: user; challenge_response: supported; message_signing: disabled"/>
+  </hostscript>
 </host>
 
 <!-- DOWN host - should be skipped -->
@@ -247,5 +348,5 @@
   <address addr="10.0.1.254" addrtype="ipv4"/>
 </host>
 
-<runstats><finished time="1710000120" elapsed="120.00" summary="Nmap done at Sat Mar 09 2024 12:02:00; 14 IP addresses (13 hosts up) scanned in 120.00 seconds" exit="success"/></runstats>
+<runstats><finished time="1710000120" elapsed="120.00" summary="Nmap done at Sat Mar 09 2024 12:02:00; 19 IP addresses (18 hosts up) scanned in 120.00 seconds" exit="success"/></runstats>
 </nmaprun>

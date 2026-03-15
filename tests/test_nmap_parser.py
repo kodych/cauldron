@@ -176,6 +176,75 @@ def test_parse_traceroute():
     assert host.traceroute[0].rtt == 1.50
 
 
+def test_parse_hostscript():
+    """Test parsing host-level scripts from <hostscript>."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.1" addrtype="ipv4"/>
+            <ports>
+                <port protocol="tcp" portid="445">
+                    <state state="open"/>
+                    <service name="microsoft-ds"/>
+                </port>
+            </ports>
+            <hostscript>
+                <script id="smb2-security-mode" output="Message signing enabled but not required"/>
+                <script id="smb-os-discovery" output="OS: Windows Server 2019 Standard 17763; Computer name: DC01"/>
+                <script id="smb-security-mode" output="account_used: guest; message_signing: disabled"/>
+            </hostscript>
+        </host>
+    </nmaprun>
+    """
+    result = parse_nmap_xml(xml)
+    host = result.hosts_up[0]
+
+    assert len(host.host_scripts) == 3
+    assert host.host_scripts[0].script_id == "smb2-security-mode"
+    assert "not required" in host.host_scripts[0].output
+    assert host.host_scripts[1].script_id == "smb-os-discovery"
+    assert "Windows Server 2019" in host.host_scripts[1].output
+    assert host.host_scripts[2].script_id == "smb-security-mode"
+    assert "disabled" in host.host_scripts[2].output
+
+    # Port-level scripts should be separate
+    smb_svc = host.services[0]
+    assert len(smb_svc.scripts) == 0  # no port-level scripts in this XML
+
+
+def test_parse_hostscript_with_port_scripts():
+    """Test that host-level and port-level scripts are stored separately."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.2" addrtype="ipv4"/>
+            <ports>
+                <port protocol="tcp" portid="445">
+                    <state state="open"/>
+                    <service name="microsoft-ds"/>
+                    <script id="smb-os-discovery" output="OS: Windows Server 2019"/>
+                </port>
+            </ports>
+            <hostscript>
+                <script id="smb2-security-mode" output="Message signing enabled and required"/>
+            </hostscript>
+        </host>
+    </nmaprun>
+    """
+    result = parse_nmap_xml(xml)
+    host = result.hosts_up[0]
+
+    # Port-level: 1 script on SMB service
+    assert len(host.services[0].scripts) == 1
+    assert host.services[0].scripts[0].script_id == "smb-os-discovery"
+
+    # Host-level: 1 script
+    assert len(host.host_scripts) == 1
+    assert host.host_scripts[0].script_id == "smb2-security-mode"
+
+
 def test_parse_empty_scan():
     """Test parsing a scan with no hosts."""
     xml = """<?xml version="1.0"?>

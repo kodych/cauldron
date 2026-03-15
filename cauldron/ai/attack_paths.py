@@ -24,6 +24,7 @@ HIGH_VALUE_ROLES = [
     "siem",
     "ci_cd",
     "backup",
+    "management",
 ]
 
 # Roles that are good pivot points
@@ -322,7 +323,18 @@ def _find_pivot_chain_paths(
 
     This picks up AI-created chains and exploit-based pivots that
     segment-level path discovery misses.
+
+    Includes OOM guard: if pivot count > 500, falls back to depth-1 only
+    with per-target LIMIT to avoid combinatorial explosion.
     """
+    # Check pivot count to avoid OOM on large graphs
+    pivot_count_result = session.run(
+        "MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt"
+    )
+    pivot_count = (pivot_count_result.single() or {}).get("cnt", 0)
+    max_depth = 2 if pivot_count <= 500 else 1
+    result_limit = 20 if pivot_count <= 500 else 50
+
     # Build target filter
     if target_ip:
         target_clause = "AND target.ip = $target_ip"
@@ -334,10 +346,14 @@ def _find_pivot_chain_paths(
         target_clause = "AND target.role IN $roles"
         params = {"roles": HIGH_VALUE_ROLES}
 
+    # Only start from entry nodes that have vulns/exploits or outgoing pivots
+    # (reduces fan-out while preserving AI-created chains)
     result = session.run(
         f"""
         MATCH (src:ScanSource)-[:SCANNED_FROM]->(entry:Host)
-        MATCH path = (entry)-[:PIVOT_TO*1..4]->(target:Host)
+        WHERE EXISTS {{ MATCH (entry)-[:HAS_SERVICE]->(:Service)-[:HAS_VULN]->(:Vulnerability) }}
+           OR EXISTS {{ MATCH (entry)-[:PIVOT_TO]->() }}
+        MATCH path = (entry)-[:PIVOT_TO*1..{max_depth}]->(target:Host)
         WHERE target.role IN $roles {target_clause}
         AND entry.ip <> target.ip
         WITH src, entry, target, path,
@@ -351,7 +367,7 @@ def _find_pivot_chain_paths(
             difficulties,
             target.role AS target_role
         ORDER BY size(ips)
-        LIMIT 20
+        LIMIT {result_limit}
         """,
         **params,
     )
@@ -482,6 +498,7 @@ def _score_path(path: AttackPath) -> float:
         "ci_cd": 23.0,
         "hypervisor": 22.0,
         "mail_server": 20.0,
+        "management": 19.0,
         "backup": 18.0,
         "file_server": 15.0,
         "web_server": 10.0,
@@ -609,6 +626,79 @@ def build_pivot_relationships() -> dict:
                     MERGE (h2)-[p:PIVOT_TO]->(h1)
                     SET p.method = $method, p.difficulty = $difficulty,
                         p.cvss = $cvss
+                    """,
+                    ip1=ip1, ip2=ip2, method=method_rev,
+                    difficulty=diff_rev, cvss=h2_cvss,
+                )
+                stats["pivots_created"] += 1
+
+        # Cross-segment pivots: hosts scanned by the same source are reachable
+        # even if they're in different /24 subnets (the scan proves TCP/IP connectivity)
+        cross_result = session.run(
+            """
+            MATCH (src:ScanSource)-[:SCANNED_FROM]->(h1:Host),
+                  (src)-[:SCANNED_FROM]->(h2:Host)
+            WHERE h1.ip < h2.ip
+            AND h1.role <> 'unknown' AND h2.role <> 'unknown'
+            AND NOT (h1)-[:IN_SEGMENT]->(:NetworkSegment)<-[:IN_SEGMENT]-(h2)
+            OPTIONAL MATCH (h1)-[:HAS_SERVICE]->(s1:Service)-[:HAS_VULN]->(v1:Vulnerability)
+            OPTIONAL MATCH (h2)-[:HAS_SERVICE]->(s2:Service)-[:HAS_VULN]->(v2:Vulnerability)
+            WITH h1, h2,
+                 max(v1.cvss) AS h1_cvss, max(v2.cvss) AS h2_cvss,
+                 max(CASE WHEN v1.has_exploit = true THEN 1 ELSE 0 END) AS h1_exploit,
+                 max(CASE WHEN v2.has_exploit = true THEN 1 ELSE 0 END) AS h2_exploit
+            WHERE COALESCE(h1_cvss, 0) > 0 OR COALESCE(h2_cvss, 0) > 0
+            RETURN h1.ip AS ip1, h2.ip AS ip2,
+                   COALESCE(h1_cvss, 0) AS h1_cvss, COALESCE(h2_cvss, 0) AS h2_cvss,
+                   h1_exploit AS h1_exploit, h2_exploit AS h2_exploit
+            """
+        )
+
+        cross_pairs = list(cross_result)
+        stats["cross_segment_pairs"] = len(cross_pairs)
+
+        for record in cross_pairs:
+            ip1, ip2 = record["ip1"], record["ip2"]
+            h1_cvss = record["h1_cvss"]
+            h2_cvss = record["h2_cvss"]
+            h1_exploit = record["h1_exploit"]
+            h2_exploit = record["h2_exploit"]
+
+            # Cross-segment pivots are always "hard" (not local network attacks)
+            if h1_exploit:
+                method_fwd, diff_fwd = "exploit", "medium"
+            elif h1_cvss > 0:
+                method_fwd, diff_fwd = "vuln_service", "hard"
+            else:
+                method_fwd = None
+
+            if method_fwd:
+                session.run(
+                    """
+                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                    MERGE (h1)-[p:PIVOT_TO]->(h2)
+                    ON CREATE SET p.method = $method, p.difficulty = $difficulty,
+                                  p.cvss = $cvss, p.cross_segment = true
+                    """,
+                    ip1=ip1, ip2=ip2, method=method_fwd,
+                    difficulty=diff_fwd, cvss=h1_cvss,
+                )
+                stats["pivots_created"] += 1
+
+            if h2_exploit:
+                method_rev, diff_rev = "exploit", "medium"
+            elif h2_cvss > 0:
+                method_rev, diff_rev = "vuln_service", "hard"
+            else:
+                method_rev = None
+
+            if method_rev:
+                session.run(
+                    """
+                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
+                    MERGE (h2)-[p:PIVOT_TO]->(h1)
+                    ON CREATE SET p.method = $method, p.difficulty = $difficulty,
+                                  p.cvss = $cvss, p.cross_segment = true
                     """,
                     ip1=ip1, ip2=ip2, method=method_rev,
                     difficulty=diff_rev, cvss=h2_cvss,

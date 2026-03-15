@@ -75,6 +75,10 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
                     for script in service.scripts:
                         _upsert_script_result(session, host.ip, service.port, service.protocol, script)
 
+            # Host-level script results (stored on Host node)
+            for script in host.host_scripts:
+                _upsert_host_script(session, host.ip, script)
+
             # Traceroute relationships
             for hop in host.traceroute:
                 if hop.ip and hop.ip != host.ip:
@@ -233,6 +237,28 @@ def _upsert_script_result(
         port=port,
         protocol=protocol,
         output=script.output[:2000],  # Limit output size
+    )
+
+
+def _upsert_host_script(session: Session, host_ip: str, script) -> None:
+    """Store host-level nmap script result as a property on the Host node.
+
+    Host-level scripts (from <hostscript>) apply to the host as a whole,
+    not to any specific service. Examples: smb2-security-mode, smb-os-discovery.
+    """
+    from cauldron.graph.models import ScriptResult
+
+    if not isinstance(script, ScriptResult):
+        return
+
+    prop_name = f"script_{script.script_id.replace('-', '_')}"
+    session.run(
+        f"""
+        MATCH (h:Host {{ip: $ip}})
+        SET h.`{prop_name}` = $output
+        """,
+        ip=host_ip,
+        output=script.output[:2000],
     )
 
 

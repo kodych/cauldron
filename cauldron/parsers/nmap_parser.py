@@ -124,6 +124,13 @@ def _parse_host(elem: ET.Element) -> Host | None:
         if hop is not None:
             host.traceroute.append(hop)
 
+    # Host-level scripts (<hostscript>)
+    for script_elem in elem.findall("hostscript/script"):
+        host.host_scripts.append(ScriptResult(
+            script_id=script_elem.get("id", "unknown"),
+            output=script_elem.get("output", ""),
+        ))
+
     return host
 
 
