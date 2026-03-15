@@ -399,8 +399,12 @@ def paths(target: str | None, role: str | None, top: int):
         console.print("[yellow]No attack paths found to the specified targets.[/yellow]")
         return
 
-    # Ensure diversity: pick top paths but guarantee each target role appears
-    display_paths = _select_diverse_paths(attack_paths, top)
+    # Only show paths that have real exploits or CVEs — no empty paths
+    actionable = [p for p in attack_paths if p.has_exploits or p.max_cvss > 0]
+    if not actionable:
+        console.print("[yellow]No exploitable attack paths found. Hosts exist but no known vulnerabilities.[/yellow]")
+        return
+    display_paths = actionable[:top]
 
     # Display paths with exploit details
     for i, path in enumerate(display_paths, 1):
@@ -457,38 +461,6 @@ def _truncate_title(title: str, max_len: int = 60) -> str:
         return title[:max_len].rsplit(" ", 1)[0] + "..."
     return title
 
-
-def _select_diverse_paths(paths: list, top: int) -> list:
-    """Select top paths ensuring each target role is represented.
-
-    Without this, paths output can be flooded by one role (e.g., 10 DB paths).
-    Guarantees at least 1 path per target role before filling remaining slots.
-    """
-    if len(paths) <= top:
-        return paths
-
-    selected = []
-    seen_roles: set[str] = set()
-    remaining = []
-
-    # First pass: pick best path per target role
-    for path in paths:
-        if path.target_role not in seen_roles:
-            selected.append(path)
-            seen_roles.add(path.target_role)
-        else:
-            remaining.append(path)
-
-        if len(selected) >= top:
-            return selected[:top]
-
-    # Fill remaining slots with highest-scoring paths
-    for path in remaining:
-        if len(selected) >= top:
-            break
-        selected.append(path)
-
-    return selected
 
 
 @cli.command()
