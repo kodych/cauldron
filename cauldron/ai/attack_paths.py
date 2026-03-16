@@ -1,8 +1,13 @@
 """Attack path discovery and scoring engine.
 
-Finds paths through the network graph from scan sources to high-value
-targets (Domain Controllers, databases, etc.), scores them by
-exploitability, and creates PIVOT_TO relationships.
+Discovers DIRECT attack paths from scan sources to vulnerable hosts.
+Each path is one hop: ScanSource -> Target Host with vulnerability.
+
+Three distinct concepts (never conflated):
+1. Reachability — ScanSource->SCANNED_FROM->Host (what we can see)
+2. Attack paths — ScanSource -> Host with vulnerability (what we can exploit)
+3. True pivoting — host compromised via RCE bridges to a new network
+   (detected when Host.ip matches ScanSource.name across different scans)
 """
 
 from __future__ import annotations
@@ -27,23 +32,6 @@ HIGH_VALUE_ROLES = [
     "management",
 ]
 
-# Roles that are good pivot points
-PIVOT_ROLES = {
-    "web_server",
-    "remote_access",
-    "mail_server",
-    "file_server",
-    "voip",
-    "printer",
-}
-
-# Difficulty ratings for pivot methods
-PIVOT_DIFFICULTY = {
-    "exploit": "easy",      # known exploit available
-    "vuln_service": "medium",  # vulnerable service, no known exploit
-    "shared_segment": "hard",  # same segment, no known vuln
-}
-
 
 @dataclass
 class VulnInfo:
@@ -54,6 +42,8 @@ class VulnInfo:
     has_exploit: bool = False
     title: str = ""
     confidence: str = "check"  # confirmed | likely | check
+    enables_pivot: bool | None = None  # True = RCE/shell, False = relay/misconfig
+    method: str = ""  # exploit | relay | credential | cve
 
 
 @dataclass
@@ -72,7 +62,11 @@ class PathNode:
 
 @dataclass
 class AttackPath:
-    """A discovered attack path from source to target."""
+    """A discovered attack path from source to target.
+
+    Direct paths: [ScanSource, Target] — 1 hop
+    Pivot paths:  [ScanSource, PivotHost, Target] — 2 hops (true pivot only)
+    """
 
     nodes: list[PathNode] = field(default_factory=list)
     target_role: str = "unknown"
@@ -80,7 +74,7 @@ class AttackPath:
     hop_count: int = 0
     max_cvss: float = 0.0
     has_exploits: bool = False
-    pivot_methods: list[str] = field(default_factory=list)
+    attack_methods: list[str] = field(default_factory=list)
 
     @property
     def source_ip(self) -> str:
@@ -105,14 +99,15 @@ class AttackPath:
 def discover_attack_paths(
     target_role: str | None = None,
     target_ip: str | None = None,
-    max_depth: int = 6,
 ) -> list[AttackPath]:
-    """Discover attack paths from scan sources to high-value targets.
+    """Discover direct attack paths from scan sources to vulnerable hosts.
+
+    Every path is DIRECT: ScanSource -> Target with vulnerability.
+    Multi-hop paths only exist through true pivot hosts (Phase 2, future).
 
     Args:
-        target_role: Filter paths to targets with this role (e.g. "domain_controller").
+        target_role: Filter paths to targets with this role.
         target_ip: Find paths to a specific host IP.
-        max_depth: Maximum path length (hops).
 
     Returns:
         List of AttackPath objects, sorted by score (highest first).
@@ -120,28 +115,18 @@ def discover_attack_paths(
     paths = []
 
     with get_session() as session:
-        if target_ip:
-            # Paths to a specific host
-            paths = _find_paths_to_host(session, target_ip, max_depth)
-        elif target_role:
-            # Paths to all hosts with a specific role
-            paths = _find_paths_to_role(session, target_role, max_depth)
-        else:
-            # Paths to all high-value targets
-            for role in HIGH_VALUE_ROLES:
-                role_paths = _find_paths_to_role(session, role, max_depth)
-                paths.extend(role_paths)
+        # Find all direct attack paths (scanner -> vulnerable host)
+        paths = _find_direct_paths(session, target_role, target_ip)
 
-    # Add paths discovered via PIVOT_TO chains (including AI-created)
-    with get_session() as session:
-        pivot_paths = _find_pivot_chain_paths(session, target_ip, target_role)
+        # Find pivot paths (scanner -> pivot host -> hosts in pivot's scan)
+        pivot_paths = _find_pivot_paths(session, target_role, target_ip)
         paths.extend(pivot_paths)
 
     # Score all paths
     for path in paths:
         path.score = _score_path(path)
 
-    # Deduplicate by full path (sequence of IPs), keep highest scoring
+    # Deduplicate by (source_ip, target_ip, top_vuln), keep highest scoring
     seen: dict[tuple, AttackPath] = {}
     for path in paths:
         key = tuple(n.ip for n in path.nodes)
@@ -153,81 +138,62 @@ def discover_attack_paths(
     return paths
 
 
-def _find_paths_to_role(session, role: str, max_depth: int) -> list[AttackPath]:
-    """Find paths from scan sources to all hosts with given role."""
-    # Find target hosts
-    result = session.run(
-        "MATCH (h:Host {role: $role}) RETURN h.ip AS ip",
-        role=role,
-    )
-    target_ips = [r["ip"] for r in result]
+def _find_direct_paths(
+    session, target_role: str | None, target_ip: str | None
+) -> list[AttackPath]:
+    """Find all direct attack paths: ScanSource -> Host with vulnerability.
 
-    paths = []
-    for ip in target_ips:
-        paths.extend(_find_paths_to_host(session, ip, max_depth))
-    return paths
-
-
-def _find_paths_to_host(session, target_ip: str, max_depth: int) -> list[AttackPath]:
-    """Find paths from scan sources to a specific host.
-
-    Strategy:
-    1. Segment-level paths via CAN_REACH (fast, coarse)
-    2. Host-level paths via shared segments (detailed)
+    This is the core path discovery. A path exists when:
+    1. ScanSource scanned the host (SCANNED_FROM)
+    2. Host has at least one vulnerability (HAS_VULN)
+    3. Host matches target filter (role or IP)
     """
-    paths = []
+    # Build target filter
+    where_clauses = []
+    params: dict = {}
 
-    # Get target info
-    target_info = _get_host_info(session, target_ip)
-    if not target_info:
-        return []
+    if target_ip:
+        where_clauses.append("h.ip = $target_ip")
+        params["target_ip"] = target_ip
+    elif target_role:
+        where_clauses.append("h.role = $target_role")
+        params["target_role"] = target_role
 
-    # Find scan sources
-    sources = session.run(
-        "MATCH (s:ScanSource) RETURN s.name AS name"
-    )
-    source_names = [r["name"] for r in sources]
+    where_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-    for source_name in source_names:
-        # Get hosts the source scanned that are in the same segment as target
-        # or in segments that CAN_REACH the target's segment
-        path = _build_path(session, source_name, target_ip, target_info, max_depth)
-        if path and len(path.nodes) >= 2:
-            paths.append(path)
-
-    return paths
-
-
-def _build_path(
-    session, source_name: str, target_ip: str, target_info: PathNode, max_depth: int
-) -> AttackPath | None:
-    """Build a single attack path from source to target.
-
-    Uses the graph to find intermediate hosts that could serve as pivots.
-    """
-    target_segment = target_info.segment
-
-    # Get all hosts scanned by this source, grouped by segment
     result = session.run(
-        """
-        MATCH (src:ScanSource {name: $source})-[:SCANNED_FROM]->(h:Host)
+        f"""
+        MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
+        MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+        {where_str}
+        WITH src, h,
+             collect(DISTINCT {{
+                 cve: v.cve_id, cvss: v.cvss,
+                 has_exploit: v.has_exploit, desc: v.description,
+                 confidence: v.confidence, enables_pivot: v.enables_pivot
+             }}) AS vulns,
+             max(v.cvss) AS max_cvss,
+             max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
         OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
-        OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
-        OPTIONAL MATCH (s)-[:HAS_VULN]->(v:Vulnerability)
-        RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
-               seg.cidr AS segment,
-               count(DISTINCT s) AS service_count,
-               max(v.cvss) AS max_cvss,
-               max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
+        OPTIONAL MATCH (h)-[:HAS_SERVICE]->(svc:Service)
+        WITH src, h, vulns, max_cvss, has_exploit, seg,
+             count(DISTINCT svc) AS service_count
+        RETURN src.name AS source,
+               h.ip AS ip, h.hostname AS hostname, h.role AS role,
+               seg.cidr AS segment, service_count,
+               max_cvss, has_exploit, vulns
         """,
-        source=source_name,
+        **params,
     )
 
-    hosts_by_segment: dict[str, list[PathNode]] = {}
-    all_hosts: dict[str, PathNode] = {}
-
+    paths = []
     for record in result:
-        node = PathNode(
+        # Parse vulns
+        vuln_list = _parse_vulns(record["vulns"])
+        if not vuln_list:
+            continue
+
+        target_node = PathNode(
             ip=record["ip"],
             hostname=record["hostname"],
             role=record["role"] or "unknown",
@@ -235,175 +201,200 @@ def _build_path(
             max_cvss=record["max_cvss"] or 0.0,
             has_exploit=bool(record["has_exploit"]),
             service_count=record["service_count"] or 0,
+            vulns=vuln_list,
         )
-        all_hosts[node.ip] = node
-        if node.segment:
-            hosts_by_segment.setdefault(node.segment, []).append(node)
 
-    # If target is directly scanned by this source
-    if target_ip in all_hosts:
-        source_node = PathNode(ip=source_name, role="scan_source")
-        # Use target_info (from _get_host_info) which includes vulns
+        source_node = PathNode(ip=record["source"], role="scan_source")
+
+        # Determine attack methods from vulns
+        methods = _get_attack_methods(vuln_list)
+
         path = AttackPath(
-            nodes=[source_node, target_info],
-            target_role=target_info.role,
+            nodes=[source_node, target_node],
+            target_role=target_node.role,
             hop_count=1,
-            max_cvss=target_info.max_cvss,
-            has_exploits=target_info.has_exploit,
-            pivot_methods=["direct"],
-        )
-        return path
-
-    # Find a pivot: host in a segment that can reach the target's segment
-    if not target_segment:
-        return None
-
-    # Check if any scanned host is in the same segment as target
-    same_segment_hosts = hosts_by_segment.get(target_segment, [])
-    if same_segment_hosts:
-        # Direct segment access — pick best pivot, enrich with vulns
-        pivot = _pick_best_pivot(same_segment_hosts)
-        pivot = _get_host_info(session, pivot.ip) or pivot
-        source_node = PathNode(ip=source_name, role="scan_source")
-        path = AttackPath(
-            nodes=[source_node, pivot, target_info],
-            target_role=target_info.role,
-            hop_count=2,
-            max_cvss=max(pivot.max_cvss, target_info.max_cvss),
-            has_exploits=pivot.has_exploit or target_info.has_exploit,
-            pivot_methods=_determine_pivot_methods(pivot, target_info),
-        )
-        return path
-
-    # Try to find a multi-hop path via CAN_REACH segments
-    result = session.run(
-        """
-        MATCH (src_seg:NetworkSegment)<-[:IN_SEGMENT]-(pivot:Host)<-[:SCANNED_FROM]-(ss:ScanSource {name: $source})
-        MATCH path = (src_seg)-[:CAN_REACH*1..3]->(tgt_seg:NetworkSegment {cidr: $target_seg})
-        OPTIONAL MATCH (pivot)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
-        RETURN DISTINCT pivot.ip AS pivot_ip, pivot.hostname AS pivot_hostname,
-               pivot.role AS pivot_role, src_seg.cidr AS pivot_segment,
-               max(v.cvss) AS pivot_max_cvss,
-               max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS pivot_has_exploit,
-               length(path) AS seg_hops
-        ORDER BY seg_hops
-        LIMIT 5
-        """,
-        source=source_name,
-        target_seg=target_segment,
-    )
-
-    for record in result:
-        pivot_node = PathNode(
-            ip=record["pivot_ip"],
-            hostname=record["pivot_hostname"],
-            role=record["pivot_role"] or "unknown",
-            segment=record["pivot_segment"],
-            max_cvss=record["pivot_max_cvss"] or 0.0,
-            has_exploit=bool(record["pivot_has_exploit"]),
-        )
-        source_node = PathNode(ip=source_name, role="scan_source")
-        path = AttackPath(
-            nodes=[source_node, pivot_node, target_info],
-            target_role=target_info.role,
-            hop_count=1 + (record["seg_hops"] or 1),
-            max_cvss=max(pivot_node.max_cvss, target_info.max_cvss),
-            has_exploits=pivot_node.has_exploit or target_info.has_exploit,
-            pivot_methods=_determine_pivot_methods(pivot_node, target_info),
-        )
-        return path  # Return first (shortest) path found
-
-    return None
-
-
-def _find_pivot_chain_paths(
-    session, target_ip: str | None, target_role: str | None
-) -> list[AttackPath]:
-    """Find multi-hop attack paths by traversing PIVOT_TO relationships.
-
-    This picks up AI-created chains and exploit-based pivots that
-    segment-level path discovery misses.
-
-    Includes OOM guard: if pivot count > 500, falls back to depth-1 only
-    with per-target LIMIT to avoid combinatorial explosion.
-    """
-    # Check pivot count to avoid OOM on large graphs
-    pivot_count_result = session.run(
-        "MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt"
-    )
-    pivot_count = (pivot_count_result.single() or {}).get("cnt", 0)
-    max_depth = 2 if pivot_count <= 500 else 1
-    result_limit = 20 if pivot_count <= 500 else 50
-
-    # Build target filter
-    if target_ip:
-        target_clause = "AND target.ip = $target_ip"
-        params = {"target_ip": target_ip, "roles": HIGH_VALUE_ROLES}
-    elif target_role:
-        target_clause = "AND target.role = $target_role"
-        params = {"target_role": target_role, "roles": [target_role]}
-    else:
-        target_clause = "AND target.role IN $roles"
-        params = {"roles": HIGH_VALUE_ROLES}
-
-    # Only start from entry nodes that have vulns/exploits or outgoing pivots
-    # (reduces fan-out while preserving AI-created chains)
-    result = session.run(
-        f"""
-        MATCH (src:ScanSource)-[:SCANNED_FROM]->(entry:Host)
-        WHERE EXISTS {{ MATCH (entry)-[:HAS_SERVICE]->(:Service)-[:HAS_VULN]->(:Vulnerability) }}
-           OR EXISTS {{ MATCH (entry)-[:PIVOT_TO]->() }}
-        MATCH path = (entry)-[:PIVOT_TO*1..{max_depth}]->(target:Host)
-        WHERE target.role IN $roles {target_clause}
-        AND entry.ip <> target.ip
-        WITH src, entry, target, path,
-             [n IN nodes(path) | n.ip] AS ips,
-             [r IN relationships(path) | r.method] AS methods,
-             [r IN relationships(path) | r.difficulty] AS difficulties
-        RETURN DISTINCT
-            src.name AS source,
-            ips,
-            methods,
-            difficulties,
-            target.role AS target_role
-        ORDER BY size(ips)
-        LIMIT {result_limit}
-        """,
-        **params,
-    )
-
-    paths = []
-    for record in result:
-        ips = record["ips"]
-        methods = record["methods"]
-        source_name = record["source"]
-
-        # Build path nodes with enriched info
-        nodes = [PathNode(ip=source_name, role="scan_source")]
-        max_cvss = 0.0
-        has_exploits = False
-
-        for ip in ips:
-            info = _get_host_info(session, ip)
-            if info:
-                nodes.append(info)
-                max_cvss = max(max_cvss, info.max_cvss)
-                if info.has_exploit:
-                    has_exploits = True
-            else:
-                nodes.append(PathNode(ip=ip))
-
-        path = AttackPath(
-            nodes=nodes,
-            target_role=record["target_role"] or "unknown",
-            hop_count=len(ips),  # source->entry is 1 hop + PIVOT_TO hops
-            max_cvss=max_cvss,
-            has_exploits=has_exploits or any(m == "exploit" for m in methods),
-            pivot_methods=methods,
+            max_cvss=target_node.max_cvss,
+            has_exploits=target_node.has_exploit,
+            attack_methods=methods,
         )
         paths.append(path)
 
     return paths
+
+
+def _find_pivot_paths(
+    session, target_role: str | None, target_ip: str | None
+) -> list[AttackPath]:
+    """Find attack paths through true pivot hosts.
+
+    A true pivot exists when:
+    - Host X was scanned by ScanSource A (external scan)
+    - Host X.ip matches ScanSource B.name (internal scan from compromised X)
+    - Host X has RCE vulnerability (enables_pivot = true)
+    - ScanSource B discovered additional hosts not in ScanSource A
+
+    Path: ScanSource A -> Host X (pivot) -> Target (discovered by ScanSource B)
+    """
+    # Find pivot hosts: Host.ip == ScanSource.name for a different scan
+    pivot_result = session.run(
+        """
+        MATCH (src_ext:ScanSource)-[:SCANNED_FROM]->(pivot:Host)
+        MATCH (src_int:ScanSource)
+        WHERE pivot.ip = src_int.name AND src_ext.name <> src_int.name
+        MATCH (pivot)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+        WHERE v.enables_pivot = true OR v.enables_pivot IS NULL
+        RETURN DISTINCT src_ext.name AS external_source,
+               pivot.ip AS pivot_ip,
+               src_int.name AS internal_source,
+               max(v.cvss) AS pivot_cvss
+        """
+    )
+
+    pivot_hosts = list(pivot_result)
+    if not pivot_hosts:
+        return []
+
+    paths = []
+    for pivot_rec in pivot_hosts:
+        ext_source = pivot_rec["external_source"]
+        pivot_ip = pivot_rec["pivot_ip"]
+        int_source = pivot_rec["internal_source"]
+
+        # Get pivot host info
+        pivot_info = _get_host_info(session, pivot_ip)
+        if not pivot_info:
+            continue
+
+        # Build target filter for hosts discovered by the internal scan
+        where_clauses = [
+            "h.ip <> $pivot_ip",
+        ]
+        params: dict = {
+            "int_source": int_source,
+            "pivot_ip": pivot_ip,
+        }
+
+        if target_ip:
+            where_clauses.append("h.ip = $target_ip")
+            params["target_ip"] = target_ip
+        elif target_role:
+            where_clauses.append("h.role = $target_role")
+            params["target_role"] = target_role
+
+        where_str = " AND ".join(where_clauses)
+
+        # Find targets discovered by the internal scan that have vulns
+        target_result = session.run(
+            f"""
+            MATCH (src:ScanSource {{name: $int_source}})-[:SCANNED_FROM]->(h:Host)
+            MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+            WHERE {where_str}
+            WITH h,
+                 collect(DISTINCT {{
+                     cve: v.cve_id, cvss: v.cvss,
+                     has_exploit: v.has_exploit, desc: v.description,
+                     confidence: v.confidence, enables_pivot: v.enables_pivot
+                 }}) AS vulns,
+                 max(v.cvss) AS max_cvss,
+                 max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
+            OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
+            OPTIONAL MATCH (h)-[:HAS_SERVICE]->(svc:Service)
+            WITH h, vulns, max_cvss, has_exploit, seg,
+                 count(DISTINCT svc) AS service_count
+            RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
+                   seg.cidr AS segment, service_count,
+                   max_cvss, has_exploit, vulns
+            """,
+            **params,
+        )
+
+        for target_rec in target_result:
+            vuln_list = _parse_vulns(target_rec["vulns"])
+            if not vuln_list:
+                continue
+
+            target_node = PathNode(
+                ip=target_rec["ip"],
+                hostname=target_rec["hostname"],
+                role=target_rec["role"] or "unknown",
+                segment=target_rec["segment"],
+                max_cvss=target_rec["max_cvss"] or 0.0,
+                has_exploit=bool(target_rec["has_exploit"]),
+                service_count=target_rec["service_count"] or 0,
+                vulns=vuln_list,
+            )
+
+            source_node = PathNode(ip=ext_source, role="scan_source")
+            methods = ["pivot"] + _get_attack_methods(vuln_list)
+
+            path = AttackPath(
+                nodes=[source_node, pivot_info, target_node],
+                target_role=target_node.role,
+                hop_count=2,
+                max_cvss=max(pivot_info.max_cvss, target_node.max_cvss),
+                has_exploits=pivot_info.has_exploit or target_node.has_exploit,
+                attack_methods=methods,
+            )
+            paths.append(path)
+
+    return paths
+
+
+def _parse_vulns(raw_vulns: list[dict]) -> list[VulnInfo]:
+    """Parse raw vulnerability dicts into VulnInfo objects."""
+    vulns = []
+    for v in raw_vulns:
+        if not v.get("cve"):
+            continue
+        method = _classify_attack_method(v)
+        vulns.append(VulnInfo(
+            cve_id=v["cve"],
+            cvss=v.get("cvss") or 0.0,
+            has_exploit=bool(v.get("has_exploit")),
+            title=(v.get("desc") or "")[:80],
+            confidence=v.get("confidence") or "check",
+            enables_pivot=v.get("enables_pivot"),
+            method=method,
+        ))
+    # Sort by confidence (confirmed first), then exploitable, then CVSS
+    conf_order = {"confirmed": 0, "likely": 1, "check": 2}
+    vulns.sort(key=lambda v: (conf_order.get(v.confidence, 2), -int(v.has_exploit), -v.cvss))
+    return vulns
+
+
+def _classify_attack_method(vuln: dict) -> str:
+    """Classify the attack method based on vulnerability properties."""
+    cve_id = vuln.get("cve", "")
+    desc = (vuln.get("desc") or "").lower()
+
+    # Script-detected findings
+    if "relay" in desc or "signing" in desc.lower():
+        return "relay"
+    if "default" in desc and ("cred" in desc or "password" in desc):
+        return "credential"
+    if "anonymous" in desc or "anon" in desc:
+        return "credential"
+
+    # Exploit DB or NVD with exploit
+    if vuln.get("has_exploit"):
+        return "exploit"
+
+    # CVE without known exploit
+    if cve_id.startswith("CVE-"):
+        return "cve"
+
+    return "exploit"
+
+
+def _get_attack_methods(vulns: list[VulnInfo]) -> list[str]:
+    """Get unique attack methods from vulnerability list."""
+    methods = []
+    seen = set()
+    for v in vulns:
+        if v.method and v.method not in seen:
+            methods.append(v.method)
+            seen.add(v.method)
+    return methods or ["direct"]
 
 
 def _get_host_info(session, ip: str) -> PathNode | None:
@@ -421,7 +412,8 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
                collect(DISTINCT {cve: v.cve_id, cvss: v.cvss,
                        has_exploit: v.has_exploit, desc: v.description,
-                       confidence: v.confidence}) AS vulns
+                       confidence: v.confidence,
+                       enables_pivot: v.enables_pivot}) AS vulns
         """,
         ip=ip,
     )
@@ -429,20 +421,7 @@ def _get_host_info(session, ip: str) -> PathNode | None:
     if not record or not record["ip"]:
         return None
 
-    # Parse vulnerability details (filter out nulls from OPTIONAL MATCH)
-    vulns = []
-    for v in record["vulns"]:
-        if v["cve"]:
-            vulns.append(VulnInfo(
-                cve_id=v["cve"],
-                cvss=v["cvss"] or 0.0,
-                has_exploit=bool(v["has_exploit"]),
-                title=(v["desc"] or "")[:80],
-                confidence=v.get("confidence") or "check",
-            ))
-    # Sort by confidence (confirmed first), then exploitable, then CVSS
-    conf_order = {"confirmed": 0, "likely": 1, "check": 2}
-    vulns.sort(key=lambda v: (conf_order.get(v.confidence, 2), -int(v.has_exploit), -v.cvss))
+    vulns = _parse_vulns(record["vulns"])
 
     return PathNode(
         ip=record["ip"],
@@ -456,37 +435,15 @@ def _get_host_info(session, ip: str) -> PathNode | None:
     )
 
 
-def _pick_best_pivot(hosts: list[PathNode]) -> PathNode:
-    """Pick the best pivot host from a list (most exploitable)."""
-    return max(hosts, key=lambda h: (
-        h.has_exploit,
-        h.max_cvss,
-        h.role in PIVOT_ROLES,
-        h.service_count,
-    ))
-
-
-def _determine_pivot_methods(pivot: PathNode, target: PathNode) -> list[str]:
-    """Determine how an attacker could pivot from one host to another."""
-    methods = []
-    if pivot.has_exploit:
-        methods.append("exploit")
-    if pivot.max_cvss > 0:
-        methods.append("vuln_service")
-    if not methods:
-        methods.append("shared_segment")
-    return methods
-
-
 def _score_path(path: AttackPath) -> float:
     """Score an attack path. Higher = more dangerous / easier to exploit.
 
     Scoring factors (max ~115):
     - Target value (0-30): DC highest, then DB, SIEM, CI/CD, etc.
-    - CVSS contribution (0-35): non-linear — critical vulns score much higher
+    - CVSS contribution (0-35): non-linear -- critical vulns score much higher
     - Exploit availability (0-25): bonus for known exploits
     - Hop bonus (0-15): fewer hops = easier path
-    - Pivot method quality (0-10): exploit pivots > shared_segment
+    - Attack method quality (0-10): exploit > relay > cve
     """
     score = 0.0
 
@@ -506,7 +463,7 @@ def _score_path(path: AttackPath) -> float:
     }
     score += target_value.get(path.target_role, 5.0)
 
-    # 2. CVSS contribution (0-35 points) — non-linear curve
+    # 2. CVSS contribution (0-35 points) -- non-linear curve
     max_cvss = max((n.max_cvss for n in path.nodes), default=0.0)
     if max_cvss >= 9.0:
         score += 35.0
@@ -517,7 +474,7 @@ def _score_path(path: AttackPath) -> float:
     else:
         score += max_cvss * 2.5
 
-    # 3. Exploit availability (0-25 points) — scaled by confidence
+    # 3. Exploit availability (0-25 points) -- scaled by confidence
     if path.has_exploits:
         confidence = path.max_confidence
         if confidence == "confirmed":
@@ -527,209 +484,38 @@ def _score_path(path: AttackPath) -> float:
         else:  # check
             score += 5.0
 
-    # 4. Hop bonus (0-15 points) — steeper penalty for multi-hop
+    # 4. Hop bonus (0-15 points) -- steeper penalty for multi-hop
     hop_bonus = {1: 15.0, 2: 8.0, 3: 3.0}.get(path.hop_count, 0.0)
     score += hop_bonus
 
-    # 5. Pivot method quality (0-10 points)
-    method_scores = {"exploit": 3.0, "ai_chain": 2.0, "vuln_service": 1.0}
-    method_bonus = sum(method_scores.get(m, 0.0) for m in path.pivot_methods)
+    # 5. Attack method quality (0-10 points)
+    method_scores = {"exploit": 3.0, "relay": 2.5, "credential": 2.0, "cve": 1.0}
+    method_bonus = sum(method_scores.get(m, 0.0) for m in path.attack_methods)
     score += min(method_bonus, 10.0)
 
     return round(score, 1)
 
 
-def build_pivot_relationships() -> dict:
-    """Create PIVOT_TO relationships between hosts in adjacent segments.
-
-    A host can pivot to another if:
-    - They share a network segment, OR
-    - The source host has a vulnerability with an exploit, AND
-    - The target host is in a reachable segment
-
-    Returns:
-        Dict with pivot relationship statistics.
-    """
-    stats = {"pivots_created": 0, "pairs_analyzed": 0}
-
-    with get_session() as session:
-        # Create PIVOT_TO between hosts in the same segment
-        # where at least one has a PIVOT-CAPABLE vulnerability (RCE/shell).
-        # Relay targets, misconfigs, info disclosure do NOT enable pivoting.
-        # NVD CVEs (enables_pivot IS NULL) are treated as pivot-capable
-        # since we can't determine this from NVD data alone.
-        result = session.run(
-            """
-            MATCH (h1:Host)-[:IN_SEGMENT]->(seg:NetworkSegment)<-[:IN_SEGMENT]-(h2:Host)
-            WHERE h1.ip < h2.ip
-            AND h1.role <> 'unknown' AND h2.role <> 'unknown'
-            OPTIONAL MATCH (h1)-[:HAS_SERVICE]->(s1:Service)-[:HAS_VULN]->(v1:Vulnerability)
-                WHERE v1.enables_pivot = true OR v1.enables_pivot IS NULL
-            OPTIONAL MATCH (h2)-[:HAS_SERVICE]->(s2:Service)-[:HAS_VULN]->(v2:Vulnerability)
-                WHERE v2.enables_pivot = true OR v2.enables_pivot IS NULL
-            WITH h1, h2,
-                 max(v1.cvss) AS h1_cvss, max(v2.cvss) AS h2_cvss,
-                 max(CASE WHEN v1.has_exploit = true THEN 1 ELSE 0 END) AS h1_exploit,
-                 max(CASE WHEN v2.has_exploit = true THEN 1 ELSE 0 END) AS h2_exploit
-            RETURN h1.ip AS ip1, h2.ip AS ip2,
-                   COALESCE(h1_cvss, 0) AS h1_cvss, COALESCE(h2_cvss, 0) AS h2_cvss,
-                   h1_exploit AS h1_exploit, h2_exploit AS h2_exploit
-            """
-        )
-
-        pairs = list(result)
-        stats["pairs_analyzed"] = len(pairs)
-
-        for record in pairs:
-            ip1, ip2 = record["ip1"], record["ip2"]
-            h1_cvss = record["h1_cvss"]
-            h2_cvss = record["h2_cvss"]
-            h1_exploit = record["h1_exploit"]
-            h2_exploit = record["h2_exploit"]
-
-            # Only create pivots when there's a real reason to pivot
-            # (exploit, vuln, or at least one side is a high-value target)
-            has_reason = (h1_exploit or h2_exploit or h1_cvss > 0 or h2_cvss > 0)
-
-            # h1 -> h2: needs h1 to have exploit/vuln OR h2 to be high-value
-            if h1_exploit:
-                method_fwd, diff_fwd = "exploit", "easy"
-            elif h1_cvss > 0:
-                method_fwd, diff_fwd = "vuln_service", "medium"
-            elif has_reason:
-                method_fwd, diff_fwd = "shared_segment", "hard"
-            else:
-                method_fwd = None  # Skip — no reason to pivot
-
-            if method_fwd:
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h1)-[p:PIVOT_TO]->(h2)
-                    SET p.method = $method, p.difficulty = $difficulty,
-                        p.cvss = $cvss
-                    """,
-                    ip1=ip1, ip2=ip2, method=method_fwd,
-                    difficulty=diff_fwd, cvss=h1_cvss,
-                )
-                stats["pivots_created"] += 1
-
-            # h2 -> h1: needs h2 to have exploit/vuln
-            if h2_exploit:
-                method_rev, diff_rev = "exploit", "easy"
-            elif h2_cvss > 0:
-                method_rev, diff_rev = "vuln_service", "medium"
-            elif has_reason:
-                method_rev, diff_rev = "shared_segment", "hard"
-            else:
-                method_rev = None
-
-            if method_rev:
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h2)-[p:PIVOT_TO]->(h1)
-                    SET p.method = $method, p.difficulty = $difficulty,
-                        p.cvss = $cvss
-                    """,
-                    ip1=ip1, ip2=ip2, method=method_rev,
-                    difficulty=diff_rev, cvss=h2_cvss,
-                )
-                stats["pivots_created"] += 1
-
-        # Cross-segment pivots: hosts scanned by the same source are reachable
-        # even if they're in different /24 subnets (the scan proves TCP/IP connectivity)
-        # Only pivot-capable vulns (RCE/shell) count for creating pivots.
-        cross_result = session.run(
-            """
-            MATCH (src:ScanSource)-[:SCANNED_FROM]->(h1:Host),
-                  (src)-[:SCANNED_FROM]->(h2:Host)
-            WHERE h1.ip < h2.ip
-            AND h1.role <> 'unknown' AND h2.role <> 'unknown'
-            AND NOT (h1)-[:IN_SEGMENT]->(:NetworkSegment)<-[:IN_SEGMENT]-(h2)
-            OPTIONAL MATCH (h1)-[:HAS_SERVICE]->(s1:Service)-[:HAS_VULN]->(v1:Vulnerability)
-                WHERE v1.enables_pivot = true OR v1.enables_pivot IS NULL
-            OPTIONAL MATCH (h2)-[:HAS_SERVICE]->(s2:Service)-[:HAS_VULN]->(v2:Vulnerability)
-                WHERE v2.enables_pivot = true OR v2.enables_pivot IS NULL
-            WITH h1, h2,
-                 max(v1.cvss) AS h1_cvss, max(v2.cvss) AS h2_cvss,
-                 max(CASE WHEN v1.has_exploit = true THEN 1 ELSE 0 END) AS h1_exploit,
-                 max(CASE WHEN v2.has_exploit = true THEN 1 ELSE 0 END) AS h2_exploit
-            WHERE COALESCE(h1_cvss, 0) > 0 OR COALESCE(h2_cvss, 0) > 0
-            RETURN h1.ip AS ip1, h2.ip AS ip2,
-                   COALESCE(h1_cvss, 0) AS h1_cvss, COALESCE(h2_cvss, 0) AS h2_cvss,
-                   h1_exploit AS h1_exploit, h2_exploit AS h2_exploit
-            """
-        )
-
-        cross_pairs = list(cross_result)
-        stats["cross_segment_pairs"] = len(cross_pairs)
-
-        for record in cross_pairs:
-            ip1, ip2 = record["ip1"], record["ip2"]
-            h1_cvss = record["h1_cvss"]
-            h2_cvss = record["h2_cvss"]
-            h1_exploit = record["h1_exploit"]
-            h2_exploit = record["h2_exploit"]
-
-            # Cross-segment pivots are always "hard" (not local network attacks)
-            if h1_exploit:
-                method_fwd, diff_fwd = "exploit", "medium"
-            elif h1_cvss > 0:
-                method_fwd, diff_fwd = "vuln_service", "hard"
-            else:
-                method_fwd = None
-
-            if method_fwd:
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h1)-[p:PIVOT_TO]->(h2)
-                    ON CREATE SET p.method = $method, p.difficulty = $difficulty,
-                                  p.cvss = $cvss, p.cross_segment = true
-                    """,
-                    ip1=ip1, ip2=ip2, method=method_fwd,
-                    difficulty=diff_fwd, cvss=h1_cvss,
-                )
-                stats["pivots_created"] += 1
-
-            if h2_exploit:
-                method_rev, diff_rev = "exploit", "medium"
-            elif h2_cvss > 0:
-                method_rev, diff_rev = "vuln_service", "hard"
-            else:
-                method_rev = None
-
-            if method_rev:
-                session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h2)-[p:PIVOT_TO]->(h1)
-                    ON CREATE SET p.method = $method, p.difficulty = $difficulty,
-                                  p.cvss = $cvss, p.cross_segment = true
-                    """,
-                    ip1=ip1, ip2=ip2, method=method_rev,
-                    difficulty=diff_rev, cvss=h2_cvss,
-                )
-                stats["pivots_created"] += 1
-
-    return stats
-
-
 def get_path_summary() -> dict:
     """Get attack path statistics for display."""
     with get_session() as session:
-        # Count PIVOT_TO relationships
-        pivot_result = session.run(
+        # Count vulnerable hosts (hosts with at least one vuln)
+        vuln_result = session.run(
             """
-            MATCH ()-[p:PIVOT_TO]->()
-            RETURN count(p) AS total,
-                   count(CASE WHEN p.difficulty = 'easy' THEN 1 END) AS easy,
-                   count(CASE WHEN p.difficulty = 'medium' THEN 1 END) AS medium,
-                   count(CASE WHEN p.difficulty = 'hard' THEN 1 END) AS hard
+            MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
+                  -[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+            WITH DISTINCT h, max(v.cvss) AS max_cvss,
+                 max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
+                 max(CASE WHEN v.confidence = 'confirmed' THEN 3
+                          WHEN v.confidence = 'likely' THEN 2
+                          ELSE 1 END) AS conf_level
+            RETURN count(h) AS total,
+                   count(CASE WHEN has_exploit = 1 THEN 1 END) AS with_exploits,
+                   count(CASE WHEN conf_level >= 3 THEN 1 END) AS confirmed,
+                   count(CASE WHEN conf_level = 2 THEN 1 END) AS likely
             """
         )
-        pivot_record = pivot_result.single()
+        vuln_record = vuln_result.single()
 
         # Count high-value targets
         target_result = session.run(
@@ -742,10 +528,23 @@ def get_path_summary() -> dict:
         )
         targets = {r["role"]: r["cnt"] for r in target_result}
 
+        # Detect true pivot hosts
+        pivot_result = session.run(
+            """
+            MATCH (h:Host), (src:ScanSource)
+            WHERE h.ip = src.name
+            MATCH (ext:ScanSource)-[:SCANNED_FROM]->(h)
+            WHERE ext.name <> src.name
+            RETURN count(DISTINCT h.ip) AS pivot_hosts
+            """
+        )
+        pivot_record = pivot_result.single()
+
         return {
-            "total_pivots": pivot_record["total"] if pivot_record else 0,
-            "easy_pivots": pivot_record["easy"] if pivot_record else 0,
-            "medium_pivots": pivot_record["medium"] if pivot_record else 0,
-            "hard_pivots": pivot_record["hard"] if pivot_record else 0,
+            "vulnerable_hosts": vuln_record["total"] if vuln_record else 0,
+            "with_exploits": vuln_record["with_exploits"] if vuln_record else 0,
+            "confirmed": vuln_record["confirmed"] if vuln_record else 0,
+            "likely": vuln_record["likely"] if vuln_record else 0,
             "high_value_targets": targets,
+            "pivot_hosts": pivot_record["pivot_hosts"] if pivot_record else 0,
         }

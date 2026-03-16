@@ -315,17 +315,18 @@ def boil(ai: bool):
     if topo_stats["gateway_hosts"]:
         console.print(f"  [green]+[/green] {topo_stats['gateway_hosts']} gateway/router hosts detected")
 
-    # Phase 5: Attack path pivots
+    # Phase 5: Attack path discovery
     console.print()
     console.print("[bold cyan]Phase 5: Attack Paths[/bold cyan]")
 
-    from cauldron.ai.attack_paths import build_pivot_relationships
+    from cauldron.ai.attack_paths import get_path_summary
 
-    with console.status("[bold green]Building pivot relationships..."):
-        pivot_stats = build_pivot_relationships()
-
-    console.print(f"  [green]+[/green] Analyzed {pivot_stats['pairs_analyzed']} host pairs")
-    console.print(f"  [green]+[/green] Created {pivot_stats['pivots_created']} pivot relationships")
+    summary = get_path_summary()
+    console.print(f"  [green]+[/green] {summary['vulnerable_hosts']} vulnerable hosts found")
+    if summary["with_exploits"]:
+        console.print(f"  [bold red]![/bold red] {summary['with_exploits']} hosts with known exploits")
+    if summary["pivot_hosts"]:
+        console.print(f"  [green]+[/green] {summary['pivot_hosts']} true pivot hosts detected (multi-scan)")
 
     # Phase 6: AI Analysis (optional)
     if ai:
@@ -344,22 +345,17 @@ def boil(ai: bool):
                 console.print(f"  [green]+[/green] AI found {ai_result.cves_found} CVEs across {ai_result.services_enriched} services")
             if ai_result.ambiguous_classified:
                 console.print(f"  [green]+[/green] AI re-classified {ai_result.ambiguous_classified} ambiguous hosts")
-            if ai_result.pivots_created:
-                console.print(f"  [green]+[/green] AI created {ai_result.pivots_created} new pivot relationships")
             if ai_result.insights:
-                console.print(f"  [green]+[/green] {len(ai_result.insights)} attack chains discovered:")
+                console.print(f"  [green]+[/green] {len(ai_result.insights)} attack insights discovered:")
                 for insight in ai_result.insights[:5]:
                     prio_color = "red" if insight.priority <= 2 else "yellow" if insight.priority <= 3 else "dim"
                     console.print(f"      [{prio_color}]P{insight.priority}[/{prio_color}] {insight.title}")
-            if not any([ai_result.cves_found, ai_result.ambiguous_classified, ai_result.pivots_created]):
+            if not any([ai_result.cves_found, ai_result.ambiguous_classified, ai_result.insights]):
                 console.print("  [dim]  No new findings[/dim]")
 
-            # Rebuild pivots if AI found new CVEs (upgrades shared_segment → exploit/vuln_service)
+            # AI CVEs are immediately available for path discovery
             if ai_result.cves_found:
-                console.print()
-                console.print("[bold cyan]Rebuilding pivots with AI findings...[/bold cyan]")
-                pivot_stats = build_pivot_relationships()
-                console.print(f"  [green]+[/green] Updated {pivot_stats['pivots_created']} pivot relationships")
+                console.print("  [dim]  AI CVEs added — will appear in attack paths[/dim]")
 
     console.print()
     console.print("[bold green]Boil complete![/bold green] Run [cyan]cauldron paths[/cyan] to see attack paths.")
@@ -384,17 +380,18 @@ def paths(target: str | None, role: str | None, top: int, show_all: bool):
 
     # Show summary first
     summary = get_path_summary()
-    if summary["total_pivots"] == 0:
-        console.print("[yellow]No pivot relationships found. Run [cyan]cauldron boil[/cyan] first.[/yellow]")
+    if summary["vulnerable_hosts"] == 0:
+        console.print("[yellow]No vulnerable hosts found. Run [cyan]cauldron boil[/cyan] first.[/yellow]")
         return
 
     console.print("[bold magenta]Attack Path Analysis[/bold magenta]")
     console.print()
-    console.print(f"  Pivot relationships: {summary['total_pivots']}", end="")
-    if summary["easy_pivots"]:
-        console.print(f"  ([red]{summary['easy_pivots']} easy[/red]", end="")
-        console.print(f", [yellow]{summary['medium_pivots']} medium[/yellow]", end="")
-        console.print(f", [dim]{summary['hard_pivots']} hard[/dim])", end="")
+    console.print(f"  Vulnerable hosts: {summary['vulnerable_hosts']}", end="")
+    if summary["with_exploits"]:
+        console.print(f"  ([red]{summary['with_exploits']} with exploits[/red]", end="")
+        if summary["confirmed"]:
+            console.print(f", [bold]{summary['confirmed']} confirmed[/bold]", end="")
+        console.print(")", end="")
     console.print()
 
     if summary["high_value_targets"]:
@@ -403,6 +400,9 @@ def paths(target: str | None, role: str | None, top: int, show_all: bool):
             for r, c in summary["high_value_targets"].items()
         )
         console.print(f"  High-value targets: {targets_str}")
+
+    if summary["pivot_hosts"]:
+        console.print(f"  [bold green]Pivot hosts: {summary['pivot_hosts']}[/bold green] (bridge external/internal scans)")
 
     console.print()
 
@@ -474,11 +474,19 @@ def paths(target: str | None, role: str | None, top: int, show_all: bool):
                 title_str = f" {title}" if title else ""
                 console.print(f"       {icon} {node.ip}  {expl_marker} {vuln.cve_id}{title_str}")
 
-        # Show pivot methods if available
-        methods = [m for m in path.pivot_methods if m != "direct"]
+        # Show attack methods
+        methods = path.attack_methods
         if methods:
-            method_str = " -> ".join(methods)
-            console.print(f"       [dim]pivot: {method_str}[/dim]")
+            method_labels = {
+                "exploit": "[red]exploit[/red]",
+                "relay": "[yellow]relay[/yellow]",
+                "credential": "[yellow]credential[/yellow]",
+                "cve": "[dim]CVE[/dim]",
+                "pivot": "[bold green]pivot[/bold green]",
+                "direct": "[dim]direct[/dim]",
+            }
+            method_str = " + ".join(method_labels.get(m, m) for m in methods)
+            console.print(f"       method: {method_str}")
 
         console.print()
 

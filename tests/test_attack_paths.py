@@ -1,4 +1,11 @@
-"""Tests for attack path discovery and scoring engine."""
+"""Tests for attack path discovery and scoring engine.
+
+Tests the redesigned attack path system:
+- Direct paths: ScanSource -> Host with vulnerability
+- Scoring: target value, CVSS, exploits, hops, attack methods
+- True pivoting: multi-scan overlap detection
+- No PIVOT_TO relationships — paths are computed dynamically
+"""
 
 from __future__ import annotations
 
@@ -8,8 +15,8 @@ from cauldron.graph.connection import clear_database, get_session, verify_connec
 from cauldron.ai.attack_paths import (
     AttackPath,
     PathNode,
+    VulnInfo,
     _score_path,
-    build_pivot_relationships,
     discover_attack_paths,
     get_path_summary,
 )
@@ -34,8 +41,8 @@ def _setup_attack_graph():
     Network:
         ScanSource("192.168.1.100")
           -> WEB01 (10.0.2.20) - web_server, Apache 2.4.49 with CVE (CVSS 7.5, has exploit)
-          -> WEB02 (10.0.2.21) - web_server, Tomcat
-          -> DC01  (10.0.1.10) - domain_controller
+          -> WEB02 (10.0.2.21) - web_server, Tomcat (no vulns)
+          -> DC01  (10.0.1.10) - domain_controller (no vulns)
           -> DB01  (10.0.1.30) - database, MySQL 5.7 with CVE (CVSS 6.5)
 
         Segments:
@@ -46,21 +53,17 @@ def _setup_attack_graph():
           10.0.2.0/24 -> 10.0.1.0/24
     """
     with get_session() as session:
-        # Scan source
         session.run("CREATE (:ScanSource {name: '192.168.1.100'})")
 
-        # Segments
         session.run("CREATE (:NetworkSegment {cidr: '10.0.1.0/24'})")
         session.run("CREATE (:NetworkSegment {cidr: '10.0.2.0/24'})")
 
-        # CAN_REACH
         session.run("""
             MATCH (s1:NetworkSegment {cidr: '10.0.2.0/24'}),
                   (s2:NetworkSegment {cidr: '10.0.1.0/24'})
             CREATE (s1)-[:CAN_REACH]->(s2)
         """)
 
-        # Hosts
         session.run("""
             CREATE (:Host {ip: '10.0.2.20', hostname: 'web01.corp.local',
                           state: 'up', role: 'web_server', role_confidence: 0.9})
@@ -78,7 +81,6 @@ def _setup_attack_graph():
                           state: 'up', role: 'database', role_confidence: 0.9})
         """)
 
-        # Link hosts to segments
         for ip, cidr in [
             ("10.0.2.20", "10.0.2.0/24"),
             ("10.0.2.21", "10.0.2.0/24"),
@@ -93,7 +95,6 @@ def _setup_attack_graph():
                 ip=ip, cidr=cidr,
             )
 
-        # Link scan source to hosts
         for ip in ["10.0.2.20", "10.0.2.21", "10.0.1.10", "10.0.1.30"]:
             session.run(
                 """
@@ -134,16 +135,23 @@ def _setup_attack_graph():
             MATCH (s:Service {host_ip: '10.0.2.20', port: 80})
             CREATE (s)-[:HAS_VULN]->(:Vulnerability {
                 cve_id: 'CVE-2021-41773', cvss: 7.5, severity: 'HIGH',
-                has_exploit: true, description: 'Path traversal in Apache 2.4.49'
+                has_exploit: true, description: 'Path traversal in Apache 2.4.49',
+                confidence: 'confirmed', enables_pivot: true
             })
         """)
         session.run("""
             MATCH (s:Service {host_ip: '10.0.1.30', port: 3306})
             CREATE (s)-[:HAS_VULN]->(:Vulnerability {
                 cve_id: 'CVE-2022-21417', cvss: 6.5, severity: 'MEDIUM',
-                has_exploit: false, description: 'MySQL vulnerability'
+                has_exploit: false, description: 'MySQL vulnerability',
+                confidence: 'likely'
             })
         """)
+
+
+# ---------------------------------------------------------------------------
+# Scoring tests
+# ---------------------------------------------------------------------------
 
 
 class TestScorePath:
@@ -268,8 +276,6 @@ class TestScorePathNonLinearCVSS:
             max_cvss=9.8,
         )
         score = _score_path(path)
-        # CVSS 9.8 should contribute 35 points
-        # target_value(web_server)=10 + cvss=35 + hop(1)=15 = 60
         assert score >= 55
 
     def test_low_cvss_scores_low(self):
@@ -280,7 +286,6 @@ class TestScorePathNonLinearCVSS:
             max_cvss=2.0,
         )
         score = _score_path(path)
-        # CVSS 2.0 → 2.0*2.5=5, target=10, hop=15 → ~30
         assert score < 35
 
     def test_medium_cvss_middle_range(self):
@@ -291,338 +296,64 @@ class TestScorePathNonLinearCVSS:
             max_cvss=5.5,
         )
         score = _score_path(path)
-        # CVSS 5.5: 10 + (5.5-4)*5 = 17.5, target=10, hop=15 → ~42.5
         assert 35 < score < 50
 
 
-class TestScorePathPivotMethods:
-    def test_exploit_pivot_adds_bonus(self):
-        with_exploit_pivot = AttackPath(
-            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
-            target_role="database",
-            hop_count=1,
-            pivot_methods=["exploit"],
-        )
-        with_shared_segment = AttackPath(
-            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
-            target_role="database",
-            hop_count=1,
-            pivot_methods=["shared_segment"],
-        )
-        assert _score_path(with_exploit_pivot) > _score_path(with_shared_segment)
+class TestScorePathAttackMethods:
+    """Test attack method scoring."""
 
-    def test_pivot_method_bonus_capped(self):
+    def test_exploit_method_adds_bonus(self):
+        with_exploit = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            attack_methods=["exploit"],
+        )
+        with_cve_only = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            attack_methods=["cve"],
+        )
+        assert _score_path(with_exploit) > _score_path(with_cve_only)
+
+    def test_relay_method_scores_between_exploit_and_cve(self):
+        relay = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            attack_methods=["relay"],
+        )
+        exploit = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            attack_methods=["exploit"],
+        )
+        cve = AttackPath(
+            nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
+            target_role="database",
+            hop_count=1,
+            attack_methods=["cve"],
+        )
+        assert _score_path(exploit) > _score_path(relay) > _score_path(cve)
+
+    def test_method_bonus_capped(self):
         many_exploits = AttackPath(
             nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
             target_role="database",
             hop_count=1,
-            pivot_methods=["exploit"] * 10,  # 30 points worth
+            attack_methods=["exploit"] * 10,
         )
-        score_many = _score_path(many_exploits)
         few_exploits = AttackPath(
             nodes=[PathNode(ip="src"), PathNode(ip="tgt")],
             target_role="database",
             hop_count=1,
-            pivot_methods=["exploit"] * 3,  # 9 points
+            attack_methods=["exploit"] * 3,
         )
+        score_many = _score_path(many_exploits)
         score_few = _score_path(few_exploits)
-        # Cap is 10, so 10 exploits shouldn't score much more than 4
         assert score_many - score_few <= 2
-
-
-class TestBuildPivotRelationships:
-    def test_creates_pivots(self):
-        _setup_attack_graph()
-        stats = build_pivot_relationships()
-
-        assert stats["pairs_analyzed"] > 0
-        # WEB01 has exploit → should create pivots
-        with get_session() as session:
-            result = session.run(
-                "MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt"
-            )
-            assert result.single()["cnt"] > 0
-
-    def test_pivot_has_method_and_difficulty(self):
-        _setup_attack_graph()
-        build_pivot_relationships()
-
-        with get_session() as session:
-            result = session.run(
-                """
-                MATCH ()-[p:PIVOT_TO]->()
-                RETURN p.method AS method, p.difficulty AS difficulty
-                LIMIT 1
-                """
-            )
-            record = result.single()
-            assert record is not None
-            assert record["method"] in ("exploit", "vuln_service", "shared_segment")
-            assert record["difficulty"] in ("easy", "medium", "hard")
-
-    def test_empty_graph(self):
-        stats = build_pivot_relationships()
-        assert stats["pivots_created"] == 0
-        assert stats["pairs_analyzed"] == 0
-
-    def test_idempotent(self):
-        _setup_attack_graph()
-        build_pivot_relationships()
-
-        with get_session() as session:
-            result = session.run("MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt")
-            count1 = result.single()["cnt"]
-
-        build_pivot_relationships()
-
-        with get_session() as session:
-            result = session.run("MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt")
-            count2 = result.single()["cnt"]
-
-        assert count1 == count2
-
-
-class TestDiscoverAttackPaths:
-    def test_finds_paths_to_dc(self):
-        _setup_attack_graph()
-        paths = discover_attack_paths(target_role="domain_controller")
-
-        assert len(paths) >= 1
-        assert paths[0].target_role == "domain_controller"
-        assert paths[0].score > 0
-
-    def test_finds_paths_to_specific_ip(self):
-        _setup_attack_graph()
-        paths = discover_attack_paths(target_ip="10.0.1.10")
-
-        assert len(paths) >= 1
-        assert paths[0].target_ip == "10.0.1.10"
-
-    def test_finds_all_high_value_paths(self):
-        _setup_attack_graph()
-        paths = discover_attack_paths()
-
-        # Should find paths to DC and DB at minimum
-        target_roles = {p.target_role for p in paths}
-        assert "domain_controller" in target_roles
-
-    def test_paths_sorted_by_score(self):
-        _setup_attack_graph()
-        paths = discover_attack_paths()
-
-        if len(paths) >= 2:
-            for i in range(len(paths) - 1):
-                assert paths[i].score >= paths[i + 1].score
-
-    def test_no_paths_in_empty_graph(self):
-        paths = discover_attack_paths()
-        assert paths == []
-
-    def test_path_has_nodes(self):
-        _setup_attack_graph()
-        paths = discover_attack_paths(target_role="domain_controller")
-
-        if paths:
-            path = paths[0]
-            assert len(path.nodes) >= 2
-            assert path.nodes[0].role == "scan_source"
-            assert path.hop_count >= 1
-
-
-class TestGetPathSummary:
-    def test_summary_with_pivots(self):
-        _setup_attack_graph()
-        build_pivot_relationships()
-
-        summary = get_path_summary()
-        assert summary["total_pivots"] > 0
-        assert "domain_controller" in summary["high_value_targets"]
-
-    def test_summary_empty_graph(self):
-        summary = get_path_summary()
-        assert summary["total_pivots"] == 0
-        assert summary["high_value_targets"] == {}
-
-
-class TestAIPivotIntegration:
-    """Test that AI-created PIVOT_TO relationships appear in path discovery."""
-
-    def test_ai_pivot_appears_in_paths(self):
-        """AI creates PIVOT_TO between printer and DC → paths should find it."""
-        _setup_attack_graph()
-
-        # Add a printer host in a different segment (not directly reachable)
-        with get_session() as session:
-            session.run("""
-                CREATE (seg:NetworkSegment {cidr: '10.0.3.0/24'})
-                CREATE (h:Host {ip: '10.0.3.50', hostname: 'printer01',
-                               state: 'up', role: 'printer', role_confidence: 0.9})
-                CREATE (h)-[:IN_SEGMENT]->(seg)
-            """)
-            # Scan source scanned the printer
-            session.run("""
-                MATCH (src:ScanSource {name: '192.168.1.100'}), (h:Host {ip: '10.0.3.50'})
-                CREATE (src)-[:SCANNED_FROM]->(h)
-            """)
-            # AI discovers: printer → DC (method=ai_chain)
-            session.run("""
-                MATCH (h1:Host {ip: '10.0.3.50'}), (h2:Host {ip: '10.0.1.10'})
-                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'medium',
-                                        ai_title: 'Printer SNMP to DC'}]->(h2)
-            """)
-
-        paths = discover_attack_paths(target_role="domain_controller")
-
-        # Should find the AI chain path (printer → DC)
-        ai_paths = [p for p in paths if any(
-            n.ip == "10.0.3.50" for n in p.nodes
-        )]
-        assert len(ai_paths) >= 1
-        assert ai_paths[0].target_role == "domain_controller"
-
-    def test_ai_cves_upgrade_pivot_difficulty(self):
-        """AI-found CVEs should upgrade shared_segment pivots to exploit."""
-        _setup_attack_graph()
-        build_pivot_relationships()
-
-        # Before AI: WEB01→DC should exist (via CAN_REACH segments)
-        paths_before = discover_attack_paths(target_role="domain_controller")
-        dc_path_before = next(
-            (p for p in paths_before if p.target_ip == "10.0.1.10"), None
-        )
-        score_before = dc_path_before.score if dc_path_before else 0
-
-        # AI finds CVE on DC's LDAP service
-        with get_session() as session:
-            session.run("""
-                MERGE (v:Vulnerability {cve_id: 'CVE-2022-99999'})
-                SET v.cvss = 9.8, v.severity = 'CRITICAL',
-                    v.has_exploit = true, v.source = 'ai'
-            """)
-            session.run("""
-                MATCH (s:Service {host_ip: '10.0.1.10', port: 389})
-                MATCH (v:Vulnerability {cve_id: 'CVE-2022-99999'})
-                MERGE (s)-[:HAS_VULN]->(v)
-            """)
-
-        # Rebuild pivots with new CVE data
-        build_pivot_relationships()
-        paths_after = discover_attack_paths(target_role="domain_controller")
-        dc_path_after = next(
-            (p for p in paths_after if p.target_ip == "10.0.1.10"), None
-        )
-
-        assert dc_path_after is not None
-        assert dc_path_after.score > score_before
-        assert dc_path_after.max_cvss >= 9.8
-
-    def test_multiple_paths_to_same_target_preserved(self):
-        """Different paths to same target should NOT be deduplicated."""
-        _setup_attack_graph()
-        build_pivot_relationships()
-
-        # Create two different AI chains to DC
-        with get_session() as session:
-            # Chain 1: WEB02 → DC (ai_chain)
-            session.run("""
-                MATCH (h1:Host {ip: '10.0.2.21'}), (h2:Host {ip: '10.0.1.10'})
-                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'easy',
-                                        ai_title: 'Tomcat to DC'}]->(h2)
-            """)
-            # Chain 2: DB01 → DC (ai_chain)
-            session.run("""
-                MATCH (h1:Host {ip: '10.0.1.30'}), (h2:Host {ip: '10.0.1.10'})
-                CREATE (h1)-[:PIVOT_TO {method: 'ai_chain', difficulty: 'medium',
-                                        ai_title: 'DB to DC lateral'}]->(h2)
-            """)
-
-        paths = discover_attack_paths(target_role="domain_controller")
-
-        # Should have multiple distinct paths to DC (not just one)
-        dc_paths = [p for p in paths if p.target_ip == "10.0.1.10"]
-        assert len(dc_paths) >= 2
-
-        # Paths should have different intermediate nodes
-        path_signatures = {tuple(n.ip for n in p.nodes) for p in dc_paths}
-        assert len(path_signatures) >= 2
-
-
-class TestCrossSegmentPivots:
-    """Test cross-segment pivot creation for hosts scanned by same source."""
-
-    def test_cross_segment_pivot_created(self):
-        """Hosts in different segments but scanned by same source should get cross-segment pivots."""
-        with get_session() as session:
-            session.run("CREATE (:ScanSource {name: 'scanner1'})")
-            session.run("""
-                CREATE (seg1:NetworkSegment {cidr: '10.1.0.0/24'})
-                CREATE (seg2:NetworkSegment {cidr: '10.2.0.0/24'})
-            """)
-            # Two hosts in different segments
-            session.run("""
-                CREATE (h1:Host {ip: '10.1.0.10', state: 'up', role: 'web_server', role_confidence: 0.9})
-                CREATE (h2:Host {ip: '10.2.0.20', state: 'up', role: 'database', role_confidence: 0.9})
-            """)
-            for ip, cidr in [("10.1.0.10", "10.1.0.0/24"), ("10.2.0.20", "10.2.0.0/24")]:
-                session.run(
-                    "MATCH (h:Host {ip: $ip}), (s:NetworkSegment {cidr: $cidr}) CREATE (h)-[:IN_SEGMENT]->(s)",
-                    ip=ip, cidr=cidr,
-                )
-            for ip in ["10.1.0.10", "10.2.0.20"]:
-                session.run(
-                    "MATCH (src:ScanSource {name: 'scanner1'}), (h:Host {ip: $ip}) CREATE (src)-[:SCANNED_FROM]->(h)",
-                    ip=ip,
-                )
-            # Add a vuln to h1 so there's a reason to pivot
-            session.run("""
-                MATCH (h:Host {ip: '10.1.0.10'})
-                CREATE (h)-[:HAS_SERVICE]->(:Service {host_ip: '10.1.0.10', port: 80, protocol: 'tcp', state: 'open'})
-            """)
-            session.run("""
-                MATCH (s:Service {host_ip: '10.1.0.10', port: 80})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true})
-            """)
-
-        stats = build_pivot_relationships()
-        assert stats.get("cross_segment_pairs", 0) > 0
-
-        with get_session() as session:
-            result = session.run(
-                "MATCH (h1:Host {ip: '10.1.0.10'})-[p:PIVOT_TO]->(h2:Host {ip: '10.2.0.20'}) RETURN p"
-            )
-            pivot = result.single()
-            assert pivot is not None
-            assert pivot["p"]["cross_segment"] is True
-
-    def test_cross_segment_no_pivot_without_vuln(self):
-        """Cross-segment pivots should NOT be created if neither side has vulns."""
-        with get_session() as session:
-            session.run("CREATE (:ScanSource {name: 'scanner1'})")
-            session.run("""
-                CREATE (seg1:NetworkSegment {cidr: '10.1.0.0/24'})
-                CREATE (seg2:NetworkSegment {cidr: '10.2.0.0/24'})
-            """)
-            session.run("""
-                CREATE (h1:Host {ip: '10.1.0.10', state: 'up', role: 'web_server', role_confidence: 0.9})
-                CREATE (h2:Host {ip: '10.2.0.20', state: 'up', role: 'database', role_confidence: 0.9})
-            """)
-            for ip, cidr in [("10.1.0.10", "10.1.0.0/24"), ("10.2.0.20", "10.2.0.0/24")]:
-                session.run(
-                    "MATCH (h:Host {ip: $ip}), (s:NetworkSegment {cidr: $cidr}) CREATE (h)-[:IN_SEGMENT]->(s)",
-                    ip=ip, cidr=cidr,
-                )
-            for ip in ["10.1.0.10", "10.2.0.20"]:
-                session.run(
-                    "MATCH (src:ScanSource {name: 'scanner1'}), (h:Host {ip: $ip}) CREATE (src)-[:SCANNED_FROM]->(h)",
-                    ip=ip,
-                )
-
-        stats = build_pivot_relationships()
-        assert stats.get("cross_segment_pairs", 0) == 0
-
-        with get_session() as session:
-            result = session.run("MATCH ()-[p:PIVOT_TO]->() RETURN count(p) AS cnt")
-            assert result.single()["cnt"] == 0
 
 
 class TestManagementTargetValue:
@@ -642,12 +373,271 @@ class TestManagementTargetValue:
         assert _score_path(mgmt_path) > _score_path(backup_path)
 
 
+# ---------------------------------------------------------------------------
+# Direct attack path discovery (Neo4j integration tests)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverDirectPaths:
+    """Test direct path discovery: ScanSource -> vulnerable host."""
+
+    def test_finds_path_to_vulnerable_host(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_ip="10.0.2.20")
+
+        assert len(paths) >= 1
+        path = paths[0]
+        assert path.target_ip == "10.0.2.20"
+        assert path.hop_count == 1
+        assert path.has_exploits is True
+        assert path.score > 0
+
+    def test_finds_path_to_db_with_cve(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_ip="10.0.1.30")
+
+        assert len(paths) >= 1
+        path = paths[0]
+        assert path.target_ip == "10.0.1.30"
+        assert path.target_role == "database"
+
+    def test_no_path_to_host_without_vulns(self):
+        """DC01 has no vulns — no attack path should exist."""
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_ip="10.0.1.10")
+
+        assert len(paths) == 0
+
+    def test_finds_all_vulnerable_hosts(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths()
+
+        target_ips = {p.target_ip for p in paths}
+        # WEB01 (has CVE) and DB01 (has CVE) should have paths
+        assert "10.0.2.20" in target_ips
+        assert "10.0.1.30" in target_ips
+        # DC01 (no CVE) should NOT have a path
+        assert "10.0.1.10" not in target_ips
+
+    def test_paths_sorted_by_score(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths()
+
+        if len(paths) >= 2:
+            for i in range(len(paths) - 1):
+                assert paths[i].score >= paths[i + 1].score
+
+    def test_no_paths_in_empty_graph(self):
+        paths = discover_attack_paths()
+        assert paths == []
+
+    def test_path_has_two_nodes(self):
+        """Direct paths always have exactly 2 nodes: source + target."""
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_ip="10.0.2.20")
+
+        if paths:
+            path = paths[0]
+            assert len(path.nodes) == 2
+            assert path.nodes[0].role == "scan_source"
+            assert path.nodes[1].ip == "10.0.2.20"
+
+    def test_path_includes_vuln_details(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_ip="10.0.2.20")
+
+        if paths:
+            target = paths[0].nodes[-1]
+            assert len(target.vulns) >= 1
+            cve = target.vulns[0]
+            assert cve.cve_id == "CVE-2021-41773"
+            assert cve.cvss == 7.5
+            assert cve.has_exploit is True
+
+    def test_filter_by_role(self):
+        _setup_attack_graph()
+        paths = discover_attack_paths(target_role="database")
+
+        assert all(p.target_role == "database" for p in paths)
+        assert len(paths) >= 1
+
+    def test_smb_relay_creates_path(self):
+        """SMB signing disabled = valid attack path (relay target)."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: 'scanner'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.5', state: 'up', role: 'file_server',
+                               role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: 'scanner'}), (h:Host {ip: '10.0.0.5'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            session.run("""
+                MATCH (h:Host {ip: '10.0.0.5'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.0.5',
+                       port: 445, protocol: 'tcp', state: 'open', name: 'microsoft-ds'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CAULDRON-SMB-SIGNING', cvss: 0.0,
+                    has_exploit: true, enables_pivot: false,
+                    description: 'SMB signing not required - NTLM relay target',
+                    confidence: 'confirmed'
+                })
+            """)
+
+        paths = discover_attack_paths(target_ip="10.0.0.5")
+        assert len(paths) >= 1
+        assert paths[0].target_ip == "10.0.0.5"
+
+
+# ---------------------------------------------------------------------------
+# True pivot path discovery
+# ---------------------------------------------------------------------------
+
+
+class TestTruePivotPaths:
+    """Test multi-scan pivot detection.
+
+    True pivot: Host appears in external scan AND is ScanSource for internal scan.
+    """
+
+    def test_pivot_path_through_compromised_host(self):
+        """External scan finds web01, internal scan from web01 finds db_internal."""
+        with get_session() as session:
+            # External scan
+            session.run("CREATE (:ScanSource {name: 'attacker'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.1.5', hostname: 'web01', state: 'up',
+                               role: 'web_server', role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: 'attacker'}), (h:Host {ip: '10.0.1.5'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # web01 has RCE vuln
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.5'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.1.5',
+                       port: 80, protocol: 'tcp', state: 'open',
+                       product: 'Apache httpd', version: '2.4.49'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true,
+                    enables_pivot: true, description: 'Apache RCE',
+                    confidence: 'confirmed'
+                })
+            """)
+
+            # Internal scan FROM web01 (compromised → pivot)
+            session.run("CREATE (:ScanSource {name: '10.0.1.5'})")
+            session.run("""
+                CREATE (h:Host {ip: '192.168.1.10', hostname: 'db-internal',
+                               state: 'up', role: 'database', role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: '10.0.1.5'}), (h:Host {ip: '192.168.1.10'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # Internal DB has vuln
+            session.run("""
+                MATCH (h:Host {ip: '192.168.1.10'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '192.168.1.10',
+                       port: 3306, protocol: 'tcp', state: 'open',
+                       product: 'MySQL', version: '5.7.38'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CVE-2022-21417', cvss: 6.5, has_exploit: false,
+                    description: 'MySQL vuln', confidence: 'likely'
+                })
+            """)
+
+        paths = discover_attack_paths(target_ip="192.168.1.10")
+
+        assert len(paths) >= 1
+        pivot_path = paths[0]
+        assert pivot_path.hop_count == 2
+        assert len(pivot_path.nodes) == 3
+        assert pivot_path.nodes[0].ip == "attacker"  # source
+        assert pivot_path.nodes[1].ip == "10.0.1.5"  # pivot
+        assert pivot_path.nodes[2].ip == "192.168.1.10"  # target
+        assert "pivot" in pivot_path.attack_methods
+
+    def test_no_pivot_without_matching_scan_source(self):
+        """No pivot path if no internal scan exists."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: 'attacker'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.1.5', state: 'up', role: 'web_server',
+                               role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: 'attacker'}), (h:Host {ip: '10.0.1.5'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.5'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.1.5',
+                       port: 80, protocol: 'tcp', state: 'open'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true,
+                    enables_pivot: true, description: 'Apache RCE'
+                })
+            """)
+
+        # No internal ScanSource matching 10.0.1.5 → no pivot paths
+        pivot_paths = discover_attack_paths(target_role="database")
+        assert len(pivot_paths) == 0
+
+
+# ---------------------------------------------------------------------------
+# Path summary
+# ---------------------------------------------------------------------------
+
+
+class TestGetPathSummary:
+    def test_summary_with_vulns(self):
+        _setup_attack_graph()
+        summary = get_path_summary()
+
+        assert summary["vulnerable_hosts"] >= 2  # WEB01 + DB01
+        assert summary["with_exploits"] >= 1  # WEB01
+        assert "domain_controller" in summary["high_value_targets"]
+
+    def test_summary_empty_graph(self):
+        summary = get_path_summary()
+        assert summary["vulnerable_hosts"] == 0
+        assert summary["high_value_targets"] == {}
+        assert summary["pivot_hosts"] == 0
+
+    def test_summary_detects_pivot_hosts(self):
+        """Pivot host detected when Host.ip matches ScanSource.name."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: 'external'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.1.5', state: 'up', role: 'web_server',
+                               role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: 'external'}), (h:Host {ip: '10.0.1.5'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # Internal scan from 10.0.1.5
+            session.run("CREATE (:ScanSource {name: '10.0.1.5'})")
+
+        summary = get_path_summary()
+        assert summary["pivot_hosts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline test
+# ---------------------------------------------------------------------------
+
+
 class TestFullPipeline:
     def test_brew_boil_paths_pipeline(self):
         """Test the complete pipeline with corporate_network.xml."""
         from pathlib import Path
 
         from cauldron.ai.classifier import classify_hosts
+        from cauldron.exploits.matcher import ExploitDB, upgrade_confidence_from_scripts
         from cauldron.graph.ingestion import ingest_scan
         from cauldron.graph.topology import build_segment_connectivity
         from cauldron.parsers.nmap_parser import parse_nmap_xml
@@ -661,15 +651,39 @@ class TestFullPipeline:
         classify_hosts(scan.hosts_up)
         ingest_scan(scan, source_name="10.0.0.100")
 
-        # Boil (topology + pivots)
+        # Boil phases: exploit DB + scripts + topology
+        exploit_db = ExploitDB()
+        exploit_db.match_from_graph()
+        upgrade_confidence_from_scripts()
         build_segment_connectivity()
-        build_pivot_relationships()
 
-        # Paths
+        # Paths — discovered dynamically from vulns
         paths = discover_attack_paths()
 
-        # Should find at least one path (there are 2 DCs in the test data)
+        # Should find paths to hosts with vulns
         assert len(paths) >= 1
 
         summary = get_path_summary()
         assert summary["high_value_targets"].get("domain_controller", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# VulnInfo attack method classification
+# ---------------------------------------------------------------------------
+
+
+class TestVulnInfoMethod:
+    """Test that VulnInfo carries attack method info."""
+
+    def test_vuln_has_method_field(self):
+        v = VulnInfo(cve_id="CVE-2021-41773", method="exploit")
+        assert v.method == "exploit"
+
+    def test_vuln_has_enables_pivot(self):
+        v = VulnInfo(cve_id="CVE-2021-41773", enables_pivot=True)
+        assert v.enables_pivot is True
+
+    def test_relay_vuln(self):
+        v = VulnInfo(cve_id="CAULDRON-SMB-SIGNING", method="relay", enables_pivot=False)
+        assert v.method == "relay"
+        assert v.enables_pivot is False

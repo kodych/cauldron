@@ -193,7 +193,7 @@ class TestAnalyzeGraph:
             assert isinstance(result, AnalysisResult)
             assert result.insights == []
             assert result.cves_found == 0
-            assert result.pivots_created == 0
+            assert result.insights == []
 
 
 class TestApplyAiCves:
@@ -248,80 +248,75 @@ class TestApplyAiCves:
         assert services == 0
 
 
-class TestParseAndCreateChainPivots:
-    def test_valid_chain(self):
-        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+class TestParseAttackInsights:
+    def test_valid_insight(self):
+        from cauldron.ai.analyzer import _parse_attack_insights
 
         response = json.dumps([{
             "type": "attack_chain",
             "title": "Printer pivot to DC",
-            "path": ["10.0.0.5", "10.0.1.10"],
+            "hosts": ["10.0.0.5", "10.0.1.10"],
             "priority": 1,
             "confidence": 0.85,
+            "details": "SNMP to AD exploitation",
         }])
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.single.return_value = {"ip": "10.0.0.5"}
-            mock_session.run.return_value = mock_result
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
-
-            insights, pivots = _parse_and_create_chain_pivots(response)
-            assert len(insights) == 1
-            assert insights[0].title == "Printer pivot to DC"
-            assert pivots == 1
+        insights = _parse_attack_insights(response)
+        assert len(insights) == 1
+        assert insights[0].title == "Printer pivot to DC"
+        assert insights[0].hosts == ["10.0.0.5", "10.0.1.10"]
+        assert insights[0].priority == 1
 
     def test_filters_low_confidence(self):
-        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+        from cauldron.ai.analyzer import _parse_attack_insights
 
         response = json.dumps([{
             "type": "attack_chain",
             "title": "Bad chain",
-            "path": ["10.0.0.1", "10.0.0.2"],
+            "hosts": ["10.0.0.1", "10.0.0.2"],
             "priority": 1,
             "confidence": 0.3,
         }])
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
-
-            insights, pivots = _parse_and_create_chain_pivots(response)
-            assert len(insights) == 0
-            assert pivots == 0
+        insights = _parse_attack_insights(response)
+        assert len(insights) == 0
 
     def test_handles_invalid_json(self):
-        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+        from cauldron.ai.analyzer import _parse_attack_insights
 
-        insights, pivots = _parse_and_create_chain_pivots("broken")
+        insights = _parse_attack_insights("broken")
         assert insights == []
-        assert pivots == 0
 
     def test_sorts_by_priority(self):
-        from cauldron.ai.analyzer import _parse_and_create_chain_pivots
+        from cauldron.ai.analyzer import _parse_attack_insights
 
         response = json.dumps([
-            {"type": "attack_chain", "title": "Low", "path": ["10.0.0.1", "10.0.0.2"],
+            {"type": "attack_chain", "title": "Low", "hosts": ["10.0.0.1", "10.0.0.2"],
              "priority": 4, "confidence": 0.9},
-            {"type": "attack_chain", "title": "High", "path": ["10.0.0.3", "10.0.0.4"],
+            {"type": "attack_chain", "title": "High", "hosts": ["10.0.0.3", "10.0.0.4"],
              "priority": 1, "confidence": 0.9},
         ])
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.single.return_value = {"ip": "10.0.0.1"}
-            mock_session.run.return_value = mock_result
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+        insights = _parse_attack_insights(response)
+        assert len(insights) == 2
+        assert insights[0].title == "High"
+        assert insights[1].title == "Low"
 
-            insights, _ = _parse_and_create_chain_pivots(response)
-            assert len(insights) == 2
-            assert insights[0].title == "High"
-            assert insights[1].title == "Low"
+    def test_accepts_path_key_for_backwards_compat(self):
+        """AI might still return 'path' key instead of 'hosts'."""
+        from cauldron.ai.analyzer import _parse_attack_insights
+
+        response = json.dumps([{
+            "type": "attack_chain",
+            "title": "Chain via path key",
+            "path": ["10.0.0.1", "10.0.0.2"],
+            "priority": 2,
+            "confidence": 0.8,
+        }])
+
+        insights = _parse_attack_insights(response)
+        assert len(insights) == 1
+        assert insights[0].hosts == ["10.0.0.1", "10.0.0.2"]
 
 
 # --- Integration tests (require Neo4j) ---

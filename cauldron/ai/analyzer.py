@@ -3,7 +3,7 @@
 Three integrated AI phases that directly affect the graph:
 1. CVE discovery — find vulnerabilities NVD missed based on product+version
 2. Host classification — re-classify ambiguous hosts
-3. Attack chain discovery — find non-obvious paths, create PIVOT_TO relationships
+3. Attack chain discovery — find non-obvious attack insights
 
 Each phase writes results back to Neo4j so that `cauldron paths` reflects AI findings.
 """
@@ -73,10 +73,8 @@ def analyze_graph() -> AnalysisResult:
     # Phase 2: Re-classify ambiguous hosts
     result.ambiguous_classified = _classify_ambiguous_hosts()
 
-    # Phase 3: Attack chain discovery → PIVOT_TO
-    insights, pivots = _discover_and_create_pivots()
-    result.insights = insights
-    result.pivots_created = pivots
+    # Phase 3: Attack chain discovery (insights only, no graph mutations)
+    result.insights = _discover_attack_insights()
 
     return result
 
@@ -251,33 +249,35 @@ Only include hosts where confidence > 0.6."""
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Attack Chain Discovery → PIVOT_TO
+# Phase 3: Attack Chain Discovery (insights only)
 # ---------------------------------------------------------------------------
 
 
-def _discover_and_create_pivots() -> tuple[list[AIInsight], int]:
-    """Discover attack chains and create PIVOT_TO relationships for them.
+def _discover_attack_insights() -> list[AIInsight]:
+    """Discover non-obvious attack chains and insights.
 
-    Returns:
-        (insights, pivots_created)
+    AI analyzes the full network map and identifies attack chains,
+    chokepoints, and correlations. Results are returned as insights
+    for display — no graph mutations (attack paths are computed
+    dynamically from ScanSource→Host→Vulnerability relationships).
     """
-    # Get full network summary — AI needs complete picture to find hidden paths
     summary = _get_network_summary()
     if not summary:
-        return [], 0
+        return []
 
-    prompt = f"""You are a penetration tester. Analyze this network and find non-obvious attack chains.
+    prompt = f"""You are a penetration tester. Analyze this network and find non-obvious attack insights.
 
 {summary}
 
 Find:
-1. Multi-step attack chains through unexpected pivots (printers, VoIP, monitoring → DC)
+1. High-value attack chains (which hosts to target first and why)
 2. Service correlations that enable lateral movement
 3. Chokepoint hosts (compromising one = access to many)
+4. Hosts that could serve as pivot points to reach other network segments
 
-IMPORTANT: Only report chains that involve real exploitable vulnerabilities or confirmed misconfigurations.
-Do NOT suggest checking for default credentials, null sessions, or anonymous access as attack chains —
-those are basic checks, not attack paths. Focus on paths where the exploit or vulnerability is known.
+IMPORTANT: Only report insights involving real exploitable vulnerabilities or confirmed misconfigurations.
+Do NOT suggest checking for default credentials, null sessions, or anonymous access —
+those are basic checks, not insights. Focus on known vulns and concrete attack techniques.
 
 Use confidence levels:
 - 0.9+ = confirmed (version-matched CVE with known exploit)
@@ -288,30 +288,29 @@ Respond with ONLY JSON array:
 [{{
   "type": "attack_chain",
   "title": "short description",
-  "path": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+  "hosts": ["10.0.0.1", "10.0.0.2"],
   "priority": 1-5,
-  "confidence": 0.0-1.0
+  "confidence": 0.0-1.0,
+  "details": "brief explanation of the attack technique"
 }}]
 
-"path" = ordered list of IPs in the attack chain. Priority 1 = most interesting.
-Only include findings with confidence > 0.5. Respond with ONLY the JSON."""
+Priority 1 = most critical. Only include findings with confidence > 0.5.
+Respond with ONLY the JSON."""
 
     response = _call_claude(prompt, max_tokens=2048)
     if not response:
-        return [], 0
+        return []
 
-    insights, pivots = _parse_and_create_chain_pivots(response)
-    return insights, pivots
+    return _parse_attack_insights(response)
 
 
 def _get_network_summary() -> str | None:
-    """Build a detailed network summary for AI attack chain discovery.
+    """Build a detailed network summary for AI analysis.
 
-    Includes full service details, all CVEs, banners, and existing pivots
-    so AI has complete picture to find non-obvious attack paths.
+    Includes full service details, all CVEs, banners, and segment connectivity
+    so AI has complete picture to find non-obvious attack insights.
     """
     with get_session() as session:
-        # Get all up hosts with their services and vulns — no limits
         result = session.run(
             """
             MATCH (h:Host)
@@ -338,24 +337,14 @@ def _get_network_summary() -> str | None:
         if not hosts:
             return None
 
-        # Get segment connectivity
         conn = session.run(
             "MATCH (s1:NetworkSegment)-[:CAN_REACH]->(s2:NetworkSegment) "
             "RETURN s1.cidr AS src, s2.cidr AS dst"
         )
         connectivity = list(conn)
 
-        # Get existing pivots so AI knows what's already discovered
-        pivots = session.run(
-            "MATCH (h1:Host)-[p:PIVOT_TO]->(h2:Host) "
-            "RETURN h1.ip AS src, h2.ip AS dst, p.method AS method, "
-            "p.difficulty AS difficulty"
-        )
-        existing_pivots = list(pivots)
-
     lines = ["=== NETWORK MAP ===", ""]
 
-    # Group by segment for readability
     current_segment = None
     for h in hosts:
         seg = h["segment"] or "unknown"
@@ -363,7 +352,6 @@ def _get_network_summary() -> str | None:
             current_segment = seg
             lines.append(f"--- Segment: {seg} ---")
 
-        # Host header
         role = h["role"] or "unknown"
         header = f"  {h['ip']} [{role}]"
         if h.get("hostname"):
@@ -372,7 +360,6 @@ def _get_network_summary() -> str | None:
             header += f" OS:{h['os']}"
         lines.append(header)
 
-        # Services — full detail
         services = [s for s in (h["services"] or []) if s.get("port")]
         for s in services:
             svc_line = f"    {s['port']}/{s.get('protocol', 'tcp')}"
@@ -386,7 +373,6 @@ def _get_network_summary() -> str | None:
                 svc_line += f" | {s['banner'][:80]}"
             lines.append(svc_line)
 
-        # Vulnerabilities — all of them
         vulns = [v for v in (h["vulns"] or []) if v.get("cve_id")]
         for v in vulns:
             vuln_line = f"    VULN: {v['cve_id']} CVSS:{v.get('cvss', '?')}"
@@ -402,67 +388,41 @@ def _get_network_summary() -> str | None:
             lines.append(f"  {c['src']} -> {c['dst']}")
         lines.append("")
 
-    if existing_pivots:
-        lines.append("=== EXISTING PIVOTS (already discovered) ===")
-        for p in existing_pivots:
-            lines.append(f"  {p['src']} -> {p['dst']} [{p['method']}] {p['difficulty']}")
-        lines.append("")
-
     return "\n".join(lines)
 
 
-def _parse_and_create_chain_pivots(response: str) -> tuple[list[AIInsight], int]:
-    """Parse chain response and create PIVOT_TO for discovered paths."""
+def _parse_attack_insights(response: str) -> list[AIInsight]:
+    """Parse AI attack chain response into insights (no graph mutations)."""
     data = _parse_json_response(response)
     if not isinstance(data, list):
-        return [], 0
+        return []
 
     insights = []
-    pivots_created = 0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title", "")
+        hosts = item.get("hosts", item.get("path", []))
+        priority_raw = item.get("priority")
+        priority = int(priority_raw) if priority_raw is not None else 3
+        confidence_raw = item.get("confidence")
+        confidence = float(confidence_raw) if confidence_raw is not None else 0.5
 
-    with get_session() as session:
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            path = item.get("path", [])
-            title = item.get("title", "")
-            priority_raw = item.get("priority")
-            priority = int(priority_raw) if priority_raw is not None else 3
-            confidence_raw = item.get("confidence")
-            confidence = float(confidence_raw) if confidence_raw is not None else 0.5
+        if not title or confidence <= 0.5:
+            continue
 
-            if not title or confidence <= 0.5 or len(path) < 2:
-                continue
-
-            insight = AIInsight(
-                insight_type=item.get("type", "attack_chain"),
-                confidence=confidence,
-                title=title,
-                details=item.get("details", ""),
-                hosts=path,
-                priority=priority,
-            )
-            insights.append(insight)
-
-            # Create PIVOT_TO for each consecutive pair in the chain
-            for i in range(len(path) - 1):
-                result = session.run(
-                    """
-                    MATCH (h1:Host {ip: $ip1}), (h2:Host {ip: $ip2})
-                    MERGE (h1)-[p:PIVOT_TO]->(h2)
-                    ON CREATE SET p.method = 'ai_chain', p.difficulty = $diff,
-                                  p.ai_title = $title
-                    RETURN h1.ip AS ip
-                    """,
-                    ip1=path[i], ip2=path[i + 1],
-                    diff="easy" if priority <= 2 else "medium" if priority <= 3 else "hard",
-                    title=title,
-                )
-                if result.single():
-                    pivots_created += 1
+        insight = AIInsight(
+            insight_type=item.get("type", "attack_chain"),
+            confidence=confidence,
+            title=title,
+            details=item.get("details", ""),
+            hosts=hosts,
+            priority=priority,
+        )
+        insights.append(insight)
 
     insights.sort(key=lambda i: (i.priority, -i.confidence))
-    return insights, pivots_created
+    return insights
 
 
 # ---------------------------------------------------------------------------
