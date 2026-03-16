@@ -554,14 +554,19 @@ def build_pivot_relationships() -> dict:
 
     with get_session() as session:
         # Create PIVOT_TO between hosts in the same segment
-        # where at least one has an exploitable vulnerability
+        # where at least one has a PIVOT-CAPABLE vulnerability (RCE/shell).
+        # Relay targets, misconfigs, info disclosure do NOT enable pivoting.
+        # NVD CVEs (enables_pivot IS NULL) are treated as pivot-capable
+        # since we can't determine this from NVD data alone.
         result = session.run(
             """
             MATCH (h1:Host)-[:IN_SEGMENT]->(seg:NetworkSegment)<-[:IN_SEGMENT]-(h2:Host)
             WHERE h1.ip < h2.ip
             AND h1.role <> 'unknown' AND h2.role <> 'unknown'
             OPTIONAL MATCH (h1)-[:HAS_SERVICE]->(s1:Service)-[:HAS_VULN]->(v1:Vulnerability)
+                WHERE v1.enables_pivot = true OR v1.enables_pivot IS NULL
             OPTIONAL MATCH (h2)-[:HAS_SERVICE]->(s2:Service)-[:HAS_VULN]->(v2:Vulnerability)
+                WHERE v2.enables_pivot = true OR v2.enables_pivot IS NULL
             WITH h1, h2,
                  max(v1.cvss) AS h1_cvss, max(v2.cvss) AS h2_cvss,
                  max(CASE WHEN v1.has_exploit = true THEN 1 ELSE 0 END) AS h1_exploit,
@@ -634,6 +639,7 @@ def build_pivot_relationships() -> dict:
 
         # Cross-segment pivots: hosts scanned by the same source are reachable
         # even if they're in different /24 subnets (the scan proves TCP/IP connectivity)
+        # Only pivot-capable vulns (RCE/shell) count for creating pivots.
         cross_result = session.run(
             """
             MATCH (src:ScanSource)-[:SCANNED_FROM]->(h1:Host),
@@ -642,7 +648,9 @@ def build_pivot_relationships() -> dict:
             AND h1.role <> 'unknown' AND h2.role <> 'unknown'
             AND NOT (h1)-[:IN_SEGMENT]->(:NetworkSegment)<-[:IN_SEGMENT]-(h2)
             OPTIONAL MATCH (h1)-[:HAS_SERVICE]->(s1:Service)-[:HAS_VULN]->(v1:Vulnerability)
+                WHERE v1.enables_pivot = true OR v1.enables_pivot IS NULL
             OPTIONAL MATCH (h2)-[:HAS_SERVICE]->(s2:Service)-[:HAS_VULN]->(v2:Vulnerability)
+                WHERE v2.enables_pivot = true OR v2.enables_pivot IS NULL
             WITH h1, h2,
                  max(v1.cvss) AS h1_cvss, max(v2.cvss) AS h2_cvss,
                  max(CASE WHEN v1.has_exploit = true THEN 1 ELSE 0 END) AS h1_exploit,
