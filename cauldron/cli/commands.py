@@ -2,9 +2,10 @@
 
 Themed after brewing potions:
   brew       — import scan files (throw ingredients in)
-  boil       — run analysis (classify, exploit DB, CVE, topology, pivots)
+  boil       — run analysis (classify, exploit DB, CVE, topology, paths)
   taste      — view graph statistics
   paths      — show attack paths with exploit details
+  collect    — extract target lists for pentesting tools
   condiments — quick reference: guaranteed exploits per host
   pour       — export report
   reset      — clear the cauldron
@@ -568,6 +569,98 @@ def condiments():
 
     console.print(f"[dim]Database: {exploit_db.size} rules loaded[/dim]")
     console.print()
+
+
+@cli.command()
+@click.option("--filter", "-f", "filter_name", default=None, help="Built-in filter (smb, rdp, ssh, vuln, etc.)")
+@click.option("--port", "-p", default=None, type=int, help="Custom port filter")
+@click.option("--role", "-r", default=None, help="Filter by host role (e.g. domain_controller, database)")
+@click.option("--source", "-s", default=None, help="Only hosts visible from this scan source")
+@click.option("--format", "fmt", type=click.Choice(["ip", "ip:port", "csv"]), default="ip", help="Output format")
+@click.option("--output", "-o", default=None, type=click.Path(), help="Write to file instead of stdout")
+@click.option("--list", "list_filters", is_flag=True, default=False, help="List available built-in filters")
+def collect(filter_name: str | None, port: int | None, role: str | None,
+            source: str | None, fmt: str, output: str | None, list_filters: bool):
+    """Collect target lists — pipe to netexec, nuclei, nmap.
+
+    \b
+    Examples:
+      cauldron collect --filter smb                    # All SMB hosts
+      cauldron collect --filter smb --format ip:port   # IP:445 format
+      cauldron collect --filter vuln                   # All vulnerable hosts
+      cauldron collect --filter exploitable            # Confirmed/likely only
+      cauldron collect --port 8080                     # Custom port
+      cauldron collect --role database                 # By role
+      cauldron collect --filter smb -o targets.txt     # Save to file
+      cauldron collect --filter smb -s scanner1        # From specific scan source
+      cauldron collect --list                          # Show available filters
+    """
+    from cauldron.collect import collect_targets, list_filters as get_filters
+
+    if list_filters:
+        console.print()
+        console.print("[bold magenta]Available Collect Filters[/bold magenta]")
+        console.print()
+        table = Table(show_header=True, box=None, padding=(0, 2))
+        table.add_column("Filter", style="cyan")
+        table.add_column("Description", style="white")
+        for f in get_filters():
+            table.add_row(f["name"], f["description"])
+        console.print(table)
+        console.print()
+        return
+
+    if not filter_name and not port and not role:
+        console.print("[yellow]Specify --filter, --port, or --role. Use --list to see available filters.[/yellow]")
+        return
+
+    from cauldron.graph.connection import verify_connection
+
+    if not verify_connection():
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
+        raise SystemExit(1)
+
+    try:
+        result = collect_targets(
+            filter_name=filter_name,
+            port=port,
+            role=role,
+            source=source,
+        )
+    except ValueError as e:
+        console.print(f"[bold red]x {e}[/bold red]")
+        raise SystemExit(1)
+
+    if not result.hosts:
+        console.print(f"[yellow]No hosts found for filter '{result.filter_used}'.[/yellow]")
+        return
+
+    # Format output lines
+    lines = []
+    for host in result.hosts:
+        if fmt == "ip:port" and host.port:
+            lines.append(f"{host.ip}:{host.port}")
+        elif fmt == "csv":
+            hostname = host.hostname or ""
+            role_str = host.role or ""
+            lines.append(f"{host.ip},{hostname},{role_str}")
+        else:
+            lines.append(host.ip)
+
+    # Output
+    if output:
+        with open(output, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        console.print(f"[green]+[/green] {result.total} hosts written to {output}")
+    else:
+        # Print to stdout (raw, no Rich formatting — pipeable)
+        for line in lines:
+            click.echo(line)
+
+    # Summary to stderr (so pipe still works)
+    if not output:
+        import sys
+        print(f"# {result.total} hosts ({result.filter_used})", file=sys.stderr)
 
 
 @cli.command()
