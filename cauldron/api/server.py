@@ -186,9 +186,43 @@ def _check_neo4j():
         raise HTTPException(status_code=503, detail="Neo4j is not available")
 
 
+def _parse_vuln_record(v: dict) -> VulnOut:
+    """Safely convert a Neo4j vuln dict to VulnOut, handling None values."""
+    return VulnOut(
+        cve_id=v["cve_id"],
+        cvss=v.get("cvss") or 0.0,
+        has_exploit=bool(v.get("has_exploit")),
+        confidence=v.get("confidence") or "check",
+        description=v.get("description"),
+        enables_pivot=v.get("enables_pivot"),
+    )
+
+
+def _parse_service_record(s: dict) -> ServiceOut:
+    """Safely convert a Neo4j service dict to ServiceOut, handling None values."""
+    return ServiceOut(
+        port=s["port"],
+        protocol=s.get("protocol") or "tcp",
+        state=s.get("state"),
+        name=s.get("name"),
+        product=s.get("product"),
+        version=s.get("version"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    """API root — health check and links."""
+    return {
+        "name": "Cauldron API",
+        "version": "0.1.0",
+        "docs": "/docs",
+        "api": "/api/v1/stats",
+    }
 
 @app.get("/api/v1/stats", response_model=StatsResponse)
 def get_stats():
@@ -280,11 +314,11 @@ def list_hosts(
         hosts = []
         for record in result:
             services = [
-                ServiceOut(**s) for s in record["services"]
+                _parse_service_record(s) for s in record["services"]
                 if s.get("port") is not None
             ]
             vulns = [
-                VulnOut(**v) for v in record["vulns"]
+                _parse_vuln_record(v) for v in record["vulns"]
                 if v.get("cve_id") is not None
             ]
             hosts.append(HostOut(
