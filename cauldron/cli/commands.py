@@ -7,6 +7,7 @@ Themed after brewing potions:
   paths      — show attack paths with exploit details
   collect    — extract target lists for pentesting tools
   condiments — quick reference: guaranteed exploits per host
+  serve      — start REST API server
   pour       — export report
   reset      — clear the cauldron
 """
@@ -661,6 +662,27 @@ def collect(filter_name: str | None, port: int | None, role: str | None,
     if not output:
         import sys
         print(f"# {result.total} hosts ({result.filter_used})", file=sys.stderr)
+
+
+@cli.command()
+@click.option("--host", "-h", default="0.0.0.0", help="Bind address")
+@click.option("--port", "-p", default=8000, type=int, help="Port number")
+@click.option("--reload", is_flag=True, default=False, help="Auto-reload on code changes")
+def serve(host: str, port: int, reload: bool):
+    """Start the REST API server."""
+    console.print(BANNER)
+    console.print(f"[bold cyan]Starting API server on {host}:{port}[/bold cyan]")
+    console.print(f"[dim]  Docs: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs[/dim]")
+    console.print()
+
+    import uvicorn
+
+    uvicorn.run(
+        "cauldron.api.server:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 @cli.command()
