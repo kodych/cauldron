@@ -25,6 +25,8 @@ export interface VulnOut {
   confidence: string;
   description: string | null;
   enables_pivot: boolean | null;
+  checked_status: string | null;
+  port: number | null;
 }
 
 export interface HostOut {
@@ -107,3 +109,35 @@ export interface TopologyResponse {
   gateways: number;
   total_reach_edges: number;
 }
+
+export interface CollectHostOut {
+  ip: string;
+  hostname: string | null;
+  port: number | null;
+  role: string | null;
+}
+
+export interface CollectResponse {
+  hosts: CollectHostOut[];
+  filter_used: string;
+  total: number;
+}
+
+export interface ImportResponse {
+  hosts_imported: number;
+  hosts_skipped: number;
+  services_imported: number;
+  segments_created: number;
+  relationships_created: number;
+}
+
+export interface AnalyzeResponse {
+  classification: Record<string, unknown>;
+  exploits: Record<string, unknown>;
+  scripts: Record<string, unknown>;
+  cve_enrichment: Record<string, unknown>;
+  topology: Record<string, unknown>;
+  path_summary: Record<string, unknown>;
+}
+
+export type VulnStatus = 'exploited' | 'false_positive' | 'mitigated' | null;

@@ -62,6 +62,8 @@ class VulnOut(BaseModel):
     confidence: str = "check"
     description: str | None = None
     enables_pivot: bool | None = None
+    checked_status: str | None = None
+    port: int | None = None
 
 
 class HostOut(BaseModel):
@@ -144,6 +146,10 @@ class AnalyzeResponse(BaseModel):
     path_summary: dict[str, Any]
 
 
+class VulnStatusUpdate(BaseModel):
+    status: str | None = None  # exploited, false_positive, mitigated, or null to clear
+
+
 class GraphNode(BaseModel):
     id: str
     label: str
@@ -195,6 +201,8 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         confidence=v.get("confidence") or "check",
         description=v.get("description"),
         enables_pivot=v.get("enables_pivot"),
+        checked_status=v.get("checked_status"),
+        port=v.get("port"),
     )
 
 
@@ -303,7 +311,8 @@ def list_hosts(
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot
+                       enables_pivot: v.enables_pivot, checked_status: v.checked_status,
+                       port: s.port
                    }}) AS vulns
             """,
             **params,
@@ -358,7 +367,8 @@ def get_host(ip: str):
                    collect(DISTINCT {
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot
+                       enables_pivot: v.enables_pivot, checked_status: v.checked_status,
+                       port: s.port
                    }) AS vulns
             """,
             ip=ip,
@@ -368,11 +378,11 @@ def get_host(ip: str):
             raise HTTPException(status_code=404, detail=f"Host {ip} not found")
 
         services = [
-            ServiceOut(**s) for s in record["services"]
+            _parse_service_record(s) for s in record["services"]
             if s.get("port") is not None
         ]
         vulns = [
-            VulnOut(**v) for v in record["vulns"]
+            _parse_vuln_record(v) for v in record["vulns"]
             if v.get("cve_id") is not None
         ]
 
@@ -673,3 +683,31 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
         topology=topo_stats,
         path_summary=summary,
     )
+
+
+@app.patch("/api/v1/hosts/{ip}/vulns/{vuln_id}/status")
+def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
+    """Update checked status for a vulnerability on a specific host."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    valid_statuses = {"exploited", "false_positive", "mitigated", None}
+    if body.status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {body.status}")
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
+            SET v.checked_status = $status
+            RETURN v.cve_id AS cve_id
+            """,
+            ip=ip,
+            vuln_id=vuln_id,
+            status=body.status,
+        )
+        record = result.single()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Vulnerability {vuln_id} not found on host {ip}")
+
+    return {"ok": True}

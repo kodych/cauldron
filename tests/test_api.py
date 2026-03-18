@@ -406,3 +406,59 @@ class TestDocs:
     def test_docs_page(self, client):
         resp = client.get("/docs")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Vulnerability checked status
+# ---------------------------------------------------------------------------
+
+class TestVulnStatus:
+    def test_update_vuln_status(self, client):
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "exploited"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify status persisted
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        assert resp.status_code == 200
+        vulns = resp.json()["vulnerabilities"]
+        assert any(v["checked_status"] == "exploited" for v in vulns)
+
+    def test_clear_vuln_status(self, client):
+        _setup_test_network()
+        # Set then clear
+        client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "exploited"},
+        )
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": None},
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["checked_status"] is None
+
+    def test_update_nonexistent_vuln(self, client):
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-9999-9999/status",
+            json={"status": "exploited"},
+        )
+        assert resp.status_code == 404
+
+    def test_invalid_status_value(self, client):
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "invalid_status"},
+        )
+        assert resp.status_code == 400

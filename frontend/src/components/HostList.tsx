@@ -1,9 +1,8 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Search, ChevronDown, ChevronUp } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor } from '../utils/colors';
-import { formatCvss } from '../utils/format';
 import type { HostListResponse, HostOut } from '../types';
 
 interface Props {
@@ -145,19 +144,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
 
           {/* Services */}
           {host.services.length > 0 && (
-            <div>
-              <p className="text-xs font-medium text-gray-500 mb-1">Services</p>
-              <div className="space-y-0.5">
-                {host.services.map((s) => (
-                  <div key={`${s.port}/${s.protocol}`} className="flex items-center gap-2 text-xs">
-                    <span className="font-mono text-blue-400 w-14 text-right">{s.port}/{s.protocol}</span>
-                    <span className="text-gray-400 truncate">
-                      {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <HostServices services={host.services} vulns={host.vulnerabilities} />
           )}
 
           {/* Vulnerabilities */}
@@ -167,12 +154,14 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               <div className="space-y-0.5">
                 {host.vulnerabilities.map((v) => (
                   <div key={v.cve_id} className="flex items-center gap-2 text-xs">
-                    <span
-                      className="font-mono shrink-0"
-                      style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}
-                    >
-                      {formatCvss(v.cvss)}
-                    </span>
+                    {v.cvss > 0 && (
+                      <span
+                        className="font-mono shrink-0"
+                        style={{ color: getCvssColor(v.cvss) }}
+                      >
+                        {v.cvss.toFixed(1)}
+                      </span>
+                    )}
                     <span className="text-gray-400 truncate">{v.cve_id}</span>
                     <span
                       className="shrink-0"
@@ -190,6 +179,38 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function HostServices({ services, vulns }: { services: HostOut['services']; vulns: HostOut['vulnerabilities'] }) {
+  const portCvssMap = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const v of vulns) {
+      if (v.port != null) {
+        map.set(v.port, Math.max(map.get(v.port) || 0, v.cvss || 0));
+      }
+    }
+    return map;
+  }, [vulns]);
+
+  return (
+    <div>
+      <p className="text-xs font-medium text-gray-500 mb-1">Services</p>
+      <div className="space-y-0.5">
+        {services.map((s) => {
+          const cvss = portCvssMap.get(s.port) || 0;
+          const color = cvss > 0 ? getCvssColor(cvss) : '#60a5fa';
+          return (
+            <div key={`${s.port}/${s.protocol}`} className="flex items-center gap-2 text-xs">
+              <span className="font-mono w-14 text-right" style={{ color }}>{s.port}/{s.protocol}</span>
+              <span className="text-gray-400 truncate">
+                {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

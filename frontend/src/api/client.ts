@@ -7,6 +7,10 @@ import type {
   PathsResponse,
   GraphResponse,
   TopologyResponse,
+  CollectResponse,
+  ImportResponse,
+  AnalyzeResponse,
+  VulnStatus,
 } from '../types';
 
 const BASE = '/api/v1';
@@ -28,6 +32,37 @@ async function get<T>(path: string, params?: Record<string, string | number | bo
   return res.json();
 }
 
+async function post<T>(path: string, params?: Record<string, string | number | boolean>): Promise<T> {
+  const url = new URL(`${BASE}${path}`, window.location.origin);
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') {
+        url.searchParams.set(k, String(v));
+      }
+    }
+  }
+  const res = await fetch(url.toString(), { method: 'POST' });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`API ${res.status}: ${detail}`);
+  }
+  return res.json();
+}
+
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const url = new URL(`${BASE}${path}`, window.location.origin);
+  const res = await fetch(url.toString(), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`API ${res.status}: ${detail}`);
+  }
+  return res.json();
+}
+
 export const api = {
   getStats: () => get<StatsResponse>('/stats'),
 
@@ -42,4 +77,28 @@ export const api = {
   getGraph: (limit?: number) => get<GraphResponse>('/graph', limit ? { limit } : undefined),
 
   getTopology: () => get<TopologyResponse>('/topology'),
+
+  getCollect: (params: { filter?: string; port?: number; role?: string; source?: string }) =>
+    get<CollectResponse>('/collect', params as Record<string, string | number>),
+
+  getCollectFilters: () => get<Record<string, string>>('/collect/filters'),
+
+  importScan: async (file: File, source?: string): Promise<ImportResponse> => {
+    const url = new URL(`${BASE}/import`, window.location.origin);
+    if (source) url.searchParams.set('source', source);
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(url.toString(), { method: 'POST', body: form });
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`API ${res.status}: ${detail}`);
+    }
+    return res.json();
+  },
+
+  runAnalysis: (ai?: boolean) =>
+    post<AnalyzeResponse>('/analyze', ai ? { ai } : undefined),
+
+  updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status }),
 };

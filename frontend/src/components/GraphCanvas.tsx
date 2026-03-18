@@ -1,12 +1,12 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MultiGraph } from 'graphology';
 import Sigma from 'sigma';
-import { Crosshair, Network } from 'lucide-react';
+import { Crosshair, Network, SlidersHorizontal } from 'lucide-react';
 import { circular } from 'graphology-layout';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getNodeColor, getCvssColor } from '../utils/colors';
+import { getNodeColor, getCvssColor, ROLE_COLORS } from '../utils/colors';
 import { HIGH_VALUE_ROLES, formatCvss } from '../utils/format';
 import type { GraphResponse, PathsResponse, HostListResponse } from '../types';
 
@@ -29,6 +29,9 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
   const [attackOnly, setAttackOnly] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  const [filterVulnOnly, setFilterVulnOnly] = useState(false);
+  const [filterRoles, setFilterRoles] = useState<Set<string>>(new Set());
 
   const { data, loading, error, refetch } = useApi<GraphResponse>(() => api.getGraph(1000), []);
   const { data: pathsData } = useApi<PathsResponse>(
@@ -160,14 +163,17 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     }
 
     // Layout
+    const nodeCount = g.order;
     circular.assign(g);
     forceAtlas2.assign(g, {
-      iterations: 100,
+      iterations: Math.min(300, 80 + nodeCount * 2),
       settings: {
-        gravity: 1,
-        scalingRatio: 10,
-        barnesHutOptimize: true,
+        gravity: 3,
+        scalingRatio: 8,
+        barnesHutOptimize: nodeCount > 50,
+        strongGravityMode: false,
         slowDown: 5,
+        outboundAttractionDistribution: true,
       },
     });
 
@@ -234,7 +240,27 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     return ids;
   }, [pathsData]);
 
-  // Highlight selected host + attack-only filter
+  // Set of hidden node IDs based on filters
+  const hiddenNodes = useMemo(() => {
+    if (!graph) return new Set<string>();
+    const hidden = new Set<string>();
+    const hasRoleFilter = filterRoles.size > 0;
+
+    graph.forEachNode((node, attrs) => {
+      if (attrs.nodeType !== 'host') return;
+      const role = (attrs.role as string || '').toUpperCase();
+
+      if (filterVulnOnly && (attrs.vulnCount as number) === 0) {
+        hidden.add(node);
+      }
+      if (hasRoleFilter && !filterRoles.has(role)) {
+        hidden.add(node);
+      }
+    });
+    return hidden;
+  }, [graph, filterVulnOnly, filterRoles]);
+
+  // Highlight selected host + attack-only filter + graph filters
   useEffect(() => {
     if (!sigmaRef.current || !graph) return;
 
@@ -242,6 +268,11 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     const selectedNodeId = selectedHost ? `host:${selectedHost}` : null;
 
     sigma.setSetting('nodeReducer', (node, attrs) => {
+      // Graph filters: dim hidden nodes
+      if (hiddenNodes.has(node)) {
+        return { ...attrs, color: attrs.color + '08', label: '', size: 1.5, zIndex: -1 };
+      }
+
       // Attack-only mode: dim nodes not in any attack path
       if (attackOnly && !attackNodeIds.has(node)) {
         if (selectedNodeId && node === selectedNodeId) {
@@ -261,6 +292,13 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
     sigma.setSetting('edgeReducer', (edge, attrs) => {
       const edgeType = graph.getEdgeAttribute(edge, 'edgeType');
+      const src = graph.source(edge);
+      const tgt = graph.target(edge);
+
+      // Hide edges connected to filtered-out nodes
+      if (hiddenNodes.has(src) || hiddenNodes.has(tgt)) {
+        return { ...attrs, hidden: true };
+      }
 
       // Attack-only mode: hide topology edges
       if (attackOnly && edgeType === 'topology') {
@@ -268,8 +306,6 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       }
 
       if (selectedNodeId) {
-        const src = graph.source(edge);
-        const tgt = graph.target(edge);
         if (src === selectedNodeId || tgt === selectedNodeId) {
           return { ...attrs, size: (attrs.size as number) * 1.5 };
         }
@@ -279,7 +315,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     });
 
     sigma.refresh();
-  }, [selectedHost, graph, attackOnly, attackNodeIds]);
+  }, [selectedHost, graph, attackOnly, attackNodeIds, hiddenNodes]);
 
   // Tooltip data
   const tooltipData = useMemo(() => {
@@ -370,8 +406,83 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
   return (
     <div className="relative w-full h-full">
       <div ref={containerRef} className="sigma-container" />
+      {/* Controls bar */}
+      <div className="absolute top-3 right-3 flex items-center gap-2">
+
+      {/* Filter button */}
+      <div className="relative">
+        <button
+          onClick={() => setShowFilters(!showFilters)}
+          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs border transition-colors ${
+            (filterVulnOnly || filterRoles.size > 0)
+              ? 'bg-indigo-900/90 border-indigo-600 text-indigo-300'
+              : 'bg-gray-900/90 border-gray-700 text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <SlidersHorizontal size={13} />
+          Filters
+          {(filterVulnOnly || filterRoles.size > 0) && (
+            <span className="rounded-full bg-indigo-500 text-white px-1.5 py-0 text-xs leading-4">
+              {(filterVulnOnly ? 1 : 0) + filterRoles.size}
+            </span>
+          )}
+        </button>
+
+        {showFilters && (
+          <div className="absolute right-0 top-full mt-1 w-56 rounded-lg bg-gray-900 border border-gray-700 p-2 shadow-xl z-50">
+            {/* Vuln-only toggle */}
+            <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={filterVulnOnly}
+                onChange={(e) => setFilterVulnOnly(e.target.checked)}
+                className="rounded border-gray-600 bg-gray-800 text-indigo-500"
+              />
+              <span className="text-xs text-gray-300">Vulnerable hosts only</span>
+            </label>
+
+            <div className="border-t border-gray-700 my-1" />
+            <p className="px-2 py-1 text-xs text-gray-500 font-medium">Filter by role</p>
+
+            {/* Role checkboxes */}
+            <div className="max-h-48 overflow-y-auto space-y-0.5">
+              {Object.entries(ROLE_COLORS).filter(([k]) => k !== 'unknown').map(([role, color]) => (
+                <label key={role} className="flex items-center gap-2 px-2 py-0.5 rounded hover:bg-gray-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={filterRoles.has(role)}
+                    onChange={(e) => {
+                      const next = new Set(filterRoles);
+                      if (e.target.checked) next.add(role);
+                      else next.delete(role);
+                      setFilterRoles(next);
+                    }}
+                    className="rounded border-gray-600 bg-gray-800 text-indigo-500"
+                  />
+                  <div className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                  <span className="text-xs text-gray-400">{role.toLowerCase().replace(/_/g, ' ')}</span>
+                </label>
+              ))}
+            </div>
+
+            {/* Clear filters */}
+            {(filterVulnOnly || filterRoles.size > 0) && (
+              <>
+                <div className="border-t border-gray-700 my-1" />
+                <button
+                  onClick={() => { setFilterVulnOnly(false); setFilterRoles(new Set()); }}
+                  className="w-full rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+                >
+                  Clear all filters
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* View toggle */}
-      <div className="absolute top-3 right-3 flex rounded-lg bg-gray-900/90 border border-gray-700 overflow-hidden">
+      <div className="flex rounded-lg bg-gray-900/90 border border-gray-700 overflow-hidden">
         <button
           onClick={() => setAttackOnly(false)}
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs transition-colors ${
@@ -390,6 +501,8 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
           <Crosshair size={13} />
           Attack Paths
         </button>
+      </div>
+
       </div>
       {renderTooltip()}
     </div>
