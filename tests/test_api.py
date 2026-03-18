@@ -303,6 +303,42 @@ class TestGraph:
         host_nodes = [n for n in resp.json()["nodes"] if n["type"] == "host"]
         assert len(host_nodes) == 1
 
+    def test_graph_merges_pivot_host_with_scan_source(self, client):
+        """When ScanSource.name matches Host.ip, they merge into one node."""
+        with get_session() as session:
+            # External scan finds host 10.0.1.10
+            session.run("""
+                CREATE (src:ScanSource {name: 'external'})
+                CREATE (h:Host {ip: '10.0.1.10', role: 'web_server', state: 'up'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # Internal scan FROM 10.0.1.10 finds host 10.0.2.20
+            session.run("""
+                CREATE (src:ScanSource {name: '10.0.1.10'})
+                CREATE (h:Host {ip: '10.0.2.20', role: 'database', state: 'up'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # External scan also scanned 10.0.2.20 (edge case)
+            session.run("""
+                MATCH (src:ScanSource {name: 'external'}), (h:Host {ip: '10.0.2.20'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+
+        resp = client.get("/api/v1/graph")
+        data = resp.json()
+
+        # Should NOT have a separate scan_source node for "10.0.1.10"
+        node_ids = [n["id"] for n in data["nodes"]]
+        assert "source:10.0.1.10" not in node_ids
+        # Host node should exist and be marked as scan source
+        host_node = next(n for n in data["nodes"] if n["id"] == "host:10.0.1.10")
+        assert host_node["properties"]["is_scan_source"] is True
+        # External scanner should still be a separate scan_source
+        assert "source:external" in node_ids
+        # No self-edge from host:10.0.1.10 to host:10.0.1.10
+        for edge in data["edges"]:
+            assert not (edge["source"] == "host:10.0.1.10" and edge["target"] == "host:10.0.1.10")
+
 
 # ---------------------------------------------------------------------------
 # Topology
@@ -462,3 +498,20 @@ class TestVulnStatus:
             json={"status": "invalid_status"},
         )
         assert resp.status_code == 400
+
+
+class TestReset:
+    def test_reset_clears_database(self, client):
+        _setup_test_network()
+        # Verify data exists
+        resp = client.get("/api/v1/stats")
+        assert resp.json()["hosts"] > 0
+
+        # Reset
+        resp = client.delete("/api/v1/reset")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify empty
+        resp = client.get("/api/v1/stats")
+        assert resp.json()["hosts"] == 0

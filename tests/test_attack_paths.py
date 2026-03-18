@@ -560,6 +560,60 @@ class TestTruePivotPaths:
         assert pivot_path.nodes[2].ip == "192.168.1.10"  # target
         assert "pivot" in pivot_path.attack_methods
 
+    def test_pivot_path_without_vulns_on_pivot_host(self):
+        """Pivot works even if pivot host has no vulns — scan FROM it = compromised."""
+        with get_session() as session:
+            # External scan finds web01 (no vulns on it)
+            session.run("CREATE (:ScanSource {name: 'attacker'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.1.5', hostname: 'web01', state: 'up',
+                               role: 'web_server', role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: 'attacker'}), (h:Host {ip: '10.0.1.5'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # web01 has a service but NO vulnerabilities
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.5'})
+                CREATE (h)-[:HAS_SERVICE]->(:Service {host_ip: '10.0.1.5',
+                       port: 80, protocol: 'tcp', state: 'open'})
+            """)
+
+            # Internal scan FROM web01
+            session.run("CREATE (:ScanSource {name: '10.0.1.5'})")
+            session.run("""
+                CREATE (h:Host {ip: '192.168.1.10', hostname: 'db-internal',
+                               state: 'up', role: 'database', role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: '10.0.1.5'}), (h:Host {ip: '192.168.1.10'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            # Target has a vuln
+            session.run("""
+                MATCH (h:Host {ip: '192.168.1.10'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '192.168.1.10',
+                       port: 3306, protocol: 'tcp', state: 'open',
+                       product: 'MySQL', version: '5.7.38'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CVE-2022-21417', cvss: 6.5, has_exploit: false,
+                    description: 'MySQL vuln', confidence: 'likely'
+                })
+            """)
+
+        paths = discover_attack_paths(target_ip="192.168.1.10")
+
+        assert len(paths) >= 1
+        # Find the pivot path (2-hop through 10.0.1.5)
+        pivot_paths = [p for p in paths if p.hop_count == 2]
+        assert len(pivot_paths) >= 1, f"No pivot paths found, got: {paths}"
+        pivot_path = pivot_paths[0]
+        assert pivot_path.nodes[0].ip == "attacker"  # source
+        assert pivot_path.nodes[1].ip == "10.0.1.5"  # pivot, no vulns
+        assert pivot_path.nodes[2].ip == "192.168.1.10"  # target
+        assert "pivot" in pivot_path.attack_methods
+
     def test_no_pivot_without_matching_scan_source(self):
         """No pivot path if no internal scan exists."""
         with get_session() as session:

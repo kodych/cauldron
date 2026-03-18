@@ -226,8 +226,10 @@ def _upsert_script_result(
         return
 
     # Store script output as property: script_<id> = output
-    # Sanitize script_id for use as property name
-    prop_name = f"script_{script.script_id.replace('-', '_')}"
+    # Sanitize script_id: only allow alphanumeric and underscores
+    import re
+    safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", script.script_id)[:100]
+    prop_name = f"script_{safe_id}"
     session.run(
         f"""
         MATCH (svc:Service {{host_ip: $ip, port: $port, protocol: $protocol}})
@@ -251,7 +253,9 @@ def _upsert_host_script(session: Session, host_ip: str, script) -> None:
     if not isinstance(script, ScriptResult):
         return
 
-    prop_name = f"script_{script.script_id.replace('-', '_')}"
+    import re
+    safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", script.script_id)[:100]
+    prop_name = f"script_{safe_id}"
     session.run(
         f"""
         MATCH (h:Host {{ip: $ip}})
@@ -264,6 +268,13 @@ def _upsert_host_script(session: Session, host_ip: str, script) -> None:
 
 def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: int) -> None:
     """Create ROUTE_THROUGH relationship from traceroute data."""
+    # Validate hop IP before creating Host node
+    import ipaddress
+    try:
+        ipaddress.ip_address(hop_ip)
+    except (ValueError, TypeError):
+        return  # Skip invalid IPs from traceroute
+
     # First ensure the hop host exists
     session.run(
         """

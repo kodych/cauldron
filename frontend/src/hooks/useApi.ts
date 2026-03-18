@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 interface UseApiState<T> {
   data: T | null;
@@ -11,13 +11,15 @@ export function useApi<T>(fetcher: () => Promise<T>, deps: unknown[] = []): UseA
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const fetcherRef = useRef(fetcher);
+  fetcherRef.current = fetcher;
 
   const refetch = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetcher()
+    fetcherRef.current()
       .then(setData)
-      .catch((e) => setError(e.message))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);

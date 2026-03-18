@@ -230,19 +230,21 @@ def _find_pivot_paths(
     A true pivot exists when:
     - Host X was scanned by ScanSource A (external scan)
     - Host X.ip matches ScanSource B.name (internal scan from compromised X)
-    - Host X has RCE vulnerability (enables_pivot = true)
     - ScanSource B discovered additional hosts not in ScanSource A
+
+    The mere fact that a scan was run FROM host X proves it was compromised.
+    Vulnerabilities on the pivot are informational, not required.
 
     Path: ScanSource A -> Host X (pivot) -> Target (discovered by ScanSource B)
     """
     # Find pivot hosts: Host.ip == ScanSource.name for a different scan
+    # No vulnerability requirement — running a scan FROM the host = compromised
     pivot_result = session.run(
         """
         MATCH (src_ext:ScanSource)-[:SCANNED_FROM]->(pivot:Host)
         MATCH (src_int:ScanSource)
         WHERE pivot.ip = src_int.name AND src_ext.name <> src_int.name
-        MATCH (pivot)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
-        WHERE v.enables_pivot = true OR v.enables_pivot IS NULL
+        OPTIONAL MATCH (pivot)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
         RETURN DISTINCT src_ext.name AS external_source,
                pivot.ip AS pivot_ip,
                src_int.name AS internal_source,

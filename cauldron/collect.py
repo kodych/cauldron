@@ -167,6 +167,9 @@ def collect_targets(
         available = ", ".join(sorted(BUILTIN_FILTERS.keys()))
         raise ValueError(f"Unknown filter '{filter_name}'. Available: {available}")
 
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(f"Invalid port: {port}. Must be 1-65535")
+
     # Build query from parts
     match_clauses = ["MATCH (h:Host)"]
     where_clauses: list[str] = []
@@ -222,6 +225,8 @@ def collect_targets(
             hosts.append(entry)
 
     label = filter_name or (f"port:{port}" if port else (f"role:{role}" if role else "all"))
+    if source:
+        label += f"@{source}"
     return CollectResult(hosts=hosts, filter_used=label, total=len(hosts))
 
 

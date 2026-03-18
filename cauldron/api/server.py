@@ -534,7 +534,12 @@ def get_graph(
                 edges.append(GraphEdge(source=node_id, target=seg_id, type="IN_SEGMENT"))
 
         # Scan sources — only those connected to hosts we included
+        # If a ScanSource.name matches a Host.ip, merge into the host node
+        # (this is a true pivot point — same machine is both host and scanner)
         host_ips = [n.properties["ip"] for n in nodes if n.type == "host"]
+        host_ip_set = set(host_ips)
+        source_to_node: dict[str, str] = {}  # source name -> graph node id
+
         result = session.run(
             """
             MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
@@ -544,13 +549,26 @@ def get_graph(
             ips=host_ips,
         )
         for r in result:
-            src_id = f"source:{r['name']}"
-            if src_id not in seen_nodes:
-                nodes.append(GraphNode(
-                    id=src_id, label=r["name"],
-                    type="scan_source", properties={"name": r["name"]},
-                ))
-                seen_nodes.add(src_id)
+            src_name = r["name"]
+            if src_name in host_ip_set:
+                # Merge: ScanSource maps to existing host node (pivot point)
+                host_node_id = f"host:{src_name}"
+                source_to_node[src_name] = host_node_id
+                # Mark host as also being a scan source
+                for n in nodes:
+                    if n.id == host_node_id:
+                        n.properties["is_scan_source"] = True
+                        break
+            else:
+                # Standalone scan source (external scanner, not in scan results)
+                src_id = f"source:{src_name}"
+                if src_id not in seen_nodes:
+                    nodes.append(GraphNode(
+                        id=src_id, label=src_name,
+                        type="scan_source", properties={"name": src_name},
+                    ))
+                    seen_nodes.add(src_id)
+                source_to_node[src_name] = src_id
 
         # SCANNED_FROM edges
         result = session.run(
@@ -560,10 +578,11 @@ def get_graph(
             """,
         )
         for r in result:
-            src_id = f"source:{r['source']}"
+            src_node_id = source_to_node.get(r["source"])
             host_id = f"host:{r['host_ip']}"
-            if src_id in seen_nodes and host_id in seen_nodes:
-                edges.append(GraphEdge(source=src_id, target=host_id, type="SCANNED_FROM"))
+            # Skip self-edges (pivot host pointing to itself)
+            if src_node_id and host_id in seen_nodes and src_node_id != host_id:
+                edges.append(GraphEdge(source=src_node_id, target=host_id, type="SCANNED_FROM"))
 
         # CAN_REACH edges between segments
         result = session.run(
@@ -711,3 +730,13 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
             raise HTTPException(status_code=404, detail=f"Vulnerability {vuln_id} not found on host {ip}")
 
     return {"ok": True}
+
+
+@app.delete("/api/v1/reset")
+def reset_database():
+    """Clear all nodes and relationships from the database."""
+    _check_neo4j()
+    from cauldron.graph.connection import clear_database
+
+    clear_database()
+    return {"ok": True, "message": "Database cleared"}

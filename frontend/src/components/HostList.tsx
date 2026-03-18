@@ -79,7 +79,7 @@ export function HostList({ onSelectHost, selectedHost }: Props) {
 function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean; onClick: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const vulnCount = host.vulnerabilities.length;
-  const maxCvss = vulnCount > 0 ? Math.max(...host.vulnerabilities.map((v) => v.cvss)) : 0;
+  const maxCvss = vulnCount > 0 ? Math.max(...host.vulnerabilities.map((v) => v.cvss || 0)) : 0;
 
 
   return (

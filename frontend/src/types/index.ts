@@ -74,9 +74,18 @@ export interface AttackPathOut {
   max_confidence: string;
 }
 
+export interface PathSummary {
+  vulnerable_hosts: number;
+  with_exploits: number;
+  confirmed: number;
+  likely: number;
+  high_value_targets: Record<string, number>;
+  pivot_hosts: number;
+}
+
 export interface PathsResponse {
   paths: AttackPathOut[];
-  summary: Record<string, unknown>;
+  summary: PathSummary;
 }
 
 export interface GraphNode {
@@ -132,12 +141,12 @@ export interface ImportResponse {
 }
 
 export interface AnalyzeResponse {
-  classification: Record<string, unknown>;
-  exploits: Record<string, unknown>;
-  scripts: Record<string, unknown>;
-  cve_enrichment: Record<string, unknown>;
-  topology: Record<string, unknown>;
-  path_summary: Record<string, unknown>;
+  classification: { classified?: number; skipped?: number } | null;
+  exploits: { matched?: number; hosts_matched?: number; exploits_found?: number } | null;
+  scripts: { upgraded?: number } | null;
+  cve_enrichment: { enriched?: number; cached?: number } | null;
+  topology: { segments?: number; reach_edges?: number } | null;
+  path_summary: PathSummary | null;
 }
 
 export type VulnStatus = 'exploited' | 'false_positive' | 'mitigated' | null;

@@ -90,7 +90,8 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
       const role = node.properties.role as string | undefined;
       const roleUpper = (role || '').toUpperCase();
-      const ip = node.properties.ip as string || '';
+      const ip = node.properties.ip as string || node.properties.name as string || '';
+      const isScanSource = node.type === 'scan_source' || node.properties.is_scan_source === true;
       const color = getNodeColor(node.type, role);
       const info = hostVulnMap.get(ip);
 
@@ -120,6 +121,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         vulnCount: info?.vulnCount || 0,
         maxCvss: info?.maxCvss ?? -1,
         hasExploit: info?.hasExploit || false,
+        isScanSource: isScanSource,
       });
     }
 
@@ -321,26 +323,32 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
   const tooltipData = useMemo(() => {
     if (!hoveredNode || !graph || !graph.hasNode(hoveredNode)) return null;
     const attrs = graph.getNodeAttributes(hoveredNode);
-    if (attrs.nodeType !== 'host') return null;
+    if (attrs.nodeType !== 'host' && attrs.nodeType !== 'scan_source') return null;
     return {
       ip: attrs.ip as string,
       role: attrs.role as string,
-      vulnCount: attrs.vulnCount as number,
-      maxCvss: attrs.maxCvss as number,
-      hasExploit: attrs.hasExploit as boolean,
+      vulnCount: (attrs.vulnCount as number) || 0,
+      maxCvss: (attrs.maxCvss as number) ?? -1,
+      hasExploit: (attrs.hasExploit as boolean) || false,
+      isScanSource: (attrs.isScanSource as boolean) || attrs.nodeType === 'scan_source',
     };
   }, [hoveredNode, graph]);
 
   const renderTooltip = useCallback(() => {
     if (!tooltipData) return null;
-    const { ip, role, vulnCount, maxCvss, hasExploit } = tooltipData;
+    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource } = tooltipData;
     return (
       <div
         ref={tooltipRef}
         className="absolute z-50 pointer-events-none rounded bg-gray-900 border border-gray-700 px-3 py-2 shadow-xl"
         style={{ left: tooltipPos.x + 12, top: tooltipPos.y - 10 }}
       >
-        <p className="text-xs font-mono text-gray-100 font-semibold">{ip}</p>
+        <div className="flex items-center gap-2">
+          <p className="text-xs font-mono text-gray-100 font-semibold">{ip}</p>
+          {isScanSource && (
+            <span className="text-xs text-green-400 font-semibold">PIVOT</span>
+          )}
+        </div>
         <p className="text-xs text-gray-400 mt-0.5">{role}</p>
         {vulnCount > 0 ? (
           <div className="mt-1 flex items-center gap-2">

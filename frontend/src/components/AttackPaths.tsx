@@ -46,26 +46,20 @@ export function AttackPaths() {
       </div>
 
       {/* Summary */}
-      {data.summary && typeof data.summary === 'object' && (
+      {data.summary && (
         <div className="grid grid-cols-3 gap-2 p-3 border-b border-gray-800">
-          {data.summary.total_paths != null && (
-            <div className="text-center">
-              <p className="text-lg font-semibold text-indigo-400">{String(data.summary.total_paths)}</p>
-              <p className="text-xs text-gray-600">Total</p>
-            </div>
-          )}
-          {data.summary.confirmed != null && (
-            <div className="text-center">
-              <p className="text-lg font-semibold text-red-400">{String(data.summary.confirmed)}</p>
-              <p className="text-xs text-gray-600">Confirmed</p>
-            </div>
-          )}
-          {data.summary.likely != null && (
-            <div className="text-center">
-              <p className="text-lg font-semibold text-orange-400">{String(data.summary.likely)}</p>
-              <p className="text-xs text-gray-600">Likely</p>
-            </div>
-          )}
+          <div className="text-center">
+            <p className="text-lg font-semibold text-indigo-400">{data.summary.vulnerable_hosts}</p>
+            <p className="text-xs text-gray-600">Vulnerable</p>
+          </div>
+          <div className="text-center">
+            <p className="text-lg font-semibold text-red-400">{data.summary.confirmed}</p>
+            <p className="text-xs text-gray-600">Confirmed</p>
+          </div>
+          <div className="text-center">
+            <p className="text-lg font-semibold text-orange-400">{data.summary.likely}</p>
+            <p className="text-xs text-gray-600">Likely</p>
+          </div>
         </div>
       )}
 

@@ -101,4 +101,14 @@ export const api = {
 
   updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status }),
+
+  resetDatabase: async (): Promise<{ ok: boolean }> => {
+    const url = new URL(`${BASE}/reset`, window.location.origin);
+    const res = await fetch(url.toString(), { method: 'DELETE' });
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`API ${res.status}: ${detail}`);
+    }
+    return res.json();
+  },
 };

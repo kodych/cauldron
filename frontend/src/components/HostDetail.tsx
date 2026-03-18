@@ -102,8 +102,8 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
       const newStatus = status === currentStatus ? null : status;
       await api.updateVulnStatus(hostIp, vuln.cve_id, newStatus);
       onUpdated();
-    } catch {
-      // Silently fail — endpoint may not exist yet
+    } catch (e) {
+      console.error('Failed to update vuln status:', e);
     } finally {
       setUpdating(false);
     }

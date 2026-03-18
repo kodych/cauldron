@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import { Upload, FileText, Play, Check, AlertCircle, Brain } from 'lucide-react';
+import { Upload, FileText, Play, Check, AlertCircle, Brain, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ImportResponse, AnalyzeResponse } from '../types';
 
@@ -18,6 +18,8 @@ export function ImportPanel({ onImported }: Props) {
   const [importResult, setImportResult] = useState<ImportResponse | null>(null);
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.endsWith('.xml')) {
@@ -27,7 +29,6 @@ export function ImportPanel({ onImported }: Props) {
     setFile(f);
     setError(null);
     setImportResult(null);
-    setAnalyzeResult(null);
     if (!source) {
       setSource(f.name.replace(/\.xml$/i, ''));
     }
@@ -59,28 +60,46 @@ export function ImportPanel({ onImported }: Props) {
   const handleAnalyze = useCallback(async () => {
     setAnalyzing(true);
     setError(null);
+    setAnalyzeResult(null);
     try {
       const result = await api.runAnalysis(useAi);
       setAnalyzeResult(result);
-      // Auto-reload after short delay so user sees the result
       setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Analysis failed');
     } finally {
       setAnalyzing(false);
     }
-  }, [useAi, onImported]);
+  }, [useAi]);
 
-  const reset = useCallback(() => {
+  const resetForm = useCallback(() => {
     setFile(null);
     setSource('');
     setImportResult(null);
-    setAnalyzeResult(null);
     setError(null);
   }, []);
 
+  const handleResetDatabase = useCallback(async () => {
+    setResetting(true);
+    setError(null);
+    try {
+      await api.resetDatabase();
+      resetForm();
+      setAnalyzeResult(null);
+      setTimeout(() => window.location.reload(), 500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Reset failed');
+    } finally {
+      setResetting(false);
+      setConfirmReset(false);
+    }
+  }, [resetForm]);
+
   return (
     <div className="p-3 space-y-3">
+      {/* === IMPORT SECTION === */}
+      <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">Import Scan</p>
+
       {/* Drop zone */}
       <div
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
@@ -120,22 +139,20 @@ export function ImportPanel({ onImported }: Props) {
 
       {/* Scanner source */}
       {file && !importResult && (
-        <div className="space-y-2">
-          <div>
-            <label className="text-xs text-gray-400 block mb-1">
-              Scanner IP <span className="text-gray-600">(where was the scan run from?)</span>
-            </label>
-            <input
-              type="text"
-              value={source}
-              onChange={(e) => setSource(e.target.value)}
-              placeholder="e.g., 10.0.0.7 or kali-external"
-              className="w-full rounded bg-gray-800 px-2 py-1.5 text-xs font-mono text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-            <p className="mt-1 text-xs text-gray-600">
-              Identifies the scan position in the network. Multiple scans from different positions build multi-perspective attack paths.
-            </p>
-          </div>
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">
+            Scanner IP <span className="text-gray-600">(where was the scan run from?)</span>
+          </label>
+          <input
+            type="text"
+            value={source}
+            onChange={(e) => setSource(e.target.value)}
+            placeholder="e.g., 10.0.0.7 or kali-external"
+            className="w-full rounded bg-gray-800 px-2 py-1.5 text-xs font-mono text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+          <p className="mt-1 text-xs text-gray-600">
+            Identifies the scan position in the network. Multiple scans from different positions build multi-perspective attack paths.
+          </p>
         </div>
       )}
 
@@ -178,76 +195,87 @@ export function ImportPanel({ onImported }: Props) {
         </div>
       )}
 
-      {/* Analyze section */}
-      {importResult && !analyzeResult && (
-        <div className="space-y-2">
-          {/* AI toggle */}
-          <label className="flex items-center gap-2 px-1 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useAi}
-              onChange={(e) => setUseAi(e.target.checked)}
-              className="rounded border-gray-600 bg-gray-800 text-purple-500"
-            />
-            <Brain size={13} className="text-purple-400" />
-            <span className="text-xs text-gray-400">Include AI analysis (Claude API)</span>
-          </label>
-
-          <button
-            onClick={handleAnalyze}
-            disabled={analyzing}
-            className="w-full flex items-center justify-center gap-1.5 rounded bg-orange-600 py-2 text-xs text-white hover:bg-orange-500 disabled:opacity-50"
-          >
-            {analyzing ? (
-              <>
-                <div className="h-3 w-3 animate-spin rounded-full border border-white border-t-transparent" />
-                Analyzing{useAi ? ' (with AI)' : ''}...
-              </>
-            ) : (
-              <>
-                <Play size={13} />
-                Run Analysis
-              </>
-            )}
-          </button>
-          <p className="text-xs text-gray-600 px-1">
-            Classify hosts, match exploits, enrich CVEs, build topology{useAi ? ', AI attack chains' : ''}
-          </p>
-        </div>
+      {/* Import another */}
+      {(importResult || file) && (
+        <button
+          onClick={resetForm}
+          className="w-full rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200"
+        >
+          Import another scan
+        </button>
       )}
 
-      {/* Analyze result */}
-      {analyzeResult && (
-        <div className="rounded bg-orange-950/20 border border-orange-800/30 p-2 space-y-2">
-          <div className="flex items-center gap-1.5">
-            <Check size={13} className="text-orange-400" />
-            <span className="text-xs font-medium text-orange-400">Analysis complete</span>
-          </div>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
-            {analyzeResult.classification?.classified != null && (
-              <>
-                <span className="text-gray-500">Classified:</span>
-                <span className="text-gray-300">{String(analyzeResult.classification.classified)} hosts</span>
-              </>
-            )}
-            {analyzeResult.exploits?.matched != null && (
-              <>
-                <span className="text-gray-500">Exploits found:</span>
-                <span className="text-gray-300">{String(analyzeResult.exploits.matched)}</span>
-              </>
-            )}
-            {analyzeResult.path_summary?.total_paths != null && (
-              <>
-                <span className="text-gray-500">Attack paths:</span>
-                <span className="text-gray-300">{String(analyzeResult.path_summary.total_paths)}</span>
-              </>
-            )}
-          </div>
-          <p className="text-xs text-gray-500">Reloading page...</p>
-        </div>
-      )}
+      {/* === ANALYZE SECTION === */}
+      <div className="border-t border-gray-800 pt-3">
+        <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Analyze</p>
 
-      {/* Error */}
+        {/* AI toggle */}
+        <label className="flex items-center gap-2 px-1 cursor-pointer mb-2">
+          <input
+            type="checkbox"
+            checked={useAi}
+            onChange={(e) => setUseAi(e.target.checked)}
+            className="rounded border-gray-600 bg-gray-800 text-purple-500"
+          />
+          <Brain size={13} className="text-purple-400" />
+          <span className="text-xs text-gray-400">Include AI analysis (Claude API)</span>
+        </label>
+
+        {!analyzeResult ? (
+          <div>
+            <button
+              onClick={handleAnalyze}
+              disabled={analyzing}
+              className="w-full flex items-center justify-center gap-1.5 rounded bg-orange-600 py-2 text-xs text-white hover:bg-orange-500 disabled:opacity-50"
+            >
+              {analyzing ? (
+                <>
+                  <div className="h-3 w-3 animate-spin rounded-full border border-white border-t-transparent" />
+                  Analyzing{useAi ? ' (with AI)' : ''}...
+                </>
+              ) : (
+                <>
+                  <Play size={13} />
+                  Run Analysis
+                </>
+              )}
+            </button>
+            <p className="text-xs text-gray-600 px-1 mt-1">
+              Classify hosts, match exploits, enrich CVEs, build topology{useAi ? ', AI attack chains' : ''}
+            </p>
+          </div>
+        ) : (
+          <div className="rounded bg-orange-950/20 border border-orange-800/30 p-2 space-y-2">
+            <div className="flex items-center gap-1.5">
+              <Check size={13} className="text-orange-400" />
+              <span className="text-xs font-medium text-orange-400">Analysis complete</span>
+            </div>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+              {analyzeResult.classification?.classified != null && (
+                <>
+                  <span className="text-gray-500">Classified:</span>
+                  <span className="text-gray-300">{String(analyzeResult.classification.classified)} hosts</span>
+                </>
+              )}
+              {analyzeResult.exploits?.matched != null && (
+                <>
+                  <span className="text-gray-500">Exploits found:</span>
+                  <span className="text-gray-300">{String(analyzeResult.exploits.matched)}</span>
+                </>
+              )}
+              {analyzeResult.path_summary?.vulnerable_hosts != null && (
+                <>
+                  <span className="text-gray-500">Vulnerable hosts:</span>
+                  <span className="text-gray-300">{String(analyzeResult.path_summary.vulnerable_hosts)}</span>
+                </>
+              )}
+            </div>
+            <p className="text-xs text-gray-500">Reloading page...</p>
+          </div>
+        )}
+      </div>
+
+      {/* === ERROR === */}
       {error && (
         <div className="flex items-start gap-1.5 rounded bg-red-950/20 border border-red-800/30 p-2">
           <AlertCircle size={13} className="text-red-400 shrink-0 mt-0.5" />
@@ -255,15 +283,44 @@ export function ImportPanel({ onImported }: Props) {
         </div>
       )}
 
-      {/* Reset */}
-      {(importResult || file) && (
-        <button
-          onClick={reset}
-          className="w-full rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200"
-        >
-          Import another scan
-        </button>
-      )}
+      {/* === CLEAR DATABASE === */}
+      <div className="border-t border-gray-800 pt-3">
+        {!confirmReset ? (
+          <button
+            onClick={() => setConfirmReset(true)}
+            className="w-full flex items-center justify-center gap-1.5 rounded bg-gray-800 py-1.5 text-xs text-gray-500 hover:bg-red-950/30 hover:text-red-400 transition-colors"
+          >
+            <Trash2 size={13} />
+            Clear Database
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-xs text-red-400 text-center">
+              This will delete all hosts, services, and vulnerabilities.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setConfirmReset(false)}
+                className="flex-1 rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-gray-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleResetDatabase}
+                disabled={resetting}
+                className="flex-1 flex items-center justify-center gap-1 rounded bg-red-700 py-1.5 text-xs text-white hover:bg-red-600 disabled:opacity-50"
+              >
+                {resetting ? (
+                  <div className="h-3 w-3 animate-spin rounded-full border border-white border-t-transparent" />
+                ) : (
+                  <Trash2 size={12} />
+                )}
+                Confirm
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
