@@ -1,0 +1,109 @@
+// Types matching Cauldron API response models
+
+export interface StatsResponse {
+  hosts: number;
+  services: number;
+  segments: number;
+  vulnerabilities: number;
+  scan_sources: number;
+  roles: Record<string, number>;
+}
+
+export interface ServiceOut {
+  port: number;
+  protocol: string;
+  state: string | null;
+  name: string | null;
+  product: string | null;
+  version: string | null;
+}
+
+export interface VulnOut {
+  cve_id: string;
+  cvss: number;
+  has_exploit: boolean;
+  confidence: string;
+  description: string | null;
+  enables_pivot: boolean | null;
+}
+
+export interface HostOut {
+  ip: string;
+  hostname: string | null;
+  role: string;
+  role_confidence: number;
+  os_name: string | null;
+  segment: string | null;
+  services: ServiceOut[];
+  vulnerabilities: VulnOut[];
+}
+
+export interface HostListResponse {
+  hosts: HostOut[];
+  total: number;
+}
+
+export interface VulnInfoOut {
+  cve_id: string;
+  cvss: number;
+  has_exploit: boolean;
+  title: string;
+  confidence: string;
+  enables_pivot: boolean | null;
+  method: string;
+}
+
+export interface PathNodeOut {
+  ip: string;
+  hostname: string | null;
+  role: string;
+  segment: string | null;
+  vulns: VulnInfoOut[];
+}
+
+export interface AttackPathOut {
+  nodes: PathNodeOut[];
+  target_role: string;
+  score: number;
+  hop_count: number;
+  max_cvss: number;
+  has_exploits: boolean;
+  attack_methods: string[];
+  max_confidence: string;
+}
+
+export interface PathsResponse {
+  paths: AttackPathOut[];
+  summary: Record<string, unknown>;
+}
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  type: 'host' | 'segment' | 'scan_source';
+  properties: Record<string, unknown>;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  type: string;
+  properties: Record<string, unknown>;
+}
+
+export interface GraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface TopologySegment {
+  cidr: string;
+  hosts: number;
+  reaches: number;
+}
+
+export interface TopologyResponse {
+  segments: TopologySegment[];
+  gateways: number;
+  total_reach_edges: number;
+}

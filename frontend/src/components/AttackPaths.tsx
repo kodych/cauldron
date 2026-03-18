@@ -1,0 +1,195 @@
+import { useState } from 'react';
+import { Crosshair, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react';
+import { useApi } from '../hooks/useApi';
+import { api } from '../api/client';
+import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors';
+import { formatCvss } from '../utils/format';
+import type { PathsResponse, AttackPathOut } from '../types';
+
+export function AttackPaths() {
+  const [includeCheck, setIncludeCheck] = useState(false);
+  const { data, loading, error } = useApi<PathsResponse>(
+    () => api.getAttackPaths({ top: 50, include_check: includeCheck }),
+    [includeCheck],
+  );
+
+  if (loading) {
+    return (
+      <div className="p-3 space-y-2">
+        {[...Array(5)].map((_, i) => (
+          <div key={i} className="h-16 animate-pulse rounded bg-gray-800/50" />
+        ))}
+      </div>
+    );
+  }
+
+  if (error) {
+    return <div className="p-4 text-sm text-red-400">{error}</div>;
+  }
+
+  if (!data) return null;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Controls */}
+      <div className="flex items-center justify-between border-b border-gray-800 px-3 py-2">
+        <p className="text-xs text-gray-500">{data.paths.length} paths</p>
+        <label className="flex items-center gap-1.5 text-xs text-gray-500">
+          <input
+            type="checkbox"
+            checked={includeCheck}
+            onChange={(e) => setIncludeCheck(e.target.checked)}
+            className="rounded border-gray-600 bg-gray-800 text-indigo-500 focus:ring-indigo-500"
+          />
+          Include check-level
+        </label>
+      </div>
+
+      {/* Summary */}
+      {data.summary && typeof data.summary === 'object' && (
+        <div className="grid grid-cols-3 gap-2 p-3 border-b border-gray-800">
+          {data.summary.total_paths != null && (
+            <div className="text-center">
+              <p className="text-lg font-semibold text-indigo-400">{String(data.summary.total_paths)}</p>
+              <p className="text-xs text-gray-600">Total</p>
+            </div>
+          )}
+          {data.summary.confirmed != null && (
+            <div className="text-center">
+              <p className="text-lg font-semibold text-red-400">{String(data.summary.confirmed)}</p>
+              <p className="text-xs text-gray-600">Confirmed</p>
+            </div>
+          )}
+          {data.summary.likely != null && (
+            <div className="text-center">
+              <p className="text-lg font-semibold text-orange-400">{String(data.summary.likely)}</p>
+              <p className="text-xs text-gray-600">Likely</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Path list */}
+      <div className="flex-1 overflow-y-auto">
+        {data.paths.length === 0 ? (
+          <div className="p-4 text-center text-xs text-gray-600">
+            No attack paths found
+          </div>
+        ) : (
+          data.paths.map((path, i) => (
+            <PathCard key={i} path={path} index={i + 1} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PathCard({ path, index }: { path: AttackPathOut; index: number }) {
+  const [expanded, setExpanded] = useState(false);
+
+
+  return (
+    <div className="border-b border-gray-800/50">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full px-3 py-2.5 text-left hover:bg-gray-800/30 transition-colors"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-gray-600 w-5">#{index}</span>
+          <div
+            className="h-2 w-2 rounded-full shrink-0"
+            style={{ backgroundColor: getConfidenceColor(path.max_confidence) }}
+          />
+          <div className="flex-1 min-w-0">
+            <p className="text-xs text-gray-200 truncate">
+              {path.nodes.map((n) => n.ip).join(' → ')}
+            </p>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span
+                className="text-xs"
+                style={{ color: getRoleColor(path.target_role) }}
+              >
+                {path.target_role}
+              </span>
+              <span className="text-xs text-gray-600">
+                {path.hop_count} hop{path.hop_count !== 1 ? 's' : ''}
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span
+              className="text-xs font-mono font-semibold"
+              style={{ color: path.score >= 50 ? '#ef4444' : path.score >= 25 ? '#f97316' : '#6b7280' }}
+            >
+              {path.score.toFixed(1)}
+            </span>
+            {path.has_exploits && (
+              <AlertTriangle size={12} className="text-red-400" />
+            )}
+            {expanded ? <ChevronUp size={14} className="text-gray-600" /> : <ChevronDown size={14} className="text-gray-600" />}
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="px-3 pb-3 space-y-2">
+          {/* Attack methods */}
+          {path.attack_methods.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {path.attack_methods.map((m) => (
+                <span key={m} className="rounded bg-gray-800 px-1.5 py-0.5 text-xs text-gray-400">
+                  {m}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Path nodes */}
+          {path.nodes.map((node, ni) => (
+            <div key={node.ip} className="relative pl-4">
+              {/* Connector line */}
+              {ni < path.nodes.length - 1 && (
+                <div className="absolute left-[5px] top-4 bottom-0 w-px bg-gray-700" />
+              )}
+              <div className="absolute left-0 top-1.5 h-2.5 w-2.5 rounded-full bg-gray-700 border-2 border-gray-900" />
+
+              <div className="text-xs">
+                <p className="text-gray-300 font-mono">
+                  {node.ip}
+                  {node.hostname && <span className="text-gray-600 font-sans ml-1">({node.hostname})</span>}
+                </p>
+                <p className="text-gray-600">{node.role} {node.segment && `· ${node.segment}`}</p>
+                {node.vulns.map((v) => (
+                  <div key={v.cve_id} className="flex items-start gap-1.5 mt-0.5 ml-2">
+                    <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }} />
+                    <div className="min-w-0">
+                      <span className="text-gray-400">{v.cve_id}</span>
+                      {v.title && <span className="text-gray-500 ml-1">— {v.title}</span>}
+                      <span className="ml-1" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
+                        [{formatCvss(v.cvss)}]
+                      </span>
+                      <span
+                        className="ml-1 font-medium"
+                        style={{ color: getConfidenceColor(v.confidence) }}
+                      >
+                        {v.confidence}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+
+          {/* Score */}
+          <div className="flex justify-end">
+            <span className="text-xs text-gray-600">
+              Score: <span className="text-gray-400 font-mono">{path.score.toFixed(1)}</span>
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
