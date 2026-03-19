@@ -117,11 +117,15 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               {vulnCount}V
             </span>
           )}
-          {vulnCount > 0 && (
+          {vulnCount > 0 && host.vulnerabilities.some((v) => v.has_exploit) ? (
+            <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
+              EXPLOIT
+            </span>
+          ) : vulnCount > 0 ? (
             <span className="rounded bg-purple-900/30 px-1.5 py-0.5 text-xs text-purple-400">
               VULN
             </span>
-          )}
+          ) : null}
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -172,6 +176,11 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                     >
                       {v.confidence || 'check'}
                     </span>
+                    {v.has_exploit && (
+                      <span className="shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
+                        EXPLOIT
+                      </span>
+                    )}
                     {v.source && (
                       <span className={`shrink-0 rounded px-1 py-0 ${
                         v.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :

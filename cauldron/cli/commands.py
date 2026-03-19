@@ -287,6 +287,17 @@ def boil(ai: bool):
             f"{script_stats['new_vulns']} new confirmed findings"
         )
 
+    # Phase 2.7: Bruteforceable service detection
+    from cauldron.exploits.matcher import mark_bruteforceable_services
+
+    with console.status("[bold green]Detecting bruteforceable services..."):
+        brute_stats = mark_bruteforceable_services()
+
+    if brute_stats["marked"]:
+        console.print(
+            f"  [green]+[/green] {brute_stats['marked']} bruteforceable services detected"
+        )
+
     # Phase 3: CVE enrichment (NVD API)
     console.print()
     console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")

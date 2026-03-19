@@ -297,12 +297,54 @@ class TestListFilters:
         names = [f["name"] for f in filters]
         assert "smb" in names
 
+    def test_list_filters_has_brute(self):
+        filters = list_filters()
+        names = [f["name"] for f in filters]
+        assert "brute" in names
+
     def test_list_filters_has_descriptions(self):
         filters = list_filters()
         for f in filters:
             assert "name" in f
             assert "description" in f
             assert len(f["description"]) > 5
+
+
+class TestBruteFilter:
+    """Test the brute collect filter."""
+
+    def test_brute_filter_returns_bruteforceable_sockets(self):
+        """Brute filter should return services marked as bruteforceable."""
+        _setup_network()
+        # Mark some services as bruteforceable
+        with get_session() as session:
+            session.run(
+                "MATCH (s:Service) WHERE s.port IN [22, 445, 3389, 3306, 21] "
+                "SET s.bruteforceable = true"
+            )
+        result = collect_targets(filter_name="brute")
+        # Should have multiple sockets (per_service mode)
+        assert result.total >= 5
+        # Each entry should have a port
+        for h in result.hosts:
+            assert h.port is not None
+
+    def test_brute_filter_includes_manual(self):
+        """Brute filter should also pick up manually-marked services."""
+        _setup_network()
+        with get_session() as session:
+            session.run(
+                "MATCH (s:Service {port: 80}) SET s.bruteforceable_manual = true"
+            )
+        result = collect_targets(filter_name="brute")
+        ips = [(h.ip, h.port) for h in result.hosts]
+        assert ("10.0.1.20", 80) in ips
+
+    def test_brute_filter_empty_when_no_marks(self):
+        """Brute filter returns nothing when no services are marked."""
+        _setup_network()
+        result = collect_targets(filter_name="brute")
+        assert result.total == 0
 
 
 class TestNoDuplicates:

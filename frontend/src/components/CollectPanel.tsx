@@ -17,6 +17,7 @@ const QUICK_FILTERS = [
   { name: 'rce', label: 'RCE', desc: 'Remote code exec' },
   { name: 'dc', label: 'DC', desc: 'Domain controllers' },
   { name: 'db', label: 'DB', desc: 'Databases' },
+  { name: 'brute', label: 'Brute', desc: 'Bruteforceable services' },
 ];
 
 export function CollectPanel() {

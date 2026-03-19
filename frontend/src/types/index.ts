@@ -16,12 +16,15 @@ export interface ServiceOut {
   name: string | null;
   product: string | null;
   version: string | null;
+  bruteforceable: boolean;
 }
 
 export interface VulnOut {
   cve_id: string;
   cvss: number;
   has_exploit: boolean;
+  exploit_url: string | null;
+  exploit_module: string | null;
   confidence: string;
   description: string | null;
   enables_pivot: boolean | null;

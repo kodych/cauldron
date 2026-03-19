@@ -169,6 +169,11 @@ function PathCard({ path, index }: { path: AttackPathOut; index: number }) {
                       >
                         {v.confidence}
                       </span>
+                      {v.has_exploit && (
+                        <span className="ml-1 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold text-xs">
+                          EXPLOIT
+                        </span>
+                      )}
                     </div>
                   </div>
                 ))}

@@ -500,6 +500,50 @@ class TestVulnStatus:
         assert resp.status_code == 400
 
 
+class TestBruteforceable:
+    def test_toggle_bruteforceable(self, client):
+        _setup_test_network()
+        # Mark SMB port 445 on DC01 as bruteforceable
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.10/services/445/bruteforceable",
+            json={"bruteforceable": True},
+        )
+        assert resp.status_code == 200
+
+        # Verify via host detail
+        resp = client.get("/api/v1/hosts/10.0.1.10")
+        services = resp.json()["services"]
+        smb = [s for s in services if s["port"] == 445]
+        assert len(smb) == 1
+        assert smb[0]["bruteforceable"] is True
+
+    def test_unmark_bruteforceable(self, client):
+        _setup_test_network()
+        # Mark then unmark
+        client.patch(
+            "/api/v1/hosts/10.0.1.10/services/445/bruteforceable",
+            json={"bruteforceable": True},
+        )
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.10/services/445/bruteforceable",
+            json={"bruteforceable": False},
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/api/v1/hosts/10.0.1.10")
+        services = resp.json()["services"]
+        smb = [s for s in services if s["port"] == 445]
+        assert smb[0]["bruteforceable"] is False
+
+    def test_bruteforceable_nonexistent_service(self, client):
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.10/services/9999/bruteforceable",
+            json={"bruteforceable": True},
+        )
+        assert resp.status_code == 404
+
+
 class TestReset:
     def test_reset_clears_database(self, client):
         _setup_test_network()

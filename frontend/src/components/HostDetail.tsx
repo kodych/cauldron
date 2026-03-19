@@ -69,7 +69,7 @@ export function HostDetail({ ip, onBack }: Props) {
 
       <div className="flex-1 overflow-y-auto">
         {/* Services */}
-        <ServicesList services={data.services} vulns={data.vulnerabilities} />
+        <ServicesList services={data.services} vulns={data.vulnerabilities} hostIp={ip} onUpdated={refetch} />
 
         <div>
           <div className="flex items-center gap-1.5 px-3 py-2">
@@ -134,6 +134,11 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
         >
           {vuln.confidence}
         </span>
+        {vuln.has_exploit && (
+          <span className="text-xs shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
+            EXPLOIT
+          </span>
+        )}
         {vuln.source && (
           <span className={`text-xs shrink-0 rounded px-1 py-0 ${
             vuln.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :
@@ -162,14 +167,30 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
           {vuln.description && (
             <p className="text-xs text-gray-500">{vuln.description}</p>
           )}
-          <div className="flex items-center gap-1 text-xs text-gray-600">
+          <div className="flex items-center gap-1 flex-wrap text-xs text-gray-600">
             {vuln.enables_pivot === true && (
               <span className="rounded bg-red-900/30 px-1 py-0.5 text-red-400">RCE</span>
             )}
             {vuln.enables_pivot === false && (
               <span className="rounded bg-gray-700 px-1 py-0.5 text-gray-400">relay/misc</span>
             )}
+            {vuln.exploit_module && (
+              <span className="rounded bg-gray-700 px-1 py-0.5 text-gray-400 font-mono truncate max-w-full" title={vuln.exploit_module}>
+                {vuln.exploit_module}
+              </span>
+            )}
           </div>
+          {vuln.exploit_url && (
+            <a
+              href={vuln.exploit_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-blue-400 hover:text-blue-300 truncate block"
+              title={vuln.exploit_url}
+            >
+              {vuln.exploit_url}
+            </a>
+          )}
           {/* Status buttons */}
           <div className="flex items-center gap-1 pt-1 border-t border-gray-700/50">
             <span className="text-xs text-gray-600 mr-1">Status:</span>
@@ -200,7 +221,12 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
   );
 }
 
-function ServicesList({ services, vulns }: { services: HostOut['services']; vulns: HostOut['vulnerabilities'] }) {
+function ServicesList({ services, vulns, hostIp, onUpdated }: {
+  services: HostOut['services'];
+  vulns: HostOut['vulnerabilities'];
+  hostIp: string;
+  onUpdated: () => void;
+}) {
   // Build port → max CVSS map from vulns
   const portCvssMap = useMemo(() => {
     const map = new Map<number, number>();
@@ -224,6 +250,15 @@ function ServicesList({ services, vulns }: { services: HostOut['services']; vuln
     }
     return map;
   }, [vulns]);
+
+  const handleBruteToggle = useCallback(async (port: number, current: boolean) => {
+    try {
+      await api.updateServiceBruteforceable(hostIp, port, !current);
+      onUpdated();
+    } catch (e) {
+      console.error('Failed to toggle bruteforceable:', e);
+    }
+  }, [hostIp, onUpdated]);
 
   return (
     <div className="border-b border-gray-800">
@@ -257,6 +292,17 @@ function ServicesList({ services, vulns }: { services: HostOut['services']; vuln
                   <Bug size={9} className="inline mr-0.5 -mt-px" />{vCount}
                 </span>
               )}
+              <button
+                onClick={() => handleBruteToggle(s.port, s.bruteforceable)}
+                className={`shrink-0 rounded px-1 py-0 text-xs transition-colors ${
+                  s.bruteforceable
+                    ? 'bg-orange-900/30 text-orange-400 font-semibold'
+                    : 'bg-gray-800 text-gray-600 hover:text-gray-400'
+                }`}
+                title={s.bruteforceable ? 'Bruteforceable — click to unmark' : 'Mark as bruteforceable'}
+              >
+                BRUTE
+              </button>
             </div>
           );
         })}

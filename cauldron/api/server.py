@@ -53,12 +53,15 @@ class ServiceOut(BaseModel):
     name: str | None = None
     product: str | None = None
     version: str | None = None
+    bruteforceable: bool = False
 
 
 class VulnOut(BaseModel):
     cve_id: str
     cvss: float = 0.0
     has_exploit: bool = False
+    exploit_url: str | None = None
+    exploit_module: str | None = None
     confidence: str = "check"
     description: str | None = None
     enables_pivot: bool | None = None
@@ -200,6 +203,8 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         cve_id=v["cve_id"],
         cvss=v.get("cvss") or 0.0,
         has_exploit=bool(v.get("has_exploit")),
+        exploit_url=v.get("exploit_url"),
+        exploit_module=v.get("exploit_module"),
         confidence=v.get("confidence") or "check",
         description=v.get("description"),
         enables_pivot=v.get("enables_pivot"),
@@ -218,6 +223,7 @@ def _parse_service_record(s: dict) -> ServiceOut:
         name=s.get("name"),
         product=s.get("product"),
         version=s.get("version"),
+        bruteforceable=bool(s.get("bruteforceable") or s.get("bruteforceable_manual")),
     )
 
 
@@ -309,10 +315,12 @@ def list_hosts(
                    seg.cidr AS segment,
                    collect(DISTINCT {{
                        port: s.port, protocol: s.protocol, state: s.state,
-                       name: s.name, product: s.product, version: s.version
+                       name: s.name, product: s.product, version: s.version,
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual
                    }}) AS services,
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
+                       exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status,
                        port: s.port, source: v.source
@@ -365,10 +373,12 @@ def get_host(ip: str):
                    seg.cidr AS segment,
                    collect(DISTINCT {
                        port: s.port, protocol: s.protocol, state: s.state,
-                       name: s.name, product: s.product, version: s.version
+                       name: s.name, product: s.product, version: s.version,
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual
                    }) AS services,
                    collect(DISTINCT {
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
+                       exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status,
                        port: s.port, source: v.source
@@ -667,7 +677,9 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
     _check_neo4j()
 
     from cauldron.graph.ingestion import classify_graph_hosts
-    from cauldron.exploits.matcher import ExploitDB, upgrade_confidence_from_scripts
+    from cauldron.exploits.matcher import (
+        ExploitDB, upgrade_confidence_from_scripts, mark_bruteforceable_services,
+    )
     from cauldron.ai.cve_enricher import enrich_services_from_graph
     from cauldron.graph.topology import build_segment_connectivity
     from cauldron.ai.attack_paths import get_path_summary
@@ -681,6 +693,9 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
 
     # Phase 2.5: Script confidence
     script_stats = upgrade_confidence_from_scripts()
+
+    # Phase 2.7: Bruteforceable service detection
+    mark_bruteforceable_services()
 
     # Phase 3: CVE enrichment
     cve_stats = enrich_services_from_graph()
@@ -747,6 +762,38 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
         record = result.single()
         if not record:
             raise HTTPException(status_code=404, detail=f"Vulnerability {vuln_id} not found on host {ip}")
+
+    return {"ok": True}
+
+
+class BruteforceableUpdate(BaseModel):
+    bruteforceable: bool
+
+
+@app.patch("/api/v1/hosts/{ip}/services/{port}/bruteforceable")
+def update_service_bruteforceable(ip: str, port: int, body: BruteforceableUpdate):
+    """Toggle bruteforceable flag on a service (manual override)."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})
+            SET s.bruteforceable_manual = $brute,
+                s.bruteforceable = $brute
+            RETURN s.port AS port
+            """,
+            ip=ip,
+            port=port,
+            brute=body.bruteforceable,
+        )
+        record = result.single()
+        if not record:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Service port {port} not found on host {ip}",
+            )
 
     return {"ok": True}
 

@@ -108,6 +108,9 @@ export const api = {
   updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus, port?: number | null) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status, port }),
 
+  updateServiceBruteforceable: (ip: string, port: number, bruteforceable: boolean) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/services/${port}/bruteforceable`, { bruteforceable }),
+
   resetDatabase: async (): Promise<{ ok: boolean }> => {
     const url = new URL(`${BASE}/reset`, window.location.origin);
     const res = await fetch(url.toString(), { method: 'DELETE' });

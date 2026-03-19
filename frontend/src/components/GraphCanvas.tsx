@@ -472,6 +472,9 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
                 {v.checked_status === 'mitigated' && (
                   <span className="text-blue-400 shrink-0">M</span>
                 )}
+                {v.has_exploit && (
+                  <span className="text-red-400 font-semibold shrink-0">EXP</span>
+                )}
               </div>
             ))}
             {vulnCount > topVulns.length && (

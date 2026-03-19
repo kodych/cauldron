@@ -127,6 +127,12 @@ BUILTIN_FILTERS: dict[str, dict] = {
         "description": "Database servers",
         "where": "h.role = 'database'",
     },
+    "brute": {
+        "description": "Bruteforceable services (SSH, RDP, SMB, databases, etc.)",
+        "match_service": True,
+        "where": "(s.bruteforceable = true OR s.bruteforceable_manual = true)",
+        "per_service": True,  # return one entry per socket, not per host
+    },
 }
 
 
@@ -208,13 +214,25 @@ def collect_targets(
     match_str = "\n".join(match_clauses)
     where_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-    query = f"""
-        {match_str}
-        {where_str}
-        WITH DISTINCT h
-        RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role
-        ORDER BY h.ip
-    """
+    # per_service mode: return one entry per (host, port) instead of per host
+    per_service = filter_name and BUILTIN_FILTERS.get(filter_name, {}).get("per_service")
+
+    if per_service:
+        query = f"""
+            {match_str}
+            {where_str}
+            WITH DISTINCT h, s
+            RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role, s.port AS port
+            ORDER BY h.ip, s.port
+        """
+    else:
+        query = f"""
+            {match_str}
+            {where_str}
+            WITH DISTINCT h
+            RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role
+            ORDER BY h.ip
+        """
 
     with get_session() as session:
         result = session.run(query, params)
@@ -223,7 +241,7 @@ def collect_targets(
             entry = HostEntry(
                 ip=record["ip"],
                 hostname=record.get("hostname"),
-                port=default_port,
+                port=record.get("port") if per_service else default_port,
                 role=record.get("role"),
             )
             hosts.append(entry)
