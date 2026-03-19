@@ -32,7 +32,7 @@ async function get<T>(path: string, params?: Record<string, string | number | bo
   return res.json();
 }
 
-async function post<T>(path: string, params?: Record<string, string | number | boolean>): Promise<T> {
+async function post<T>(path: string, params?: Record<string, string | number | boolean>, timeoutMs = 600000): Promise<T> {
   const url = new URL(`${BASE}${path}`, window.location.origin);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
@@ -41,12 +41,18 @@ async function post<T>(path: string, params?: Record<string, string | number | b
       }
     }
   }
-  const res = await fetch(url.toString(), { method: 'POST' });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`API ${res.status}: ${detail}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url.toString(), { method: 'POST', signal: controller.signal });
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`API ${res.status}: ${detail}`);
+    }
+    return res.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 async function patch<T>(path: string, body: unknown): Promise<T> {
@@ -99,8 +105,8 @@ export const api = {
   runAnalysis: (ai?: boolean) =>
     post<AnalyzeResponse>('/analyze', ai ? { ai } : undefined),
 
-  updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus) =>
-    patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status }),
+  updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus, port?: number | null) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status, port }),
 
   resetDatabase: async (): Promise<{ ok: boolean }> => {
     const url = new URL(`${BASE}/reset`, window.location.origin);

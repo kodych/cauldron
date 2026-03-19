@@ -123,6 +123,10 @@ BUILTIN_FILTERS: dict[str, dict] = {
         "description": "Domain Controllers",
         "where": "h.role = 'domain_controller'",
     },
+    "db": {
+        "description": "Database servers",
+        "where": "h.role = 'database'",
+    },
 }
 
 

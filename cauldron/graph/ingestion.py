@@ -181,6 +181,9 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
 
     Services are identified by host_ip + port + protocol combination.
     """
+    # Store CPE as semicolon-joined string (Neo4j doesn't have list properties in community)
+    cpe_str = ";".join(service.cpe) if service.cpe else None
+
     session.run(
         """
         MATCH (h:Host {ip: $ip})
@@ -191,13 +194,15 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
             svc.product = $product,
             svc.version = $version,
             svc.extra_info = $extra_info,
-            svc.banner = $banner
+            svc.banner = $banner,
+            svc.cpe = $cpe
         ON MATCH SET
             svc.state = $state,
             svc.name = COALESCE($name, svc.name),
             svc.product = COALESCE($product, svc.product),
             svc.version = COALESCE($version, svc.version),
-            svc.extra_info = COALESCE($extra_info, svc.extra_info)
+            svc.extra_info = COALESCE($extra_info, svc.extra_info),
+            svc.cpe = COALESCE($cpe, svc.cpe)
         MERGE (h)-[:HAS_SERVICE]->(svc)
         """,
         ip=host_ip,
@@ -209,6 +214,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
         version=service.version,
         extra_info=service.extra_info,
         banner=service.banner,
+        cpe=cpe_str,
     )
 
 

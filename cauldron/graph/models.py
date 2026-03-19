@@ -61,6 +61,7 @@ class Service:
     version: str | None = None  # e.g. "2.4.49", "7.4"
     extra_info: str | None = None
     banner: str | None = None
+    cpe: list[str] = field(default_factory=list)  # CPE URIs from nmap (e.g. "cpe:/a:apache:http_server:2.4.49")
     scripts: list[ScriptResult] = field(default_factory=list)
 
     @property

@@ -27,6 +27,7 @@ export interface VulnOut {
   enables_pivot: boolean | null;
   checked_status: string | null;
   port: number | null;
+  source: string | null; // exploit_db, nvd, ai
 }
 
 export interface HostOut {

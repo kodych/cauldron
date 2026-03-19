@@ -3,7 +3,6 @@ import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X } from
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
-import { formatCvss } from '../utils/format';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
 
 interface Props {
@@ -100,14 +99,14 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
     setUpdating(true);
     try {
       const newStatus = status === currentStatus ? null : status;
-      await api.updateVulnStatus(hostIp, vuln.cve_id, newStatus);
+      await api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, vuln.port);
       onUpdated();
     } catch (e) {
       console.error('Failed to update vuln status:', e);
     } finally {
       setUpdating(false);
     }
-  }, [hostIp, vuln.cve_id, currentStatus, onUpdated]);
+  }, [hostIp, vuln.cve_id, vuln.port, currentStatus, onUpdated]);
 
   return (
     <div className={`rounded bg-gray-800/30 ${currentStatus === 'false_positive' ? 'opacity-50' : ''}`}>
@@ -115,6 +114,11 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
         onClick={() => setExpanded(!expanded)}
         className="w-full px-2 py-1.5 text-left flex items-center gap-2"
       >
+        {vuln.port != null && (
+          <span className="font-mono text-xs text-gray-500 shrink-0 w-10 text-right">
+            :{vuln.port}
+          </span>
+        )}
         {vuln.cvss > 0 && (
           <span
             className="font-mono text-xs shrink-0"
@@ -130,6 +134,16 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
         >
           {vuln.confidence}
         </span>
+        {vuln.source && (
+          <span className={`text-xs shrink-0 rounded px-1 py-0 ${
+            vuln.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :
+            vuln.source === 'exploit_db' ? 'bg-amber-900/30 text-amber-400' :
+            vuln.source === 'nvd' ? 'bg-cyan-900/30 text-cyan-400' :
+            'bg-gray-700 text-gray-400'
+          }`}>
+            {vuln.source === 'ai' ? 'AI' : vuln.source === 'exploit_db' ? 'DB' : vuln.source === 'nvd' ? 'NVD' : vuln.source}
+          </span>
+        )}
         {currentStatus && (
           <span className="text-xs shrink-0" style={{
             color: currentStatus === 'exploited' ? '#22c55e' :
@@ -236,10 +250,11 @@ function ServicesList({ services, vulns }: { services: HostOut['services']; vuln
               </span>
               {vCount > 0 && (
                 <span
-                  className="shrink-0 rounded px-1 py-0 text-xs font-mono"
+                  className="shrink-0 rounded px-1 py-0 text-xs"
                   style={{ color: portColor, backgroundColor: portColor + '18' }}
+                  title={`${vCount} vulnerability${vCount !== 1 ? 'ies' : ''} on this port`}
                 >
-                  {vCount}
+                  <Bug size={9} className="inline mr-0.5 -mt-px" />{vCount}
                 </span>
               )}
             </div>

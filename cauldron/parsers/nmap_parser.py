@@ -169,6 +169,11 @@ def _parse_port(elem: ET.Element) -> Service | None:
         if tunnel:
             service.banner = f"tunnel:{tunnel}"
 
+        # CPE URIs (nmap's built-in CPE detection)
+        for cpe_elem in svc_elem.findall("cpe"):
+            if cpe_elem.text:
+                service.cpe.append(cpe_elem.text)
+
     # NSE script results
     for script_elem in elem.findall("script"):
         script = ScriptResult(

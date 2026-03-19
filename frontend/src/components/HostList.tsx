@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { Search, ChevronDown, ChevronUp } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getRoleColor, getCvssColor } from '../utils/colors';
+import { getRoleColor, getCvssColor, getConfidenceColor } from '../utils/colors';
 import type { HostListResponse, HostOut } from '../types';
 
 interface Props {
@@ -154,6 +154,9 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               <div className="space-y-0.5">
                 {host.vulnerabilities.map((v) => (
                   <div key={v.cve_id} className="flex items-center gap-2 text-xs">
+                    {v.port != null && (
+                      <span className="font-mono text-gray-500 shrink-0 w-10 text-right">:{v.port}</span>
+                    )}
                     {v.cvss > 0 && (
                       <span
                         className="font-mono shrink-0"
@@ -165,13 +168,20 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                     <span className="text-gray-400 truncate">{v.cve_id}</span>
                     <span
                       className="shrink-0"
-                      style={{
-                        color: v.confidence === 'confirmed' ? '#ef4444' :
-                               v.confidence === 'likely' ? '#f97316' : '#6b7280',
-                      }}
+                      style={{ color: getConfidenceColor(v.confidence) }}
                     >
                       {v.confidence || 'check'}
                     </span>
+                    {v.source && (
+                      <span className={`shrink-0 rounded px-1 py-0 ${
+                        v.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :
+                        v.source === 'exploit_db' ? 'bg-amber-900/30 text-amber-400' :
+                        v.source === 'nvd' ? 'bg-cyan-900/30 text-cyan-400' :
+                        'bg-gray-700 text-gray-400'
+                      }`}>
+                        {v.source === 'ai' ? 'AI' : v.source === 'exploit_db' ? 'DB' : v.source === 'nvd' ? 'NVD' : v.source}
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>

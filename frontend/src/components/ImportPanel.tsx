@@ -20,6 +20,8 @@ export function ImportPanel({ onImported }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [analyzeStartTime, setAnalyzeStartTime] = useState<number | null>(null);
+  const [analyzeElapsed, setAnalyzeElapsed] = useState(0);
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.endsWith('.xml')) {
@@ -57,10 +59,17 @@ export function ImportPanel({ onImported }: Props) {
     }
   }, [file, source, onImported]);
 
+  // Elapsed time ticker during analysis
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const handleAnalyze = useCallback(async () => {
     setAnalyzing(true);
     setError(null);
     setAnalyzeResult(null);
+    const start = Date.now();
+    setAnalyzeStartTime(start);
+    setAnalyzeElapsed(0);
+    timerRef.current = setInterval(() => setAnalyzeElapsed(Date.now() - start), 1000);
     try {
       const result = await api.runAnalysis(useAi);
       setAnalyzeResult(result);
@@ -69,6 +78,8 @@ export function ImportPanel({ onImported }: Props) {
       setError(e instanceof Error ? e.message : 'Analysis failed');
     } finally {
       setAnalyzing(false);
+      setAnalyzeStartTime(null);
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     }
   }, [useAi]);
 
@@ -232,6 +243,11 @@ export function ImportPanel({ onImported }: Props) {
                 <>
                   <div className="h-3 w-3 animate-spin rounded-full border border-white border-t-transparent" />
                   Analyzing{useAi ? ' (with AI)' : ''}...
+                  {analyzeElapsed > 0 && (
+                    <span className="font-mono ml-1">
+                      {Math.floor(analyzeElapsed / 60000)}:{String(Math.floor((analyzeElapsed % 60000) / 1000)).padStart(2, '0')}
+                    </span>
+                  )}
                 </>
               ) : (
                 <>
@@ -240,9 +256,16 @@ export function ImportPanel({ onImported }: Props) {
                 </>
               )}
             </button>
-            <p className="text-xs text-gray-600 px-1 mt-1">
-              Classify hosts, match exploits, enrich CVEs, build topology{useAi ? ', AI attack chains' : ''}
-            </p>
+            {analyzing && analyzeElapsed > 5000 && (
+              <p className="text-xs text-orange-400/70 px-1 mt-1">
+                Large networks may take several minutes (NVD enrichment, exploit matching)...
+              </p>
+            )}
+            {!analyzing && (
+              <p className="text-xs text-gray-600 px-1 mt-1">
+                Classify hosts, match exploits, enrich CVEs, build topology{useAi ? ', AI attack chains' : ''}
+              </p>
+            )}
           </div>
         ) : (
           <div className="rounded bg-orange-950/20 border border-orange-800/30 p-2 space-y-2">

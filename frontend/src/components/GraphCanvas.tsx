@@ -2,13 +2,12 @@ import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MultiGraph } from 'graphology';
 import Sigma from 'sigma';
 import { Crosshair, Network, SlidersHorizontal } from 'lucide-react';
-import { circular } from 'graphology-layout';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getNodeColor, getCvssColor, ROLE_COLORS } from '../utils/colors';
+import { getNodeColor, getCvssColor, getConfidenceColor, ROLE_COLORS } from '../utils/colors';
 import { HIGH_VALUE_ROLES, formatCvss } from '../utils/format';
-import type { GraphResponse, PathsResponse, HostListResponse } from '../types';
+import type { GraphResponse, PathsResponse, HostListResponse, VulnOut } from '../types';
 
 interface Props {
   selectedHost: string | null;
@@ -20,6 +19,7 @@ interface HostVulnInfo {
   maxCvss: number;
   hasExploit: boolean;
   role: string;
+  topVulns: VulnOut[]; // top 5 vulns for tooltip
 }
 
 export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
@@ -49,11 +49,20 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     if (!hostsData) return map;
     for (const h of hostsData.hosts) {
       const vulns = h.vulnerabilities;
+      // Sort vulns: highest confidence first, then by CVSS
+      const confOrder: Record<string, number> = { confirmed: 0, likely: 1, check: 2 };
+      const sorted = [...vulns].sort((a, b) => {
+        const ca = confOrder[a.confidence] ?? 2;
+        const cb = confOrder[b.confidence] ?? 2;
+        if (ca !== cb) return ca - cb;
+        return (b.cvss || 0) - (a.cvss || 0);
+      });
       map.set(h.ip, {
         vulnCount: vulns.length,
         maxCvss: vulns.length > 0 ? Math.max(...vulns.map((v) => v.cvss)) : -1,
         hasExploit: vulns.some((v) => v.has_exploit),
         role: h.role,
+        topVulns: sorted.slice(0, 5),
       });
     }
     return map;
@@ -97,7 +106,9 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
       // Node sizing: high-value targets are bigger, vulns add more
       let size = node.type === 'host' ? 6 : 5;
-      if (node.type === 'host') {
+      if (isScanSource) {
+        size = 8; // Scan sources: visible but not overwhelming
+      } else if (node.type === 'host') {
         // High-value targets: larger base
         if (HIGH_VALUE_ROLES.has(roleUpper)) {
           size = 14;
@@ -122,6 +133,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         maxCvss: info?.maxCvss ?? -1,
         hasExploit: info?.hasExploit || false,
         isScanSource: isScanSource,
+        zIndex: isScanSource ? 100 : 1,
       });
     }
 
@@ -164,20 +176,91 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       }
     }
 
-    // Layout
+    // Layout — scan sources at center, hosts fill disk via sunflower model
     const nodeCount = g.order;
-    circular.assign(g);
+    const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // ~137.5°
+    // Collect scan sources and space them around center
+    const sourceNodes: string[] = [];
+    g.forEachNode((node, attrs) => {
+      if (attrs.isScanSource || attrs.nodeType === 'scan_source') sourceNodes.push(node);
+    });
+    let i = 0;
+    g.forEachNode((node, attrs) => {
+      if (attrs.isScanSource || attrs.nodeType === 'scan_source') {
+        // Multiple scan sources: spread around center; single: dead center
+        const srcIdx = sourceNodes.indexOf(node);
+        const angle = sourceNodes.length > 1 ? (srcIdx / sourceNodes.length) * 2 * Math.PI : 0;
+        const offset = sourceNodes.length > 1 ? 0.15 : 0;
+        g.setNodeAttribute(node, 'x', offset * Math.cos(angle));
+        g.setNodeAttribute(node, 'y', offset * Math.sin(angle));
+      } else {
+        // Vogel's model: r = sqrt(i/N), θ = i * golden_angle
+        const r = Math.sqrt(i / nodeCount);
+        const theta = i * GOLDEN_ANGLE;
+        g.setNodeAttribute(node, 'x', r * Math.cos(theta));
+        g.setNodeAttribute(node, 'y', r * Math.sin(theta));
+        i++;
+      }
+    });
+
+    // ForceAtlas2 settings scale with network size
+    const isLarge = nodeCount > 200;
+    const isHuge = nodeCount > 800;
+    const gravity = isHuge ? 0.5 : isLarge ? 1 : 3;
+    const scalingRatio = isHuge ? 100 : isLarge ? 30 : 8;
+    const iterations = isHuge ? 500 : isLarge ? 350 : Math.min(300, 80 + nodeCount * 2);
+
     forceAtlas2.assign(g, {
-      iterations: Math.min(300, 80 + nodeCount * 2),
+      iterations,
       settings: {
-        gravity: 3,
-        scalingRatio: 8,
+        gravity,
+        scalingRatio,
         barnesHutOptimize: nodeCount > 50,
+        barnesHutTheta: isHuge ? 0.8 : 0.5,
         strongGravityMode: false,
-        slowDown: 5,
+        slowDown: isLarge ? 8 : 5,
         outboundAttractionDistribution: true,
       },
     });
+
+    // Post-layout: redistribute radii to fill disk uniformly
+    // FA2 groups nodes angularly, but puts them all at same radius (ring).
+    // Fix: preserve angle, remap radius so nodes fill center→edge evenly.
+    if (isLarge) {
+      // Find center of mass (scan source position)
+      let cx = 0, cy = 0, sourceCount = 0;
+      g.forEachNode((_node, attrs) => {
+        if (attrs.isScanSource || attrs.nodeType === 'scan_source') {
+          cx += attrs.x as number;
+          cy += attrs.y as number;
+          sourceCount++;
+        }
+      });
+      if (sourceCount > 0) { cx /= sourceCount; cy /= sourceCount; }
+
+      // Collect non-source nodes with their angle and current radius
+      const nodes: { id: string; angle: number; radius: number }[] = [];
+      g.forEachNode((node, attrs) => {
+        if (attrs.isScanSource || attrs.nodeType === 'scan_source') return;
+        const dx = (attrs.x as number) - cx;
+        const dy = (attrs.y as number) - cy;
+        const radius = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx);
+        nodes.push({ id: node, angle, radius });
+      });
+
+      // Sort by radius, then assign new radii to fill disk with a minimum distance from center
+      nodes.sort((a, b) => a.radius - b.radius);
+      const maxR = nodes.length > 0 ? nodes[nodes.length - 1].radius : 1;
+      const minRatio = 0.25; // inner 25% of radius is empty (keeps center clear)
+      for (let j = 0; j < nodes.length; j++) {
+        const t = Math.sqrt((j + 1) / nodes.length); // 0..1 uniform disk fill
+        const newR = maxR * (minRatio + (1 - minRatio) * t); // remap to [25%..100%] of radius
+        const { id, angle } = nodes[j];
+        g.setNodeAttribute(id, 'x', cx + newR * Math.cos(angle));
+        g.setNodeAttribute(id, 'y', cy + newR * Math.sin(angle));
+      }
+    }
 
     return g;
   }, [data, attackEdgeMap, hostVulnMap]);
@@ -324,23 +407,26 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     if (!hoveredNode || !graph || !graph.hasNode(hoveredNode)) return null;
     const attrs = graph.getNodeAttributes(hoveredNode);
     if (attrs.nodeType !== 'host' && attrs.nodeType !== 'scan_source') return null;
+    const ip = attrs.ip as string;
+    const info = hostVulnMap.get(ip);
     return {
-      ip: attrs.ip as string,
+      ip,
       role: attrs.role as string,
       vulnCount: (attrs.vulnCount as number) || 0,
       maxCvss: (attrs.maxCvss as number) ?? -1,
       hasExploit: (attrs.hasExploit as boolean) || false,
       isScanSource: (attrs.isScanSource as boolean) || attrs.nodeType === 'scan_source',
+      topVulns: info?.topVulns || [],
     };
-  }, [hoveredNode, graph]);
+  }, [hoveredNode, graph, hostVulnMap]);
 
   const renderTooltip = useCallback(() => {
     if (!tooltipData) return null;
-    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource } = tooltipData;
+    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource, topVulns } = tooltipData;
     return (
       <div
         ref={tooltipRef}
-        className="absolute z-50 pointer-events-none rounded bg-gray-900 border border-gray-700 px-3 py-2 shadow-xl"
+        className="absolute z-50 pointer-events-none rounded bg-gray-900 border border-gray-700 px-3 py-2 shadow-xl max-w-xs"
         style={{ left: tooltipPos.x + 12, top: tooltipPos.y - 10 }}
       >
         <div className="flex items-center gap-2">
@@ -351,18 +437,45 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         </div>
         <p className="text-xs text-gray-400 mt-0.5">{role}</p>
         {vulnCount > 0 ? (
-          <div className="mt-1 flex items-center gap-2">
-            <span
-              className="text-xs font-semibold"
-              style={{ color: maxCvss > 0 ? getCvssColor(maxCvss) : '#6b7280' }}
-            >
-              {vulnCount} CVE{vulnCount !== 1 ? 's' : ''}
-            </span>
-            <span className="text-xs" style={{ color: maxCvss > 0 ? getCvssColor(maxCvss) : '#6b7280' }}>
-              CVSS: {formatCvss(maxCvss)}
-            </span>
-            {hasExploit && (
-              <span className="text-xs text-red-400 font-semibold">EXPLOIT</span>
+          <div className="mt-1.5 space-y-0.5">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-xs font-semibold text-gray-300">
+                {vulnCount} vuln{vulnCount !== 1 ? 's' : ''}
+              </span>
+              <span className="text-xs font-mono" style={{ color: maxCvss > 0 ? getCvssColor(maxCvss) : '#6b7280' }}>
+                CVSS: {formatCvss(maxCvss)}
+              </span>
+              {hasExploit && (
+                <span className="text-xs text-red-400 font-semibold">EXPLOIT</span>
+              )}
+            </div>
+            {topVulns.map((v) => (
+              <div key={v.cve_id} className="flex items-center gap-1.5 text-xs">
+                {v.port != null && (
+                  <span className="font-mono text-gray-500 w-10 text-right shrink-0">:{v.port}</span>
+                )}
+                <span className="text-gray-300 truncate">{v.cve_id}</span>
+                <span style={{ color: getConfidenceColor(v.confidence) }} className="shrink-0">
+                  {v.confidence}
+                </span>
+                {v.cvss > 0 && (
+                  <span className="font-mono shrink-0" style={{ color: getCvssColor(v.cvss) }}>
+                    {v.cvss.toFixed(1)}
+                  </span>
+                )}
+                {v.checked_status === 'exploited' && (
+                  <span className="text-green-400 shrink-0">&#10003;</span>
+                )}
+                {v.checked_status === 'false_positive' && (
+                  <span className="text-gray-500 shrink-0">FP</span>
+                )}
+                {v.checked_status === 'mitigated' && (
+                  <span className="text-blue-400 shrink-0">M</span>
+                )}
+              </div>
+            ))}
+            {vulnCount > topVulns.length && (
+              <p className="text-xs text-gray-600">+{vulnCount - topVulns.length} more</p>
             )}
           </div>
         ) : (

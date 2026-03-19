@@ -64,6 +64,7 @@ class VulnOut(BaseModel):
     enables_pivot: bool | None = None
     checked_status: str | None = None
     port: int | None = None
+    source: str | None = None  # exploit_db, nvd, ai
 
 
 class HostOut(BaseModel):
@@ -148,6 +149,7 @@ class AnalyzeResponse(BaseModel):
 
 class VulnStatusUpdate(BaseModel):
     status: str | None = None  # exploited, false_positive, mitigated, or null to clear
+    port: int | None = None  # port to scope status to (same CVE on different ports = independent)
 
 
 class GraphNode(BaseModel):
@@ -203,6 +205,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         enables_pivot=v.get("enables_pivot"),
         checked_status=v.get("checked_status"),
         port=v.get("port"),
+        source=v.get("source"),
     )
 
 
@@ -300,7 +303,7 @@ def list_hosts(
             ORDER BY h.ip
             SKIP $offset LIMIT $limit
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
-            OPTIONAL MATCH (s)-[:HAS_VULN]->(v:Vulnerability)
+            OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    seg.cidr AS segment,
@@ -311,8 +314,8 @@ def list_hosts(
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot, checked_status: v.checked_status,
-                       port: s.port
+                       enables_pivot: v.enables_pivot, checked_status: r.checked_status,
+                       port: s.port, source: v.source
                    }}) AS vulns
             """,
             **params,
@@ -356,7 +359,7 @@ def get_host(ip: str):
             MATCH (h:Host {ip: $ip})
             OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
-            OPTIONAL MATCH (s)-[:HAS_VULN]->(v:Vulnerability)
+            OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    seg.cidr AS segment,
@@ -367,8 +370,8 @@ def get_host(ip: str):
                    collect(DISTINCT {
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot, checked_status: v.checked_status,
-                       port: s.port
+                       enables_pivot: v.enables_pivot, checked_status: r.checked_status,
+                       port: s.port, source: v.source
                    }) AS vulns
             """,
             ip=ip,
@@ -715,16 +718,32 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
         raise HTTPException(status_code=400, detail=f"Invalid status: {body.status}")
 
     with get_session() as session:
-        result = session.run(
-            """
-            MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
-            SET v.checked_status = $status
-            RETURN v.cve_id AS cve_id
-            """,
-            ip=ip,
-            vuln_id=vuln_id,
-            status=body.status,
-        )
+        # Status is stored on the HAS_VULN relationship so the same CVE
+        # on different ports can have independent checked status
+        if body.port is not None:
+            result = session.run(
+                """
+                MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
+                SET r.checked_status = $status
+                RETURN v.cve_id AS cve_id
+                """,
+                ip=ip,
+                port=body.port,
+                vuln_id=vuln_id,
+                status=body.status,
+            )
+        else:
+            # No port specified — update all relationships for this CVE on this host
+            result = session.run(
+                """
+                MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
+                SET r.checked_status = $status
+                RETURN v.cve_id AS cve_id
+                """,
+                ip=ip,
+                vuln_id=vuln_id,
+                status=body.status,
+            )
         record = result.single()
         if not record:
             raise HTTPException(status_code=404, detail=f"Vulnerability {vuln_id} not found on host {ip}")

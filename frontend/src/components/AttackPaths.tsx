@@ -156,11 +156,11 @@ function PathCard({ path, index }: { path: AttackPathOut; index: number }) {
                 <p className="text-gray-600">{node.role} {node.segment && `· ${node.segment}`}</p>
                 {node.vulns.map((v) => (
                   <div key={v.cve_id} className="flex items-start gap-1.5 mt-0.5 ml-2">
-                    <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }} />
+                    <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : getConfidenceColor(v.confidence) }} />
                     <div className="min-w-0">
                       <span className="text-gray-400">{v.cve_id}</span>
                       {v.title && <span className="text-gray-500 ml-1">— {v.title}</span>}
-                      <span className="ml-1" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
+                      <span className="ml-1 font-mono" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
                         [{formatCvss(v.cvss)}]
                       </span>
                       <span
