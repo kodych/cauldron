@@ -54,6 +54,8 @@ class ServiceOut(BaseModel):
     product: str | None = None
     version: str | None = None
     bruteforceable: bool = False
+    is_new: bool = False
+    is_stale: bool = False
 
 
 class VulnOut(BaseModel):
@@ -77,6 +79,9 @@ class HostOut(BaseModel):
     role_confidence: float = 0.0
     os_name: str | None = None
     segment: str | None = None
+    is_new: bool = False
+    is_stale: bool = False
+    has_changes: bool = False
     services: list[ServiceOut] = []
     vulnerabilities: list[VulnOut] = []
 
@@ -214,8 +219,64 @@ def _parse_vuln_record(v: dict) -> VulnOut:
     )
 
 
-def _parse_service_record(s: dict) -> ServiceOut:
+def _get_graph_baseline() -> str | None:
+    """Return the earliest first_seen across all hosts (= graph baseline).
+
+    Hosts whose first_seen > baseline are "new to the graph."
+    On the very first import all hosts share the baseline → none are new.
+    """
+    from cauldron.graph.connection import get_session
+    with get_session() as session:
+        result = session.run("MATCH (h:Host) RETURN min(h.first_seen) AS ts")
+        record = result.single()
+        return record["ts"] if record else None
+
+
+def _compute_host_diff(h_first: str | None, h_last: str | None,
+                       source_first: str | None, source_latest: str | None,
+                       baseline: str | None,
+                       services: list[ServiceOut],
+                       is_pivot: bool = False) -> tuple[bool, bool, bool]:
+    """Compute is_new / is_stale / has_changes for a host.
+
+    is_new uses a global baseline: host is NEW if it first appeared after the
+    earliest host in the graph (= not part of the first import baseline).
+    is_stale uses per-source comparison: host is GONE only when its own scan
+    source was re-used and the host wasn't in the latest scan.
+    Pivot hosts (host IP = ScanSource name) are never stale — scanning from
+    a host proves it's alive.
+    """
+    # is_new: host appeared after the graph baseline (new to the graph)
+    h_is_new = bool(baseline and h_first and h_last
+                    and h_first == h_last and h_first > baseline)
+    # is_stale: source re-used AND host not in latest scan from that source
+    # Pivot hosts are exempt — they're alive (we scanned from them)
+    source_reused = bool(source_first and source_latest
+                         and source_first != source_latest)
+    h_is_stale = bool(not is_pivot and source_reused
+                      and h_last and source_latest
+                      and h_last < source_latest)
+    # Pivot hosts skip service diffs — we used the host as a scanner,
+    # we didn't rescan its own services from the original scan
+    h_has_changes = bool(not is_pivot
+                         and any(s.is_new or s.is_stale for s in services))
+    return h_is_new, h_is_stale, h_has_changes
+
+
+def _parse_service_record(s: dict, host_first_seen: str | None = None,
+                          host_last_seen: str | None = None) -> ServiceOut:
     """Safely convert a Neo4j service dict to ServiceOut, handling None values."""
+    svc_first = s.get("first_seen")
+    svc_last = s.get("last_seen")
+    # Only compute diffs when the host was actually rescanned (not first import)
+    host_rescanned = bool(host_first_seen and host_last_seen
+                          and host_first_seen != host_last_seen)
+    # is_new: service first appeared in the latest scan of this host
+    is_new = bool(host_rescanned and svc_first and svc_last
+                  and svc_first == svc_last and svc_last >= host_last_seen)
+    # is_stale: host was re-scanned but this service wasn't in the latest scan
+    is_stale = bool(host_rescanned and svc_last and host_last_seen
+                    and svc_last < host_last_seen)
     return ServiceOut(
         port=s["port"],
         protocol=s.get("protocol") or "tcp",
@@ -224,6 +285,8 @@ def _parse_service_record(s: dict) -> ServiceOut:
         product=s.get("product"),
         version=s.get("version"),
         bruteforceable=bool(s.get("bruteforceable") or s.get("bruteforceable_manual")),
+        is_new=is_new,
+        is_stale=is_stale,
     )
 
 
@@ -299,7 +362,7 @@ def list_hosts(
         )
         total = count_result.single()["total"]
 
-        # Get hosts with services and vulns
+        # Get hosts with services, vulns, and per-source latest timestamp
         result = session.run(
             f"""
             MATCH (h:Host)
@@ -308,15 +371,23 @@ def list_hosts(
             WITH DISTINCT h, seg
             ORDER BY h.ip
             SKIP $offset LIMIT $limit
+            OPTIONAL MATCH (scan_src:ScanSource)-[:SCANNED_FROM]->(h)
+            OPTIONAL MATCH (pivot_src:ScanSource {{name: h.ip}})
+            WITH h, seg,
+                 min(scan_src.first_seen) AS source_first,
+                 max(scan_src.last_seen) AS source_latest,
+                 pivot_src IS NOT NULL AS is_pivot
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
             OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
-                   seg.cidr AS segment,
+                   h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
+                   seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {{
                        port: s.port, protocol: s.protocol, state: s.state,
                        name: s.name, product: s.product, version: s.version,
-                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual,
+                       first_seen: s.first_seen, last_seen: s.last_seen
                    }}) AS services,
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
@@ -331,16 +402,27 @@ def list_hosts(
             limit=limit,
         )
 
+        baseline = _get_graph_baseline()
+
         hosts = []
         for record in result:
+            h_first = record.get("h_first_seen")
+            h_last = record.get("h_last_seen")
+            src_first = record.get("source_first")
+            src_latest = record.get("source_latest")
+            is_pivot = bool(record.get("is_pivot"))
             services = [
-                _parse_service_record(s) for s in record["services"]
-                if s.get("port") is not None
+                _parse_service_record(s, host_first_seen=h_first,
+                                     host_last_seen=h_last)
+                for s in record["services"] if s.get("port") is not None
             ]
             vulns = [
                 _parse_vuln_record(v) for v in record["vulns"]
                 if v.get("cve_id") is not None
             ]
+            h_is_new, h_is_stale, h_has_changes = _compute_host_diff(
+                h_first, h_last, src_first, src_latest, baseline, services,
+                is_pivot=is_pivot)
             hosts.append(HostOut(
                 ip=record["ip"],
                 hostname=record["hostname"],
@@ -348,6 +430,9 @@ def list_hosts(
                 role_confidence=record["role_confidence"] or 0.0,
                 os_name=record["os_name"],
                 segment=record["segment"],
+                is_new=h_is_new,
+                is_stale=h_is_stale,
+                has_changes=h_has_changes,
                 services=services,
                 vulnerabilities=vulns,
             ))
@@ -366,15 +451,23 @@ def get_host(ip: str):
             """
             MATCH (h:Host {ip: $ip})
             OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
+            OPTIONAL MATCH (scan_src:ScanSource)-[:SCANNED_FROM]->(h)
+            OPTIONAL MATCH (pivot_src:ScanSource {name: h.ip})
+            WITH h, seg,
+                 min(scan_src.first_seen) AS source_first,
+                 max(scan_src.last_seen) AS source_latest,
+                 pivot_src IS NOT NULL AS is_pivot
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
             OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
-                   seg.cidr AS segment,
+                   h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
+                   seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {
                        port: s.port, protocol: s.protocol, state: s.state,
                        name: s.name, product: s.product, version: s.version,
-                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual,
+                       first_seen: s.first_seen, last_seen: s.last_seen
                    }) AS services,
                    collect(DISTINCT {
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
@@ -390,14 +483,24 @@ def get_host(ip: str):
         if not record or not record["ip"]:
             raise HTTPException(status_code=404, detail=f"Host {ip} not found")
 
+        h_first = record.get("h_first_seen")
+        h_last = record.get("h_last_seen")
+        src_first = record.get("source_first")
+        src_latest = record.get("source_latest")
+        is_pivot = bool(record.get("is_pivot"))
         services = [
-            _parse_service_record(s) for s in record["services"]
-            if s.get("port") is not None
+            _parse_service_record(s, host_first_seen=h_first,
+                                 host_last_seen=h_last)
+            for s in record["services"] if s.get("port") is not None
         ]
         vulns = [
             _parse_vuln_record(v) for v in record["vulns"]
             if v.get("cve_id") is not None
         ]
+        baseline = _get_graph_baseline()
+        h_is_new, h_is_stale, h_has_changes = _compute_host_diff(
+            h_first, h_last, src_first, src_latest, baseline, services,
+            is_pivot=is_pivot)
 
         return HostOut(
             ip=record["ip"],
@@ -406,6 +509,9 @@ def get_host(ip: str):
             role_confidence=record["role_confidence"] or 0.0,
             os_name=record["os_name"],
             segment=record["segment"],
+            is_new=h_is_new,
+            is_stale=h_is_stale,
+            has_changes=h_has_changes,
             services=services,
             vulnerabilities=vulns,
         )

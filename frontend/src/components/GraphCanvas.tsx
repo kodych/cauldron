@@ -18,8 +18,10 @@ interface HostVulnInfo {
   vulnCount: number;
   maxCvss: number;
   hasExploit: boolean;
-  role: string;
-  topVulns: VulnOut[]; // top 5 vulns for tooltip
+  isNew: boolean;
+  isStale: boolean;
+  hasChanges: boolean;
+  topVulns: VulnOut[];
 }
 
 export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
@@ -43,7 +45,8 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     [],
   );
 
-  // Build host vuln lookup from hosts data
+  // Build host vuln lookup from hosts data — stored in ref to avoid graph rebuilds
+  const hostVulnMapRef = useRef(new Map<string, HostVulnInfo>());
   const hostVulnMap = useMemo(() => {
     const map = new Map<string, HostVulnInfo>();
     if (!hostsData) return map;
@@ -61,10 +64,13 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         vulnCount: vulns.length,
         maxCvss: vulns.length > 0 ? Math.max(...vulns.map((v) => v.cvss)) : -1,
         hasExploit: vulns.some((v) => v.has_exploit),
-        role: h.role,
+        isNew: h.is_new,
+        isStale: h.is_stale,
+        hasChanges: h.has_changes,
         topVulns: sorted.slice(0, 5),
       });
     }
+    hostVulnMapRef.current = map;
     return map;
   }, [hostsData]);
 
@@ -102,24 +108,13 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       const ip = node.properties.ip as string || node.properties.name as string || '';
       const isScanSource = node.type === 'scan_source' || node.properties.is_scan_source === true;
       const color = getNodeColor(node.type, role);
-      const info = hostVulnMap.get(ip);
 
-      // Node sizing: high-value targets are bigger, vulns add more
+      // Base sizing: high-value roles are bigger; vuln-based sizing applied in nodeReducer
       let size = node.type === 'host' ? 6 : 5;
       if (isScanSource) {
-        size = 8; // Scan sources: visible but not overwhelming
-      } else if (node.type === 'host') {
-        // High-value targets: larger base
-        if (HIGH_VALUE_ROLES.has(roleUpper)) {
-          size = 14;
-        }
-        // Vulns scale size up
-        if (info && info.vulnCount > 0) {
-          size = Math.max(size, 8 + info.vulnCount * 0.5);
-          if (info.maxCvss >= 9.0) size = Math.max(size, 16);
-          else if (info.maxCvss >= 7.0) size = Math.max(size, 12);
-        }
-        size = Math.min(size, 20);
+        size = 8;
+      } else if (node.type === 'host' && HIGH_VALUE_ROLES.has(roleUpper)) {
+        size = 14;
       }
 
       g.addNode(node.id, {
@@ -129,9 +124,6 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         nodeType: node.type,
         role: role || '',
         ip,
-        vulnCount: info?.vulnCount || 0,
-        maxCvss: info?.maxCvss ?? -1,
-        hasExploit: info?.hasExploit || false,
         isScanSource: isScanSource,
         zIndex: isScanSource ? 100 : 1,
       });
@@ -263,7 +255,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     }
 
     return g;
-  }, [data, attackEdgeMap, hostVulnMap]);
+  }, [data, attackEdgeMap]);
 
   // Sigma instance management
   useEffect(() => {
@@ -334,8 +326,10 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     graph.forEachNode((node, attrs) => {
       if (attrs.nodeType !== 'host') return;
       const role = (attrs.role as string || '').toUpperCase();
+      const ip = attrs.ip as string;
+      const info = hostVulnMap.get(ip);
 
-      if (filterVulnOnly && (attrs.vulnCount as number) === 0) {
+      if (filterVulnOnly && (!info || info.vulnCount === 0)) {
         hidden.add(node);
       }
       if (hasRoleFilter && !filterRoles.has(role)) {
@@ -343,7 +337,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       }
     });
     return hidden;
-  }, [graph, filterVulnOnly, filterRoles]);
+  }, [graph, filterVulnOnly, filterRoles, hostVulnMap]);
 
   // Highlight selected host + attack-only filter + graph filters
   useEffect(() => {
@@ -358,21 +352,49 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         return { ...attrs, color: attrs.color + '08', label: '', size: 1.5, zIndex: -1 };
       }
 
+      // Apply hostVulnMap data: vuln-based sizing, diff labels
+      const ip = attrs.ip as string;
+      const info = hostVulnMapRef.current.get(ip);
+      let size = attrs.size as number;
+      let label = attrs.label as string;
+      let forceLabel = false;
+
+      if (info && !attrs.isScanSource) {
+        if (info.vulnCount > 0) {
+          size = Math.max(size, 8 + info.vulnCount * 0.5);
+          if (info.maxCvss >= 9.0) size = Math.max(size, 16);
+          else if (info.maxCvss >= 7.0) size = Math.max(size, 12);
+          size = Math.min(size, 20);
+        }
+        if (info.isStale) {
+          label = `× ${label}`;
+          forceLabel = true;
+        } else if (info.isNew) {
+          label = `★ ${label}`;
+          forceLabel = true;
+        } else if (info.hasChanges) {
+          label = `⚠ ${label}`;
+          forceLabel = true;
+        }
+      }
+
+      const base = { ...attrs, size, label, forceLabel };
+
       // Attack-only mode: dim nodes not in any attack path
       if (attackOnly && !attackNodeIds.has(node)) {
         if (selectedNodeId && node === selectedNodeId) {
-          return { ...attrs, size: attrs.size * 1.8, zIndex: 2 };
+          return { ...base, size: base.size * 1.8, zIndex: 2 };
         }
-        return { ...attrs, color: attrs.color + '15', label: '', size: 2 };
+        return { ...base, color: base.color + '15', label: '', size: 2 };
       }
 
       if (selectedNodeId) {
         if (node === selectedNodeId) {
-          return { ...attrs, size: attrs.size * 1.8, zIndex: 2 };
+          return { ...base, size: base.size * 1.8, zIndex: 2 };
         }
-        return { ...attrs, color: attrs.color + '55', label: '' };
+        return { ...base, color: base.color + '55', label: '' };
       }
-      return attrs;
+      return base;
     });
 
     sigma.setSetting('edgeReducer', (edge, attrs) => {
@@ -412,17 +434,19 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     return {
       ip,
       role: attrs.role as string,
-      vulnCount: (attrs.vulnCount as number) || 0,
-      maxCvss: (attrs.maxCvss as number) ?? -1,
-      hasExploit: (attrs.hasExploit as boolean) || false,
+      vulnCount: info?.vulnCount || 0,
+      maxCvss: info?.maxCvss ?? -1,
+      hasExploit: info?.hasExploit || false,
       isScanSource: (attrs.isScanSource as boolean) || attrs.nodeType === 'scan_source',
+      isNew: info?.isNew || false,
+      isStale: info?.isStale || false,
       topVulns: info?.topVulns || [],
     };
   }, [hoveredNode, graph, hostVulnMap]);
 
   const renderTooltip = useCallback(() => {
     if (!tooltipData) return null;
-    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource, topVulns } = tooltipData;
+    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource, isNew, isStale, topVulns } = tooltipData;
     return (
       <div
         ref={tooltipRef}
@@ -431,6 +455,12 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       >
         <div className="flex items-center gap-2">
           <p className="text-xs font-mono text-gray-100 font-semibold">{ip}</p>
+          {isNew && (
+            <span className="text-xs text-green-400 font-semibold">NEW</span>
+          )}
+          {isStale && (
+            <span className="text-xs text-gray-500 font-semibold">GONE</span>
+          )}
           {isScanSource && (
             <span className="text-xs text-green-400 font-semibold">PIVOT</span>
           )}

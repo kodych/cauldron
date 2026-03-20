@@ -61,6 +61,15 @@ export function HostDetail({ ip, onBack }: Props) {
           <span className="rounded bg-gray-800 px-1.5 py-0.5" style={{ color: getRoleColor(data.role) }}>
             {data.role}
           </span>
+          {data.is_new && (
+            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-green-400 font-semibold">NEW</span>
+          )}
+          {data.is_stale && (
+            <span className="rounded bg-gray-700 px-1.5 py-0.5 text-gray-500 font-semibold">GONE</span>
+          )}
+          {!data.is_new && !data.is_stale && data.has_changes && (
+            <span className="rounded bg-yellow-900/30 px-1.5 py-0.5 text-yellow-400 font-semibold">CHANGED</span>
+          )}
           {data.os_name && (
             <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
           )}
@@ -273,16 +282,22 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
           const portColor = maxCvss > 0 ? getCvssColor(maxCvss) : '#60a5fa';
 
           return (
-            <div key={`${s.port}/${s.protocol}`} className="flex items-center gap-2 text-xs">
+            <div key={`${s.port}/${s.protocol}`} className={`flex items-center gap-2 text-xs ${s.is_stale ? 'opacity-40' : ''}`}>
               <span
-                className="font-mono w-14 text-right shrink-0"
+                className={`font-mono w-14 text-right shrink-0 ${s.is_stale ? 'line-through' : ''}`}
                 style={{ color: portColor }}
               >
                 {s.port}/{s.protocol}
               </span>
-              <span className="text-gray-400 truncate">
+              <span className={`text-gray-400 truncate ${s.is_stale ? 'line-through' : ''}`}>
                 {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
               </span>
+              {s.is_new && (
+                <span className="shrink-0 rounded px-1 py-0 bg-green-900/30 text-green-400 font-semibold">NEW</span>
+              )}
+              {s.is_stale && (
+                <span className="shrink-0 rounded px-1 py-0 bg-gray-700 text-gray-500">GONE</span>
+              )}
               {vCount > 0 && (
                 <span
                   className="shrink-0 rounded px-1 py-0 text-xs"

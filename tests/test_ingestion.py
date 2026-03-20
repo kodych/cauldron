@@ -297,6 +297,138 @@ class TestRealNmapFile:
             assert 636 in ports  # LDAPS
 
 
+class TestScanDiff:
+    """Test scan diff — new/stale detection via timestamps.
+
+    Uses datetime.now() internally (wall-clock), so each ingest_scan()
+    call produces a unique timestamp even for the same scan file.
+    """
+
+    def test_service_gets_timestamps_on_create(self):
+        """Services should have first_seen/last_seen after ingestion."""
+        host = _make_host("10.0.0.1", [(22, "ssh"), (80, "http")])
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            result = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1'}) "
+                "RETURN s.port AS port, s.first_seen AS first_seen, s.last_seen AS last_seen "
+                "ORDER BY port"
+            )
+            records = list(result)
+            assert len(records) == 2
+            for r in records:
+                assert r["first_seen"] is not None
+                assert r["last_seen"] is not None
+                assert r["first_seen"] == r["last_seen"]  # is_new
+
+    def test_service_last_seen_updates_on_reimport(self):
+        """Re-importing updates last_seen but keeps first_seen."""
+        import time
+
+        host = _make_host("10.0.0.1", [(22, "ssh")])
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        time.sleep(0.01)  # ensure distinct wall-clock timestamps
+
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1', port: 22}) "
+                "RETURN s.first_seen AS first_seen, s.last_seen AS last_seen"
+            ).single()
+            assert r["first_seen"] != r["last_seen"]  # NOT new anymore
+            assert r["first_seen"] < r["last_seen"]
+
+    def test_new_service_on_rescan(self):
+        """A new port appearing on rescan has first_seen == last_seen."""
+        import time
+
+        host1 = _make_host("10.0.0.1", [(22, "ssh")])
+        ingest_scan(_make_scan([host1]), source_name="scanner")
+
+        time.sleep(0.01)
+
+        # Second scan adds port 80
+        host2 = _make_host("10.0.0.1", [(22, "ssh"), (80, "http")])
+        ingest_scan(_make_scan([host2]), source_name="scanner")
+
+        with get_session() as session:
+            # SSH: existed before → first_seen != last_seen
+            r = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1', port: 22}) "
+                "RETURN s.first_seen AS fs, s.last_seen AS ls"
+            ).single()
+            assert r["fs"] != r["ls"]
+
+            # HTTP: new → first_seen == last_seen
+            r = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1', port: 80}) "
+                "RETURN s.first_seen AS fs, s.last_seen AS ls"
+            ).single()
+            assert r["fs"] == r["ls"]
+
+    def test_stale_service_detection(self):
+        """Service not in second scan has last_seen < host.last_seen (stale)."""
+        import time
+
+        # First scan: host has SSH + HTTP
+        host1 = _make_host("10.0.0.1", [(22, "ssh"), (80, "http")])
+        ingest_scan(_make_scan([host1]), source_name="scanner")
+
+        time.sleep(0.01)
+
+        # Second scan: host only has SSH (HTTP gone)
+        host2 = _make_host("10.0.0.1", [(22, "ssh")])
+        ingest_scan(_make_scan([host2]), source_name="scanner")
+
+        with get_session() as session:
+            # SSH: re-scanned → last_seen == host.last_seen
+            ssh = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1', port: 22}) "
+                "RETURN s.last_seen AS ls"
+            ).single()
+            host = session.run(
+                "MATCH (h:Host {ip: '10.0.0.1'}) RETURN h.last_seen AS ls"
+            ).single()
+            assert ssh["ls"] == host["ls"]
+
+            # HTTP: stale → last_seen < host.last_seen
+            http = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.1', port: 80}) "
+                "RETURN s.last_seen AS ls"
+            ).single()
+            assert http["ls"] < host["ls"]
+
+    def test_new_host_detection(self):
+        """Host appearing for the first time has first_seen == last_seen."""
+        import time
+
+        host1 = _make_host("10.0.0.1", [(22, "ssh")])
+        ingest_scan(_make_scan([host1]), source_name="scanner")
+
+        time.sleep(0.01)
+
+        # Second scan: original host + new host
+        host2a = _make_host("10.0.0.1", [(22, "ssh")])
+        host2b = _make_host("10.0.0.2", [(80, "http")])
+        ingest_scan(_make_scan([host2a, host2b]), source_name="scanner")
+
+        with get_session() as session:
+            # Old host: first_seen != last_seen
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.1'}) RETURN h.first_seen AS fs, h.last_seen AS ls"
+            ).single()
+            assert r["fs"] != r["ls"]
+
+            # New host: first_seen == last_seen
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.2'}) RETURN h.first_seen AS fs, h.last_seen AS ls"
+            ).single()
+            assert r["fs"] == r["ls"]
+
+
 class TestRoleDistribution:
     """Test role distribution query."""
 

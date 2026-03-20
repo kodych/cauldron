@@ -37,7 +37,10 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
     }
 
     source = source_name or scan.scan_source or "unknown"
-    timestamp = scan.start_time or datetime.now()
+    # Always use wall-clock time for import timestamps so that
+    # re-importing the same (or modified) scan file produces distinct
+    # first_seen / last_seen values, enabling scan-diff detection.
+    timestamp = datetime.now()
     seen_segments: set[str] = set()
 
     with get_session() as session:
@@ -69,7 +72,7 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
             # Upsert services and their scripts
             for service in host.services:
                 if service.state in ("open", "filtered"):
-                    _upsert_service(session, host.ip, service)
+                    _upsert_service(session, host.ip, service, timestamp)
                     stats["services_imported"] += 1
                     # Store script results on the service node
                     for script in service.scripts:
@@ -93,7 +96,7 @@ def _upsert_scan_source(session: Session, name: str, timestamp: datetime, args: 
     session.run(
         """
         MERGE (s:ScanSource {name: $name})
-        ON CREATE SET s.first_seen = $ts, s.scan_args = $args
+        ON CREATE SET s.first_seen = $ts, s.last_seen = $ts, s.scan_args = $args
         ON MATCH SET s.last_seen = $ts
         """,
         name=name,
@@ -176,19 +179,22 @@ def _link_host_to_segment(session: Session, host_ip: str, segment_cidr: str) -> 
     )
 
 
-def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
+def _upsert_service(session: Session, host_ip: str, service: Service, timestamp: datetime | None = None) -> None:
     """Create or update a service node linked to a host.
 
     Services are identified by host_ip + port + protocol combination.
     """
     # Store CPE as semicolon-joined string (Neo4j doesn't have list properties in community)
     cpe_str = ";".join(service.cpe) if service.cpe else None
+    ts = timestamp.isoformat() if timestamp else datetime.now().isoformat()
 
     session.run(
         """
         MATCH (h:Host {ip: $ip})
         MERGE (svc:Service {host_ip: $ip, port: $port, protocol: $protocol})
         ON CREATE SET
+            svc.first_seen = $ts,
+            svc.last_seen = $ts,
             svc.state = $state,
             svc.name = $name,
             svc.product = $product,
@@ -197,6 +203,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
             svc.banner = $banner,
             svc.cpe = $cpe
         ON MATCH SET
+            svc.last_seen = $ts,
             svc.state = $state,
             svc.name = COALESCE($name, svc.name),
             svc.product = COALESCE($product, svc.product),
@@ -206,6 +213,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service) -> None:
         MERGE (h)-[:HAS_SERVICE]->(svc)
         """,
         ip=host_ip,
+        ts=ts,
         port=service.port,
         protocol=service.protocol,
         state=service.state,

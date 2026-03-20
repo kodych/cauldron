@@ -86,7 +86,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
     <div
       className={`border-b border-gray-800/50 transition-colors ${
         selected ? 'bg-indigo-950/30' : 'hover:bg-gray-800/30'
-      }`}
+      } ${host.is_stale ? 'opacity-40' : ''}`}
     >
       <button
         onClick={onClick}
@@ -115,6 +115,21 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               }}
             >
               {vulnCount}V
+            </span>
+          )}
+          {host.is_new && (
+            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-xs text-green-400 font-semibold">
+              NEW
+            </span>
+          )}
+          {host.is_stale && (
+            <span className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-gray-500 font-semibold">
+              GONE
+            </span>
+          )}
+          {!host.is_new && !host.is_stale && host.has_changes && (
+            <span className="rounded bg-yellow-900/30 px-1.5 py-0.5 text-xs text-yellow-400 font-semibold">
+              CHANGED
             </span>
           )}
           {vulnCount > 0 && host.vulnerabilities.some((v) => v.has_exploit) ? (
@@ -221,11 +236,17 @@ function HostServices({ services, vulns }: { services: HostOut['services']; vuln
           const cvss = portCvssMap.get(s.port) || 0;
           const color = cvss > 0 ? getCvssColor(cvss) : '#60a5fa';
           return (
-            <div key={`${s.port}/${s.protocol}`} className="flex items-center gap-2 text-xs">
+            <div key={`${s.port}/${s.protocol}`} className={`flex items-center gap-2 text-xs ${s.is_stale ? 'opacity-40 line-through' : ''}`}>
               <span className="font-mono w-14 text-right" style={{ color }}>{s.port}/{s.protocol}</span>
               <span className="text-gray-400 truncate">
                 {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
               </span>
+              {s.is_new && (
+                <span className="shrink-0 rounded px-1 py-0 bg-green-900/30 text-green-400 font-semibold">NEW</span>
+              )}
+              {s.is_stale && (
+                <span className="shrink-0 rounded px-1 py-0 bg-gray-700 text-gray-500">GONE</span>
+              )}
             </div>
           );
         })}

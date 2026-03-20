@@ -17,6 +17,8 @@ export interface ServiceOut {
   product: string | null;
   version: string | null;
   bruteforceable: boolean;
+  is_new: boolean;
+  is_stale: boolean;
 }
 
 export interface VulnOut {
@@ -40,6 +42,9 @@ export interface HostOut {
   role_confidence: number;
   os_name: string | null;
   segment: string | null;
+  is_new: boolean;
+  is_stale: boolean;
+  has_changes: boolean;
   services: ServiceOut[];
   vulnerabilities: VulnOut[];
 }

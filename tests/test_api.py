@@ -544,6 +544,275 @@ class TestBruteforceable:
         assert resp.status_code == 404
 
 
+class TestScanDiff:
+    """Test is_new / is_stale / has_changes fields in API responses.
+
+    Diff indicators only appear when a source has been re-used (imported
+    more than once).  First import = baseline, no badges.
+    """
+
+    def test_no_badges_on_first_import(self, client):
+        """First import is baseline — no NEW/GONE/CHANGED badges."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (h:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 22, protocol: 'tcp', name: 'ssh',
+                    first_seen: '2026-01-01', last_seen: '2026-01-01'
+                })
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_new"] is False
+        assert data["is_stale"] is False
+        assert data["has_changes"] is False
+        assert data["services"][0]["is_new"] is False
+        assert data["services"][0]["is_stale"] is False
+
+    def test_host_not_new_after_rescan(self, client):
+        """Hosts seen in multiple scans have is_new=False."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 22, protocol: 'tcp', name: 'ssh',
+                    first_seen: '2026-01-01', last_seen: '2026-01-02'
+                })
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        data = resp.json()
+        assert data["is_new"] is False
+        assert data["services"][0]["is_new"] is False
+
+    def test_new_host_on_rescan(self, client):
+        """Host appearing only in second scan has is_new=True."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h2:Host {ip: '10.0.0.2', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h1)
+                CREATE (src)-[:SCANNED_FROM]->(h2)
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.2")
+        data = resp.json()
+        assert data["is_new"] is True
+        assert data["is_stale"] is False
+
+    def test_stale_host_detection(self, client):
+        """Host not in latest scan has is_stale=True."""
+        with get_session() as session:
+            # Same scan source scanned both hosts, then re-scanned only host A
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                               first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h2:Host {ip: '10.0.0.2', role: 'unknown', role_confidence: 0.0,
+                               first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (src)-[:SCANNED_FROM]->(h1)
+                CREATE (src)-[:SCANNED_FROM]->(h2)
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.2")
+        data = resp.json()
+        assert data["is_stale"] is True
+        assert data["is_new"] is False
+
+    def test_service_is_stale(self, client):
+        """Service not re-scanned has is_stale=True."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 22, protocol: 'tcp', name: 'ssh',
+                    first_seen: '2026-01-01', last_seen: '2026-01-02'
+                })
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 80, protocol: 'tcp', name: 'http',
+                    first_seen: '2026-01-01', last_seen: '2026-01-01'
+                })
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        data = resp.json()
+        services = {s["port"]: s for s in data["services"]}
+        assert services[22]["is_stale"] is False  # re-scanned
+        assert services[80]["is_stale"] is True   # gone
+        assert data["has_changes"] is True  # host has stale service
+
+    def test_new_service_on_existing_host(self, client):
+        """New port on re-scanned host: service is_new=True, host has_changes=True."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 22, protocol: 'tcp', name: 'ssh',
+                    first_seen: '2026-01-01', last_seen: '2026-01-02'
+                })
+                CREATE (h)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 80, protocol: 'tcp', name: 'http',
+                    first_seen: '2026-01-02', last_seen: '2026-01-02'
+                })
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        data = resp.json()
+        assert data["is_new"] is False
+        assert data["has_changes"] is True
+        services = {s["port"]: s for s in data["services"]}
+        assert services[22]["is_new"] is False  # existed before
+        assert services[80]["is_new"] is True   # new port
+
+    def test_pivot_hosts_show_as_new(self, client):
+        """Hosts from a pivot (new source) are NEW to the graph."""
+        with get_session() as session:
+            # Source A imported Jan 1 (baseline), Source B (pivot) imported Jan 2
+            session.run("""
+                CREATE (srcA:ScanSource {name: 'scannerA',
+                                         first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (srcB:ScanSource {name: 'scannerB',
+                                         first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (h2:Host {ip: '10.0.1.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (srcA)-[:SCANNED_FROM]->(h1)
+                CREATE (srcB)-[:SCANNED_FROM]->(h2)
+            """)
+        resp = client.get("/api/v1/hosts")
+        hosts = {h["ip"]: h for h in resp.json()["hosts"]}
+        # Source A hosts = baseline → not new
+        assert hosts["10.0.0.1"]["is_new"] is False
+        assert hosts["10.0.0.1"]["is_stale"] is False
+        # Source B hosts = new to the graph (first_seen > baseline)
+        assert hosts["10.0.1.1"]["is_new"] is True
+        assert hosts["10.0.1.1"]["is_stale"] is False
+
+    def test_pivot_does_not_mark_other_source_as_gone(self, client):
+        """Importing from source B must not mark source A hosts as GONE."""
+        with get_session() as session:
+            session.run("""
+                CREATE (srcA:ScanSource {name: 'scannerA',
+                                         first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (srcB:ScanSource {name: 'scannerB',
+                                         first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (h2:Host {ip: '10.0.1.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (srcA)-[:SCANNED_FROM]->(h1)
+                CREATE (srcB)-[:SCANNED_FROM]->(h2)
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        data = resp.json()
+        assert data["is_stale"] is False, "Pivot must not mark other source's hosts as GONE"
+
+    def test_rescan_shows_gone_and_new(self, client):
+        """Re-scanning same source: missing host=GONE, new host=NEW."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h2:Host {ip: '10.0.0.2', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (h3:Host {ip: '10.0.0.3', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h1)
+                CREATE (src)-[:SCANNED_FROM]->(h2)
+                CREATE (src)-[:SCANNED_FROM]->(h3)
+            """)
+        resp = client.get("/api/v1/hosts")
+        hosts = {h["ip"]: h for h in resp.json()["hosts"]}
+        assert hosts["10.0.0.1"]["is_new"] is False   # rescanned, not new
+        assert hosts["10.0.0.1"]["is_stale"] is False
+        assert hosts["10.0.0.2"]["is_stale"] is True   # GONE
+        assert hosts["10.0.0.3"]["is_new"] is True     # NEW (first_seen > baseline)
+
+    def test_pivot_host_not_stale(self, client):
+        """Host used as scan source (pivot) is never stale — it's alive."""
+        with get_session() as session:
+            # Source "scanner1" scanned 10.0.0.1 twice (re-used)
+            # Then user scanned FROM 10.0.0.1 (pivot) — source name = host IP
+            # 10.0.0.1 wasn't in the rescan, but it's a pivot → not stale
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (pivot_src:ScanSource {name: '10.0.0.1',
+                                              first_seen: '2026-01-03', last_seen: '2026-01-03'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (h2:Host {ip: '10.0.0.2', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (h3:Host {ip: '10.0.1.1', role: 'unknown', role_confidence: 0.0,
+                                 first_seen: '2026-01-03', last_seen: '2026-01-03'})
+                CREATE (src)-[:SCANNED_FROM]->(h1)
+                CREATE (src)-[:SCANNED_FROM]->(h2)
+                CREATE (pivot_src)-[:SCANNED_FROM]->(h3)
+            """)
+        resp = client.get("/api/v1/hosts")
+        hosts = {h["ip"]: h for h in resp.json()["hosts"]}
+        # 10.0.0.1: would be stale (not in rescan) BUT it's a pivot → not stale
+        assert hosts["10.0.0.1"]["is_stale"] is False
+        assert hosts["10.0.0.1"]["has_changes"] is False
+        # 10.0.0.2: rescanned normally
+        assert hosts["10.0.0.2"]["is_stale"] is False
+        # 10.0.1.1: discovered via pivot → new to graph
+        assert hosts["10.0.1.1"]["is_new"] is True
+
+    def test_pivot_host_services_not_changed(self, client):
+        """Pivot host with services from original scan must not show CHANGED.
+
+        When host 10.0.0.1 is used as pivot and also appears in the pivot scan,
+        its last_seen updates but original services weren't rescanned —
+        they must NOT appear as GONE.
+        """
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner1',
+                                        first_seen: '2026-01-01', last_seen: '2026-01-01'})
+                CREATE (pivot_src:ScanSource {name: '10.0.0.1',
+                                              first_seen: '2026-01-02', last_seen: '2026-01-02'})
+                CREATE (h1:Host {ip: '10.0.0.1', role: 'web_server', role_confidence: 0.8,
+                                 first_seen: '2026-01-01', last_seen: '2026-01-02'})
+                CREATE (src)-[:SCANNED_FROM]->(h1)
+                CREATE (pivot_src)-[:SCANNED_FROM]->(h1)
+                CREATE (h1)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 443, protocol: 'tcp', name: 'https',
+                    first_seen: '2026-01-01', last_seen: '2026-01-01'
+                })
+                CREATE (h1)-[:HAS_SERVICE]->(:Service {
+                    host_ip: '10.0.0.1', port: 80, protocol: 'tcp', name: 'http',
+                    first_seen: '2026-01-01', last_seen: '2026-01-01'
+                })
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.1")
+        data = resp.json()
+        # Pivot host: not stale, not changed (services from original scan preserved)
+        assert data["is_stale"] is False
+        assert data["has_changes"] is False
+        assert data["is_new"] is False
+
+
 class TestReset:
     def test_reset_clears_database(self, client):
         _setup_test_network()
