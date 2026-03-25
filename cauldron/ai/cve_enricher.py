@@ -333,10 +333,9 @@ PENTESTER_CWE_IDS: set[str] = {
     "CWE-611",  # XXE
     "CWE-918",  # SSRF
     # Memory corruption (useful for known exploits)
-    "CWE-119",  # Buffer Overflow
+    # NOTE: CWE-119 (generic buffer overflow) excluded — NVD assigns it too broadly
     "CWE-120",  # Classic Buffer Overflow
     "CWE-122",  # Heap Buffer Overflow
-    "CWE-125",  # Out-of-bounds Read (info leak → chain)
     "CWE-416",  # Use After Free
     "CWE-787",  # Out-of-bounds Write
     # Credentials / secrets

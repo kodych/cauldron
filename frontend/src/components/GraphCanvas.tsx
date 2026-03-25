@@ -109,12 +109,12 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       const isScanSource = node.type === 'scan_source' || node.properties.is_scan_source === true;
       const color = getNodeColor(node.type, role);
 
-      // Base sizing: high-value roles are bigger; vuln-based sizing applied in nodeReducer
-      let size = node.type === 'host' ? 6 : 5;
+      // Base sizing: vuln-based sizing applied in nodeReducer
+      let size = node.type === 'host' ? 8 : 5;
       if (isScanSource) {
         size = 8;
       } else if (node.type === 'host' && HIGH_VALUE_ROLES.has(roleUpper)) {
-        size = 14;
+        size = 10;
       }
 
       g.addNode(node.id, {
@@ -146,21 +146,16 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       }
     }
 
-    // Attack path edges — red, thickness by vuln count
-    for (const [pathEdgeKey, vulnCount] of attackEdgeMap) {
+    // Attack path edges — red, thin, arrow
+    for (const [pathEdgeKey] of attackEdgeMap) {
       const [src, tgt] = pathEdgeKey.split('->');
       if (g.hasNode(src) && g.hasNode(tgt)) {
         const atkKey = `atk:${pathEdgeKey}`;
         if (!g.hasEdge(atkKey)) {
-          // Thickness: 1.5 base, logarithmic scaling, caps at 6
-          const thickness = Math.min(6, 1.5 + Math.log2(1 + vulnCount) * 0.9);
-
           g.addEdgeWithKey(atkKey, src, tgt, {
             type: 'arrow',
-            size: thickness,
-            color: vulnCount >= 5 ? '#ef4444ee' :
-                   vulnCount >= 3 ? '#f97316dd' :
-                                    '#ef444499',
+            size: 1.5,
+            color: '#ef4444',
             edgeType: 'attack',
             zIndex: 10,
           });
@@ -361,10 +356,17 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
       if (info && !attrs.isScanSource) {
         if (info.vulnCount > 0) {
-          size = Math.max(size, 8 + info.vulnCount * 0.5);
-          if (info.maxCvss >= 9.0) size = Math.max(size, 16);
-          else if (info.maxCvss >= 7.0) size = Math.max(size, 12);
-          size = Math.min(size, 20);
+          if (info.hasExploit) {
+            // Has public exploit — largest: 14 base + increment
+            size = Math.max(size, 14 + info.vulnCount * 0.4);
+          } else if (info.maxCvss >= 7.0) {
+            // High CVSS — medium: 10 base + increment
+            size = Math.max(size, 10 + info.vulnCount * 0.4);
+          } else {
+            // Low/medium CVSS — small bump
+            size = Math.max(size, 8 + info.vulnCount * 0.3);
+          }
+          size = Math.min(size, 22);
         }
         if (info.isStale) {
           label = `× ${label}`;

@@ -80,26 +80,63 @@ export function HostDetail({ ip, onBack }: Props) {
         {/* Services */}
         <ServicesList services={data.services} vulns={data.vulnerabilities} hostIp={ip} onUpdated={refetch} />
 
-        <div>
-          <div className="flex items-center gap-1.5 px-3 py-2">
-            <Bug size={13} className="text-red-400" />
-            <span className="text-xs font-medium text-gray-400">Vulnerabilities ({data.vulnerabilities.length})</span>
-          </div>
-          <div className="px-3 pb-2 space-y-1">
-            {data.vulnerabilities.map((v) => (
-              <VulnRow key={v.cve_id} vuln={v} hostIp={ip} onUpdated={refetch} />
-            ))}
-            {data.vulnerabilities.length === 0 && (
-              <p className="text-xs text-gray-600">No vulnerabilities</p>
-            )}
-          </div>
-        </div>
+        <VulnsList vulns={data.vulnerabilities} hostIp={ip} onUpdated={refetch} />
       </div>
     </div>
   );
 }
 
-function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; onUpdated: () => void }) {
+/** Group vulns by cve_id, merge ports, show deduped list. */
+function VulnsList({ vulns, hostIp, onUpdated }: {
+  vulns: HostOut['vulnerabilities'];
+  hostIp: string;
+  onUpdated: () => void;
+}) {
+  const grouped = useMemo(() => {
+    const map = new Map<string, { vuln: VulnOut; ports: number[] }>();
+    for (const v of vulns) {
+      const existing = map.get(v.cve_id);
+      if (existing) {
+        if (v.port != null && !existing.ports.includes(v.port)) {
+          existing.ports.push(v.port);
+        }
+        // Keep highest CVSS, exploit info, worst status
+        if (v.cvss > existing.vuln.cvss) existing.vuln = { ...existing.vuln, cvss: v.cvss };
+        if (v.has_exploit && !existing.vuln.has_exploit) existing.vuln = { ...existing.vuln, has_exploit: true };
+        if (v.exploit_url && !existing.vuln.exploit_url) existing.vuln = { ...existing.vuln, exploit_url: v.exploit_url };
+        if (v.exploit_module && !existing.vuln.exploit_module) existing.vuln = { ...existing.vuln, exploit_module: v.exploit_module };
+      } else {
+        map.set(v.cve_id, { vuln: v, ports: v.port != null ? [v.port] : [] });
+      }
+    }
+    // Sort ports within each group
+    for (const entry of map.values()) {
+      entry.ports.sort((a, b) => a - b);
+    }
+    return [...map.values()];
+  }, [vulns]);
+
+  return (
+    <div>
+      <div className="flex items-center gap-1.5 px-3 py-2">
+        <Bug size={13} className="text-red-400" />
+        <span className="text-xs font-medium text-gray-400">
+          Vulnerabilities ({grouped.length}{grouped.length !== vulns.length ? ` on ${vulns.length} ports` : ''})
+        </span>
+      </div>
+      <div className="px-3 pb-2 space-y-1">
+        {grouped.map(({ vuln, ports }) => (
+          <VulnRow key={vuln.cve_id} vuln={vuln} ports={ports} hostIp={hostIp} onUpdated={onUpdated} />
+        ))}
+        {grouped.length === 0 && (
+          <p className="text-xs text-gray-600">No vulnerabilities</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: number[]; hostIp: string; onUpdated: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const [updating, setUpdating] = useState(false);
   const currentStatus = vuln.checked_status || null;
@@ -108,14 +145,19 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
     setUpdating(true);
     try {
       const newStatus = status === currentStatus ? null : status;
-      await api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, vuln.port);
+      // Apply status to all affected ports
+      await Promise.all(
+        ports.length > 0
+          ? ports.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, p))
+          : [api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, vuln.port)]
+      );
       onUpdated();
     } catch (e) {
       console.error('Failed to update vuln status:', e);
     } finally {
       setUpdating(false);
     }
-  }, [hostIp, vuln.cve_id, vuln.port, currentStatus, onUpdated]);
+  }, [hostIp, vuln.cve_id, vuln.port, ports, currentStatus, onUpdated]);
 
   return (
     <div className={`rounded bg-gray-800/30 ${currentStatus === 'false_positive' ? 'opacity-50' : ''}`}>
@@ -123,9 +165,9 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
         onClick={() => setExpanded(!expanded)}
         className="w-full px-2 py-1.5 text-left flex items-center gap-2"
       >
-        {vuln.port != null && (
-          <span className="font-mono text-xs text-gray-500 shrink-0 w-10 text-right">
-            :{vuln.port}
+        {ports.length > 0 && (
+          <span className="font-mono text-xs text-gray-500 shrink-0" title={ports.join(', ')}>
+            :{ports[0]}{ports.length > 1 && <span className="text-gray-600">+{ports.length - 1}</span>}
           </span>
         )}
         {vuln.cvss > 0 && (
@@ -173,6 +215,9 @@ function VulnRow({ vuln, hostIp, onUpdated }: { vuln: VulnOut; hostIp: string; o
 
       {expanded && (
         <div className="px-2 pb-2 space-y-1.5">
+          {ports.length > 1 && (
+            <p className="text-xs text-gray-500 font-mono">Ports: {ports.join(', ')}</p>
+          )}
           {vuln.description && (
             <p className="text-xs text-gray-500">{vuln.description}</p>
           )}
