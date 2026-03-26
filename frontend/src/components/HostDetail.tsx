@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -178,7 +178,27 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             {vuln.cvss.toFixed(1)}
           </span>
         )}
-        <span className="text-xs text-gray-300 truncate flex-1">{vuln.cve_id}</span>
+        <span className="text-xs text-gray-300 truncate flex-1 flex items-center gap-1">
+          <span
+            className="truncate hover:text-white cursor-pointer"
+            title="Click to copy"
+            onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(vuln.cve_id); }}
+          >
+            {vuln.cve_id}
+          </span>
+          {vuln.cve_id.startsWith('CVE-') && (
+            <a
+              href={`https://nvd.nist.gov/vuln/detail/${vuln.cve_id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 text-gray-600 hover:text-blue-400"
+              title="Open in NVD"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ExternalLink size={10} />
+            </a>
+          )}
+        </span>
         <span
           className="text-xs shrink-0"
           style={{ color: getConfidenceColor(vuln.confidence) }}

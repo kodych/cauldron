@@ -9,7 +9,12 @@ import pytest
 
 from cauldron.ai.analyzer import (
     AnalysisResult,
+    _anonymize_text,
+    _build_anonymization_map,
+    _deanonymize_hosts,
+    _parse_attack_insights,
     _parse_classification_response,
+    _parse_fp_response,
     _parse_json_response,
     analyze_graph,
     is_ai_available,
@@ -197,12 +202,12 @@ class TestAnalyzeGraph:
 
 
 class TestApplyAiCves:
-    def test_valid_cve_response(self):
+    def test_index_based_matching(self):
         from cauldron.ai.analyzer import _apply_ai_cves
 
+        pairs = [("Apache", "2.4.49"), ("nginx", "1.14.1")]
         response = json.dumps([{
-            "product": "Apache",
-            "version": "2.4.49",
+            "index": 0,
             "cves": [{
                 "cve_id": "CVE-2021-41773",
                 "cvss": 7.5,
@@ -216,18 +221,41 @@ class TestApplyAiCves:
             mock_session = MagicMock()
             mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
             mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+            # Mock link query to return linked=1
+            mock_result = MagicMock()
+            mock_result.single.return_value = {"linked": 1}
+            mock_session.run.return_value = mock_result
 
-            cves, services = _apply_ai_cves(response)
+            cves, services = _apply_ai_cves(response, pairs)
             assert cves == 1
             assert services == 1
-            assert mock_session.run.call_count == 2  # MERGE vuln + link to service
 
-    def test_skips_invalid_cve_ids(self):
+    def test_fallback_to_product_version(self):
+        """When no index provided, falls back to product+version fields."""
         from cauldron.ai.analyzer import _apply_ai_cves
 
         response = json.dumps([{
             "product": "Apache",
             "version": "2.4.49",
+            "cves": [{"cve_id": "CVE-2021-41773", "cvss": 7.5}],
+        }])
+
+        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
+            mock_session = MagicMock()
+            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+            mock_result = MagicMock()
+            mock_result.single.return_value = {"linked": 1}
+            mock_session.run.return_value = mock_result
+
+            cves, services = _apply_ai_cves(response)
+            assert cves == 1
+
+    def test_skips_invalid_cve_ids(self):
+        from cauldron.ai.analyzer import _apply_ai_cves
+
+        response = json.dumps([{
+            "index": 0,
             "cves": [{"cve_id": "NOT-A-CVE", "cvss": 5.0}],
         }])
 
@@ -236,7 +264,7 @@ class TestApplyAiCves:
             mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
             mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
 
-            cves, services = _apply_ai_cves(response)
+            cves, services = _apply_ai_cves(response, [("Apache", "2.4.49")])
             assert cves == 0
             assert services == 0
 
@@ -386,3 +414,179 @@ class TestApplyClassifications:
         from cauldron.ai.analyzer import _apply_classifications
 
         assert _apply_classifications([]) == 0
+
+
+# --- Anonymization tests ---
+
+
+class TestBuildAnonymizationMap:
+    def test_basic_mapping(self):
+        ip_map, reverse_map = _build_anonymization_map(["10.0.0.5", "10.0.0.1", "10.0.0.3"])
+        assert ip_map["10.0.0.1"] == "host-1"
+        assert ip_map["10.0.0.3"] == "host-2"
+        assert ip_map["10.0.0.5"] == "host-3"
+        assert reverse_map["host-1"] == "10.0.0.1"
+
+    def test_deduplicates(self):
+        ip_map, _ = _build_anonymization_map(["10.0.0.1", "10.0.0.1", "10.0.0.2"])
+        assert len(ip_map) == 2
+
+    def test_empty(self):
+        ip_map, reverse_map = _build_anonymization_map([])
+        assert ip_map == {}
+        assert reverse_map == {}
+
+    def test_numeric_sort(self):
+        """IPs should be sorted numerically, not lexicographically."""
+        ip_map, _ = _build_anonymization_map(["10.0.0.9", "10.0.0.10", "10.0.0.2"])
+        assert ip_map["10.0.0.2"] == "host-1"
+        assert ip_map["10.0.0.9"] == "host-2"
+        assert ip_map["10.0.0.10"] == "host-3"
+
+
+class TestAnonymizeText:
+    def test_replaces_ips(self):
+        text = "Host 10.0.0.1 has port 22. Host 10.0.0.2 has port 80."
+        ip_map = {"10.0.0.1": "host-1", "10.0.0.2": "host-2"}
+        result = _anonymize_text(text, ip_map)
+        assert "10.0.0.1" not in result
+        assert "10.0.0.2" not in result
+        assert "host-1" in result
+        assert "host-2" in result
+
+    def test_strips_hostnames(self):
+        text = "  10.0.0.1 [web_server] (DC01.client.local) OS:Windows"
+        ip_map = {"10.0.0.1": "host-1"}
+        result = _anonymize_text(text, ip_map, hostnames={"DC01.client.local"})
+        assert "DC01.client.local" not in result
+        assert "()" not in result
+        assert "host-1" in result
+
+    def test_removes_segments(self):
+        text = "--- Segment: 10.0.0.0/24 ---\nhost data\n=== SEGMENT CONNECTIVITY ===\n10.0.0.0/24 -> 10.0.1.0/24"
+        result = _anonymize_text(text, {})
+        assert "Segment:" not in result
+        assert "CONNECTIVITY" not in result
+
+    def test_no_ip_leakage_with_similar_ips(self):
+        """10.0.0.1 should not partially match inside 10.0.0.10."""
+        text = "10.0.0.1 and 10.0.0.10"
+        ip_map = {"10.0.0.1": "host-1", "10.0.0.10": "host-2"}
+        result = _anonymize_text(text, ip_map)
+        assert result == "host-1 and host-2"
+
+
+class TestDeanonymizeHosts:
+    def test_basic(self):
+        reverse = {"host-1": "10.0.0.1", "host-2": "10.0.0.2"}
+        result = _deanonymize_hosts(["host-1", "host-2"], reverse)
+        assert result == ["10.0.0.1", "10.0.0.2"]
+
+    def test_unknown_alias_preserved(self):
+        result = _deanonymize_hosts(["host-99"], {"host-1": "10.0.0.1"})
+        assert result == ["host-99"]
+
+    def test_empty(self):
+        assert _deanonymize_hosts([], {}) == []
+
+
+class TestParseClassificationAnonymized:
+    def test_deanonymizes_id_field(self):
+        response = json.dumps([
+            {"id": "host-1", "role": "web_server", "confidence": 0.85},
+        ])
+        reverse = {"host-1": "10.0.0.1"}
+        result = _parse_classification_response(response, reverse)
+        assert len(result) == 1
+        assert result[0]["ip"] == "10.0.0.1"
+        assert result[0]["role"] == "web_server"
+
+    def test_legacy_ip_field_still_works(self):
+        response = json.dumps([
+            {"ip": "10.0.0.1", "role": "database", "confidence": 0.9},
+        ])
+        result = _parse_classification_response(response)
+        assert len(result) == 1
+        assert result[0]["ip"] == "10.0.0.1"
+
+
+class TestParseAttackInsightsAnonymized:
+    def test_deanonymizes_hosts(self):
+        response = json.dumps([{
+            "type": "attack_chain",
+            "title": "DC to DB lateral movement",
+            "hosts": ["host-1", "host-2"],
+            "priority": 1,
+            "confidence": 0.9,
+            "details": "Exploit DC then pivot to DB",
+        }])
+        reverse = {"host-1": "10.0.0.1", "host-2": "10.0.0.2"}
+        result = _parse_attack_insights(response, reverse)
+        assert len(result) == 1
+        assert result[0].hosts == ["10.0.0.1", "10.0.0.2"]
+
+    def test_without_reverse_map(self):
+        response = json.dumps([{
+            "type": "attack_chain",
+            "title": "Test",
+            "hosts": ["host-1"],
+            "priority": 2,
+            "confidence": 0.8,
+            "details": "test",
+        }])
+        result = _parse_attack_insights(response)
+        assert result[0].hosts == ["host-1"]
+
+
+class TestParseFpResponse:
+    def test_valid_response(self):
+        response = json.dumps([{
+            "id": "host-1",
+            "false_positives": [
+                {"cve_id": "CVE-2012-4791", "port": 3875, "reason": "DoS only, CVSS 3.5"},
+            ],
+        }])
+        reverse = {"host-1": "10.0.0.1"}
+        result = _parse_fp_response(response, reverse)
+        assert len(result) == 1
+        assert result[0]["ip"] == "10.0.0.1"
+        assert result[0]["cve_id"] == "CVE-2012-4791"
+        assert result[0]["port"] == 3875
+
+    def test_filters_invalid_cve_ids(self):
+        response = json.dumps([{
+            "id": "host-1",
+            "false_positives": [
+                {"cve_id": "NOT-A-CVE", "port": 22, "reason": "bad"},
+                {"cve_id": "CVE-2021-44228", "port": 8080, "reason": "not applicable"},
+            ],
+        }])
+        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
+        assert len(result) == 1
+        assert result[0]["cve_id"] == "CVE-2021-44228"
+
+    def test_accepts_cauldron_ids(self):
+        response = json.dumps([{
+            "id": "host-1",
+            "false_positives": [
+                {"cve_id": "CAULDRON-271", "port": 5985, "reason": "WinRM not exploitable"},
+            ],
+        }])
+        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
+        assert len(result) == 1
+
+    def test_empty_response(self):
+        assert _parse_fp_response("[]", {}) == []
+
+    def test_invalid_json(self):
+        assert _parse_fp_response("not json", {}) == []
+
+    def test_missing_port_skipped(self):
+        response = json.dumps([{
+            "id": "host-1",
+            "false_positives": [
+                {"cve_id": "CVE-2021-44228", "reason": "no port"},
+            ],
+        }])
+        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
+        assert len(result) == 0

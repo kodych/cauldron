@@ -153,6 +153,7 @@ class AnalyzeResponse(BaseModel):
     cve_enrichment: dict[str, Any]
     topology: dict[str, Any]
     path_summary: dict[str, Any]
+    ai_false_positives: int = 0
 
 
 class VulnStatusUpdate(BaseModel):
@@ -813,10 +814,12 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
     summary = get_path_summary()
 
     # Phase 6: AI (optional)
+    ai_fp_count = 0
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
-            analyze_graph()
+            ai_result = analyze_graph()
+            ai_fp_count = ai_result.false_positives_found
 
     return AnalyzeResponse(
         classification=classification,
@@ -825,6 +828,7 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
         cve_enrichment=cve_stats,
         topology=topo_stats,
         path_summary=summary,
+        ai_false_positives=ai_fp_count,
     )
 
 

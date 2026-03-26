@@ -363,7 +363,9 @@ def boil(ai: bool):
                 for insight in ai_result.insights[:5]:
                     prio_color = "red" if insight.priority <= 2 else "yellow" if insight.priority <= 3 else "dim"
                     console.print(f"      [{prio_color}]P{insight.priority}[/{prio_color}] {insight.title}")
-            if not any([ai_result.cves_found, ai_result.ambiguous_classified, ai_result.insights]):
+            if ai_result.false_positives_found:
+                console.print(f"  [green]+[/green] Marked {ai_result.false_positives_found} CVEs as AI-detected false positives")
+            if not any([ai_result.cves_found, ai_result.ambiguous_classified, ai_result.insights, ai_result.false_positives_found]):
                 console.print("  [dim]  No new findings[/dim]")
 
             # AI CVEs are immediately available for path discovery

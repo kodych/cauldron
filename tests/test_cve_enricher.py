@@ -508,7 +508,7 @@ class TestPentesterRelevance:
         assert _is_pentester_relevant(cve) is True
 
     def test_ssrf_cwe_relevant(self):
-        cve = CVEInfo(cve_id="CVE-2024-0001", cvss=5.0, cwe_ids=["CWE-918"])
+        cve = CVEInfo(cve_id="CVE-2024-0001", cvss=7.0, cwe_ids=["CWE-918"])
         assert _is_pentester_relevant(cve) is True
 
     def test_deserialization_cwe_relevant(self):
@@ -516,8 +516,13 @@ class TestPentesterRelevance:
         assert _is_pentester_relevant(cve) is True
 
     def test_path_traversal_cwe_relevant(self):
-        cve = CVEInfo(cve_id="CVE-2024-0001", cvss=5.5, cwe_ids=["CWE-22"])
+        cve = CVEInfo(cve_id="CVE-2024-0001", cvss=6.5, cwe_ids=["CWE-22"])
         assert _is_pentester_relevant(cve) is True
+
+    def test_cwe_below_threshold_dropped(self):
+        """CWE match with CVSS < 6.0 is filtered out as trivial."""
+        cve = CVEInfo(cve_id="CVE-2024-0001", cvss=3.7, cwe_ids=["CWE-287"])
+        assert _is_pentester_relevant(cve) is False
 
     def test_file_upload_cwe_relevant(self):
         cve = CVEInfo(cve_id="CVE-2024-0001", cvss=6.0, cwe_ids=["CWE-434"])

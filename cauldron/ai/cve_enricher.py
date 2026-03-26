@@ -408,9 +408,10 @@ def _is_pentester_relevant(cve: CVEInfo) -> bool:
     if cve.has_exploit:
         return True
 
-    # 2. CWE-based check
+    # 2. CWE-based check (require CVSS >= 6.0 to filter trivial matches)
     if cve.cwe_ids and PENTESTER_CWE_IDS.intersection(cve.cwe_ids):
-        return True
+        if cve.cvss is None or cve.cvss >= 6.0:
+            return True
 
     # 3. CVSS vector analysis: network-accessible + high impact
     if cve.cvss_vector and cve.cvss is not None and cve.cvss >= 7.0:
