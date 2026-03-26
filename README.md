@@ -120,11 +120,11 @@ ruff check .
 - [x] Nmap XML parser
 - [x] Neo4j graph ingestion
 - [x] CLI interface
-- [ ] Host role classification
-- [ ] CVE enrichment
-- [ ] AI attack path analysis
-- [ ] REST API
-- [ ] Web UI with graph visualization
+- [x] Host role classification
+- [x] CVE enrichment
+- [x] AI attack path analysis
+- [x] REST API
+- [x] Web UI with graph visualization
 - [ ] Report generation
 
 ## License
