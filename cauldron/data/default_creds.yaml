@@ -1,0 +1,329 @@
+# Default/known credentials database for Cauldron
+# Source: DefaultCreds-cheat-sheet (curated subset for pentesting)
+# Format: product patterns → list of username:password pairs
+#
+# Rules:
+# - Only include credentials useful for network pentesting
+# - product_regex matches service product field (case-insensitive)
+# - ports restrict matching to specific ports (optional)
+# - <blank> means empty string
+# - Ordered by likelihood of success
+
+- product_regex: "postgresql|postgres"
+  ports: [5432]
+  creds:
+    - ["postgres", ""]
+    - ["postgres", "postgres"]
+    - ["admin", "admin"]
+    - ["admin", "password"]
+
+- product_regex: "mysql|mariadb"
+  ports: [3306]
+  creds:
+    - ["root", ""]
+    - ["root", "root"]
+    - ["root", "mysql"]
+    - ["admin", "admin"]
+
+- product_regex: "mssql|sql.server|ms-sql"
+  ports: [1433, 55299]
+  creds:
+    - ["sa", ""]
+    - ["sa", "sa"]
+    - ["sa", "Password123"]
+    - ["sa", "RPSsql12345"]
+
+- product_regex: "oracle"
+  ports: [1521]
+  creds:
+    - ["system", "oracle"]
+    - ["system", "manager"]
+    - ["sys", "change_on_install"]
+    - ["scott", "tiger"]
+    - ["dbsnmp", "dbsnmp"]
+
+- product_regex: "mongodb"
+  ports: [27017, 27018]
+  creds:
+    - ["", ""]
+    - ["admin", "admin"]
+    - ["root", "root"]
+
+- product_regex: "redis"
+  ports: [6379]
+  creds:
+    - ["", ""]
+
+- product_regex: "elasticsearch"
+  ports: [9200, 9300]
+  creds:
+    - ["", ""]
+    - ["elastic", "changeme"]
+    - ["elastic", "elastic"]
+
+- product_regex: "cassandra"
+  ports: [9042]
+  creds:
+    - ["cassandra", "cassandra"]
+
+- product_regex: "couchdb"
+  ports: [5984]
+  creds:
+    - ["admin", "password"]
+    - ["admin", "admin"]
+
+- product_regex: "neo4j"
+  ports: [7474, 7687]
+  creds:
+    - ["neo4j", "neo4j"]
+
+- product_regex: "influxdb"
+  ports: [8086]
+  creds:
+    - ["admin", "admin"]
+
+- product_regex: "rabbitmq"
+  ports: [5672, 15672]
+  creds:
+    - ["guest", "guest"]
+
+- product_regex: "memcached"
+  ports: [11211]
+  creds:
+    - ["", ""]
+
+- product_regex: "openssh|ssh"
+  ports: [22]
+  creds:
+    - ["root", "root"]
+    - ["root", "toor"]
+    - ["root", "alpine"]
+    - ["admin", "admin"]
+    - ["user", "user"]
+
+- product_regex: "telnet"
+  ports: [23]
+  creds:
+    - ["admin", "admin"]
+    - ["root", "root"]
+    - ["admin", "1234"]
+    - ["root", "7ujMko0admin"]
+
+- product_regex: "ftp|proftpd|vsftpd|filezilla"
+  ports: [21]
+  creds:
+    - ["anonymous", ""]
+    - ["ftp", "ftp"]
+    - ["admin", "admin"]
+
+- product_regex: "samba|smb|microsoft-ds|netbios"
+  ports: [445, 139]
+  creds:
+    - ["", ""]
+    - ["guest", ""]
+    - ["admin", "admin"]
+    - ["Administrator", ""]
+
+- product_regex: "vnc"
+  ports: [5900, 5901]
+  creds:
+    - ["", "1234"]
+    - ["", "password"]
+    - ["", "vnc"]
+
+- product_regex: "rdp|terminal.services|ms-wbt"
+  ports: [3389]
+  creds:
+    - ["administrator", ""]
+    - ["admin", "admin"]
+    - ["admin", "1234"]
+
+- product_regex: "snmp"
+  ports: [161]
+  creds:
+    - ["", "public"]
+    - ["", "private"]
+    - ["", "community"]
+    - ["", "snmp"]
+
+- product_regex: "ipmi"
+  ports: [623]
+  creds:
+    - ["admin", "admin"]
+    - ["root", "calvin"]
+    - ["ADMIN", "ADMIN"]
+
+- product_regex: "ilo|integrated.lights"
+  ports: [443, 17988]
+  creds:
+    - ["admin", "admin"]
+    - ["Administrator", ""]
+
+- product_regex: "idrac"
+  ports: [443]
+  creds:
+    - ["root", "calvin"]
+
+- product_regex: "supermicro"
+  ports: [443, 80]
+  creds:
+    - ["ADMIN", "ADMIN"]
+    - ["ADMIN", "admin"]
+
+- product_regex: "cisco"
+  ports: [22, 23, 443]
+  creds:
+    - ["admin", "admin"]
+    - ["admin", ""]
+    - ["cisco", "cisco"]
+    - ["admin", "changeme"]
+
+- product_regex: "fortigate|fortinet|fortios"
+  ports: [22, 443]
+  creds:
+    - ["admin", ""]
+    - ["admin", "admin"]
+
+- product_regex: "juniper|junos"
+  ports: [22, 443]
+  creds:
+    - ["admin", "abc123"]
+    - ["root", ""]
+    - ["admin", "netscreen"]
+
+- product_regex: "mikrotik"
+  ports: [22, 8728, 8291]
+  creds:
+    - ["admin", ""]
+    - ["admin", "admin"]
+
+- product_regex: "palo.alto|pan-os"
+  ports: [22, 443]
+  creds:
+    - ["admin", "admin"]
+
+- product_regex: "tomcat"
+  ports: [8080, 8443]
+  creds:
+    - ["tomcat", "tomcat"]
+    - ["admin", "admin"]
+    - ["tomcat", "s3cret"]
+    - ["manager", "manager"]
+    - ["role1", "role1"]
+
+- product_regex: "jenkins"
+  ports: [8080]
+  creds:
+    - ["admin", "admin"]
+    - ["", ""]
+
+- product_regex: "jboss|wildfly"
+  ports: [8080, 9990]
+  creds:
+    - ["admin", "admin"]
+    - ["admin", "jboss"]
+
+- product_regex: "weblogic"
+  ports: [7001, 7002]
+  creds:
+    - ["weblogic", "weblogic"]
+    - ["system", "weblogic"]
+    - ["weblogic", "welcome1"]
+
+- product_regex: "glassfish"
+  ports: [4848]
+  creds:
+    - ["admin", "admin"]
+    - ["admin", ""]
+
+- product_regex: "nginx"
+  ports: [80, 443]
+  creds: []
+
+- product_regex: "apache.httpd|http_server"
+  ports: [80, 443]
+  creds: []
+
+- product_regex: "iis|internet.information"
+  ports: [80, 443]
+  creds: []
+
+- product_regex: "grafana"
+  ports: [3000]
+  creds:
+    - ["admin", "admin"]
+
+- product_regex: "zabbix"
+  ports: [80, 443]
+  creds:
+    - ["Admin", "zabbix"]
+
+- product_regex: "nagios"
+  ports: [80, 443]
+  creds:
+    - ["nagiosadmin", "nagiosadmin"]
+
+- product_regex: "splunk"
+  ports: [8089, 8000]
+  creds:
+    - ["admin", "changeme"]
+
+- product_regex: "sonarqube"
+  ports: [9000]
+  creds:
+    - ["admin", "admin"]
+
+- product_regex: "gitlab"
+  ports: [80, 443]
+  creds:
+    - ["root", "5iveL!fe"]
+    - ["admin", "5iveL!fe"]
+
+- product_regex: "nexus"
+  ports: [8081]
+  creds:
+    - ["admin", "admin123"]
+
+- product_regex: "phpmyadmin"
+  ports: [80, 443]
+  creds:
+    - ["root", ""]
+    - ["root", "root"]
+
+- product_regex: "crushftp"
+  ports: [21, 22, 443]
+  creds:
+    - ["crushadmin", "crushadmin"]
+    - ["anonymous", ""]
+
+- product_regex: "vmware|esxi|vcenter"
+  ports: [443, 902]
+  creds:
+    - ["root", "vmware"]
+    - ["admin", "admin"]
+
+- product_regex: "docker"
+  ports: [2375, 2376]
+  creds:
+    - ["", ""]
+
+- product_regex: "kubernetes|k8s"
+  ports: [6443, 8443]
+  creds:
+    - ["", ""]
+
+- product_regex: "exchange"
+  ports: [443, 80]
+  creds: []
+
+- product_regex: "wordpress"
+  ports: [80, 443]
+  creds:
+    - ["admin", "admin"]
+    - ["admin", "password"]
+
+- product_regex: "winrm|wsman"
+  ports: [5985, 5986]
+  creds:
+    - ["administrator", ""]
+    - ["admin", "admin"]

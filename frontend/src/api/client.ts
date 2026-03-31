@@ -102,8 +102,13 @@ export const api = {
     return res.json();
   },
 
-  runAnalysis: (ai?: boolean) =>
-    post<AnalyzeResponse>('/analyze', ai ? { ai } : undefined),
+  runAnalysis: (options?: { nvd?: boolean; ai?: boolean }) =>
+    post<AnalyzeResponse>('/analyze', options),
+
+  getDefaultCreds: (ip: string, port: number) =>
+    get<{ ip: string; port: number; creds: Array<{ username: string; password: string }> }>(
+      `/hosts/${ip}/services/${port}/default-creds`,
+    ),
 
   updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus, port?: number | null) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status, port }),

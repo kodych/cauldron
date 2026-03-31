@@ -12,6 +12,7 @@ export function ImportPanel({ onImported }: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [source, setSource] = useState('');
+  const [useNvd, setUseNvd] = useState(false);
   const [useAi, setUseAi] = useState(false);
   const [importing, setImporting] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -20,7 +21,6 @@ export function ImportPanel({ onImported }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [analyzeStartTime, setAnalyzeStartTime] = useState<number | null>(null);
   const [analyzeElapsed, setAnalyzeElapsed] = useState(0);
 
   const handleFile = useCallback((f: File) => {
@@ -67,21 +67,19 @@ export function ImportPanel({ onImported }: Props) {
     setError(null);
     setAnalyzeResult(null);
     const start = Date.now();
-    setAnalyzeStartTime(start);
     setAnalyzeElapsed(0);
     timerRef.current = setInterval(() => setAnalyzeElapsed(Date.now() - start), 1000);
     try {
-      const result = await api.runAnalysis(useAi);
+      const result = await api.runAnalysis({ nvd: useNvd, ai: useAi });
       setAnalyzeResult(result);
       setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Analysis failed');
     } finally {
       setAnalyzing(false);
-      setAnalyzeStartTime(null);
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     }
-  }, [useAi]);
+  }, [useNvd, useAi]);
 
   const resetForm = useCallback(() => {
     setFile(null);
@@ -220,17 +218,29 @@ export function ImportPanel({ onImported }: Props) {
       <div className="border-t border-gray-800 pt-3">
         <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Analyze</p>
 
-        {/* AI toggle */}
-        <label className="flex items-center gap-2 px-1 cursor-pointer mb-2">
-          <input
-            type="checkbox"
-            checked={useAi}
-            onChange={(e) => setUseAi(e.target.checked)}
-            className="rounded border-gray-600 bg-gray-800 text-purple-500"
-          />
-          <Brain size={13} className="text-purple-400" />
-          <span className="text-xs text-gray-400">Include AI analysis (Claude API)</span>
-        </label>
+        {/* Enrichment toggles */}
+        <div className="space-y-1.5 mb-2">
+          <label className="flex items-center gap-2 px-1 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useNvd}
+              onChange={(e) => setUseNvd(e.target.checked)}
+              className="rounded border-gray-600 bg-gray-800 text-cyan-500"
+            />
+            <span className="text-xs text-cyan-400">NVD</span>
+            <span className="text-xs text-gray-500">CVE enrichment (may take minutes)</span>
+          </label>
+          <label className="flex items-center gap-2 px-1 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useAi}
+              onChange={(e) => setUseAi(e.target.checked)}
+              className="rounded border-gray-600 bg-gray-800 text-purple-500"
+            />
+            <Brain size={13} className="text-purple-400" />
+            <span className="text-xs text-gray-400">AI analysis (Claude API)</span>
+          </label>
+        </div>
 
         {!analyzeResult ? (
           <div>
@@ -242,7 +252,7 @@ export function ImportPanel({ onImported }: Props) {
               {analyzing ? (
                 <>
                   <div className="h-3 w-3 animate-spin rounded-full border border-white border-t-transparent" />
-                  Analyzing{useAi ? ' (with AI)' : ''}...
+                  Analyzing{useNvd || useAi ? ` (${[useNvd && 'NVD', useAi && 'AI'].filter(Boolean).join(' + ')})` : ''}...
                   {analyzeElapsed > 0 && (
                     <span className="font-mono ml-1">
                       {Math.floor(analyzeElapsed / 60000)}:{String(Math.floor((analyzeElapsed % 60000) / 1000)).padStart(2, '0')}
@@ -263,7 +273,7 @@ export function ImportPanel({ onImported }: Props) {
             )}
             {!analyzing && (
               <p className="text-xs text-gray-600 px-1 mt-1">
-                Classify hosts, match exploits, enrich CVEs, build topology{useAi ? ', AI attack chains' : ''}
+                Classify hosts, match exploits, build topology{useNvd ? ', NVD CVEs' : ''}{useAi ? ', AI analysis' : ''}
               </p>
             )}
           </div>

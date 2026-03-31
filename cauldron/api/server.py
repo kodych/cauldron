@@ -779,15 +779,21 @@ async def import_scan(
 
 
 @app.post("/api/v1/analyze", response_model=AnalyzeResponse)
-def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
-    """Run the full analysis pipeline (equivalent to 'cauldron boil')."""
+def run_analysis(
+    nvd: bool = Query(False, description="Enable NVD CVE enrichment"),
+    ai: bool = Query(False, description="Enable AI analysis"),
+):
+    """Run the analysis pipeline (equivalent to 'cauldron boil').
+
+    By default runs only local analysis (exploit DB, topology, attack paths).
+    Use ?nvd=true for NVD enrichment, ?ai=true for AI analysis.
+    """
     _check_neo4j()
 
     from cauldron.graph.ingestion import classify_graph_hosts
     from cauldron.exploits.matcher import (
         ExploitDB, upgrade_confidence_from_scripts, mark_bruteforceable_services,
     )
-    from cauldron.ai.cve_enricher import enrich_services_from_graph
     from cauldron.graph.topology import build_segment_connectivity
     from cauldron.ai.attack_paths import get_path_summary
 
@@ -804,8 +810,11 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
     # Phase 2.7: Bruteforceable service detection
     mark_bruteforceable_services()
 
-    # Phase 3: CVE enrichment
-    cve_stats = enrich_services_from_graph()
+    # Phase 3: CVE enrichment (optional)
+    cve_stats: dict = {"services_checked": 0, "services_with_cves": 0, "total_cves_found": 0}
+    if nvd:
+        from cauldron.ai.cve_enricher import enrich_services_from_graph
+        cve_stats = enrich_services_from_graph()
 
     # Phase 4: Topology
     topo_stats = build_segment_connectivity()
@@ -830,6 +839,15 @@ def run_analysis(ai: bool = Query(False, description="Enable AI analysis")):
         path_summary=summary,
         ai_false_positives=ai_fp_count,
     )
+
+
+@app.get("/api/v1/hosts/{ip}/services/{port}/default-creds")
+def get_default_creds(ip: str, port: int):
+    """Get known default credentials for a service."""
+    from cauldron.exploits.default_creds import get_creds_for_graph_service
+
+    creds = get_creds_for_graph_service(ip, port)
+    return {"ip": ip, "port": port, "creds": creds}
 
 
 @app.patch("/api/v1/hosts/{ip}/vulns/{vuln_id}/status")

@@ -228,11 +228,20 @@ def reset():
 
 
 @cli.command()
+@click.option("--nvd", is_flag=True, default=False, help="Enable NVD CVE enrichment (network API, may take minutes)")
 @click.option("--ai", is_flag=True, default=False, help="Enable AI analysis (requires CAULDRON_ANTHROPIC_API_KEY)")
-def boil(ai: bool):
-    """Run analysis on the graph -- classify hosts, enrich data."""
+@click.option("--all", "run_all", is_flag=True, default=False, help="Enable all enrichments (--nvd --ai)")
+def boil(nvd: bool, ai: bool, run_all: bool):
+    """Run analysis on the graph -- classify hosts, enrich data.
+
+    By default runs only local analysis (exploit DB, topology, attack paths).
+    Use --nvd for NVD CVE enrichment, --ai for AI analysis, or --all for both.
+    """
     from cauldron.graph.connection import verify_connection
     from cauldron.graph.ingestion import classify_graph_hosts
+
+    if run_all:
+        nvd = ai = True
 
     if not verify_connection():
         console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
@@ -298,21 +307,24 @@ def boil(ai: bool):
             f"  [green]+[/green] {brute_stats['marked']} bruteforceable services detected"
         )
 
-    # Phase 3: CVE enrichment (NVD API)
+    # Phase 3: CVE enrichment (NVD API) — optional
     console.print()
     console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")
 
-    from cauldron.ai.cve_enricher import enrich_services_from_graph
+    if nvd:
+        from cauldron.ai.cve_enricher import enrich_services_from_graph
 
-    with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
-        cve_stats = enrich_services_from_graph()
+        with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
+            cve_stats = enrich_services_from_graph()
 
-    console.print(f"  [green]+[/green] Checked {cve_stats['services_checked']} product+version pairs")
-    console.print(f"  [green]+[/green] Found {cve_stats['total_cves_found']} CVEs across {cve_stats['services_with_cves']} services")
-    if cve_stats["from_cache"]:
-        console.print(f"  [dim]  ({cve_stats['from_cache']} from cache, {cve_stats['api_calls']} API calls)[/dim]")
-    if cve_stats["errors"]:
-        console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
+        console.print(f"  [green]+[/green] Checked {cve_stats['services_checked']} product+version pairs")
+        console.print(f"  [green]+[/green] Found {cve_stats['total_cves_found']} CVEs across {cve_stats['services_with_cves']} services")
+        if cve_stats["from_cache"]:
+            console.print(f"  [dim]  ({cve_stats['from_cache']} from cache, {cve_stats['api_calls']} API calls)[/dim]")
+        if cve_stats["errors"]:
+            console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
+    else:
+        console.print("  [dim]Skipped (use --nvd to enable)[/dim]")
 
     # Phase 4: Network topology
     console.print()

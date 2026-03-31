@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -334,6 +334,21 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
     }
   }, [hostIp, onUpdated]);
 
+  const [credsPort, setCredsPort] = useState<number | null>(null);
+  const [creds, setCreds] = useState<Array<{ username: string; password: string }>>([]);
+  const [credsLoading, setCredsLoading] = useState(false);
+
+  const handleShowCreds = useCallback(async (port: number) => {
+    if (credsPort === port) { setCredsPort(null); return; }
+    setCredsPort(port);
+    setCredsLoading(true);
+    try {
+      const res = await api.getDefaultCreds(hostIp, port);
+      setCreds(res.creds);
+    } catch { setCreds([]); }
+    finally { setCredsLoading(false); }
+  }, [hostIp, credsPort]);
+
   return (
     <div className="border-b border-gray-800">
       <div className="flex items-center gap-1.5 px-3 py-2">
@@ -347,42 +362,85 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
           const portColor = maxCvss > 0 ? getCvssColor(maxCvss) : '#60a5fa';
 
           return (
-            <div key={`${s.port}/${s.protocol}`} className={`flex items-center gap-2 text-xs ${s.is_stale ? 'opacity-40' : ''}`}>
-              <span
-                className={`font-mono w-14 text-right shrink-0 ${s.is_stale ? 'line-through' : ''}`}
-                style={{ color: portColor }}
-              >
-                {s.port}/{s.protocol}
-              </span>
-              <span className={`text-gray-400 truncate ${s.is_stale ? 'line-through' : ''}`}>
-                {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
-              </span>
-              {s.is_new && (
-                <span className="shrink-0 rounded px-1 py-0 bg-green-900/30 text-green-400 font-semibold">NEW</span>
-              )}
-              {s.is_stale && (
-                <span className="shrink-0 rounded px-1 py-0 bg-gray-700 text-gray-500">GONE</span>
-              )}
-              {vCount > 0 && (
+            <div key={`${s.port}/${s.protocol}`}>
+              <div className={`flex items-center gap-2 text-xs ${s.is_stale ? 'opacity-40' : ''}`}>
                 <span
-                  className="shrink-0 rounded px-1 py-0 text-xs"
-                  style={{ color: portColor, backgroundColor: portColor + '18' }}
-                  title={`${vCount} vulnerability${vCount !== 1 ? 'ies' : ''} on this port`}
+                  className={`font-mono w-14 text-right shrink-0 ${s.is_stale ? 'line-through' : ''}`}
+                  style={{ color: portColor }}
                 >
-                  <Bug size={9} className="inline mr-0.5 -mt-px" />{vCount}
+                  {s.port}/{s.protocol}
                 </span>
+                <span className={`text-gray-400 truncate ${s.is_stale ? 'line-through' : ''}`}>
+                  {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
+                </span>
+                {s.is_new && (
+                  <span className="shrink-0 rounded px-1 py-0 bg-green-900/30 text-green-400 font-semibold">NEW</span>
+                )}
+                {s.is_stale && (
+                  <span className="shrink-0 rounded px-1 py-0 bg-gray-700 text-gray-500">GONE</span>
+                )}
+                {vCount > 0 && (
+                  <span
+                    className="shrink-0 rounded px-1 py-0 text-xs"
+                    style={{ color: portColor, backgroundColor: portColor + '18' }}
+                    title={`${vCount} vulnerability${vCount !== 1 ? 'ies' : ''} on this port`}
+                  >
+                    <Bug size={9} className="inline mr-0.5 -mt-px" />{vCount}
+                  </span>
+                )}
+                <button
+                  onClick={() => handleBruteToggle(s.port, s.bruteforceable)}
+                  className={`shrink-0 rounded px-1 py-0 text-xs transition-colors ${
+                    s.bruteforceable
+                      ? 'bg-orange-900/30 text-orange-400 font-semibold'
+                      : 'bg-gray-800 text-gray-600 hover:text-gray-400'
+                  }`}
+                  title={s.bruteforceable ? 'Bruteforceable — click to unmark' : 'Mark as bruteforceable'}
+                >
+                  BRUTE
+                </button>
+                {s.bruteforceable && (
+                  <button
+                    onClick={() => handleShowCreds(s.port)}
+                    className={`shrink-0 rounded px-1 py-0 text-xs transition-colors ${
+                      credsPort === s.port
+                        ? 'bg-yellow-900/30 text-yellow-400 font-semibold'
+                        : 'bg-gray-800 text-gray-600 hover:text-yellow-400'
+                    }`}
+                    title="Show default credentials"
+                  >
+                    <Key size={9} className="inline mr-0.5 -mt-px" />CREDS
+                  </button>
+                )}
+              </div>
+              {credsPort === s.port && (
+                <div className="ml-16 mb-1 rounded bg-yellow-950/20 border border-yellow-800/30 px-2 py-1">
+                  {credsLoading ? (
+                    <span className="text-xs text-gray-500">Loading...</span>
+                  ) : creds.length > 0 ? (
+                    <div className="space-y-0.5">
+                      <span className="text-xs text-yellow-400/70 font-medium">Default credentials:</span>
+                      {creds.map((c, i) => (
+                        <div
+                          key={i}
+                          className="flex items-center gap-2 text-xs font-mono cursor-pointer hover:bg-yellow-900/20 rounded px-1"
+                          onClick={() => {
+                            const text = c.password ? `${c.username}:${c.password}` : c.username || '(empty)';
+                            navigator.clipboard.writeText(text);
+                          }}
+                          title="Click to copy"
+                        >
+                          <span className="text-yellow-300">{c.username || '(empty)'}</span>
+                          <span className="text-gray-600">:</span>
+                          <span className="text-yellow-200">{c.password || '(empty)'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="text-xs text-gray-500">No known default credentials</span>
+                  )}
+                </div>
               )}
-              <button
-                onClick={() => handleBruteToggle(s.port, s.bruteforceable)}
-                className={`shrink-0 rounded px-1 py-0 text-xs transition-colors ${
-                  s.bruteforceable
-                    ? 'bg-orange-900/30 text-orange-400 font-semibold'
-                    : 'bg-gray-800 text-gray-600 hover:text-gray-400'
-                }`}
-                title={s.bruteforceable ? 'Bruteforceable — click to unmark' : 'Mark as bruteforceable'}
-              >
-                BRUTE
-              </button>
             </div>
           );
         })}

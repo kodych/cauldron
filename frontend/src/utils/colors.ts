@@ -19,6 +19,7 @@ export const ROLE_COLORS: Record<string, string> = {
   CI_CD:             '#d946ef',  // fuchsia
   CONTAINER:         '#22d3ee',  // cyan bright
   BACKUP:            '#78716c',  // stone
+  NETWORK_EQUIPMENT: '#facc15',  // yellow — routers, switches
   unknown:           '#4b5563',  // gray-600
 };
 
