@@ -737,30 +737,43 @@ def get_topology():
 
 @app.post("/api/v1/import", response_model=ImportResponse)
 async def import_scan(
-    file: UploadFile = File(..., description="Nmap XML file"),
+    file: UploadFile = File(..., description="Nmap XML or Masscan (XML/JSON) file"),
     source: str | None = Query(None, description="Scan source name"),
+    fmt: str = Query("auto", description="Format: auto, nmap, masscan"),
 ):
-    """Import an Nmap XML scan file."""
+    """Import a scan file (Nmap XML or Masscan XML/JSON)."""
     _check_neo4j()
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
-    # Read uploaded file to a temp location
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+    suffix = ".json" if file.filename and file.filename.endswith(".json") else ".xml"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         tmp_path = Path(tmp.name)
 
     try:
         from cauldron.parsers.nmap_parser import parse_nmap_xml
+        from cauldron.parsers.masscan_parser import parse_masscan
         from cauldron.ai.classifier import classify_hosts
         from cauldron.graph.ingestion import ingest_scan
 
-        scan = parse_nmap_xml(tmp_path)
+        # Auto-detect or use explicit format
+        if fmt == "masscan":
+            scan = parse_masscan(tmp_path)
+        elif fmt == "nmap":
+            scan = parse_nmap_xml(tmp_path)
+        else:
+            text_head = content[:2000].decode("utf-8", errors="ignore").strip()
+            if text_head.startswith(("[", "{")) or 'scanner="masscan"' in text_head:
+                scan = parse_masscan(tmp_path)
+            else:
+                scan = parse_nmap_xml(tmp_path)
+
         if not scan.hosts_up:
             raise HTTPException(status_code=400, detail="No live hosts found in scan")
 

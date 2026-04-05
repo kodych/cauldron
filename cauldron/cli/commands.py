@@ -74,20 +74,44 @@ def cli():
     pass
 
 
+def _parse_scan_file(file: Path, fmt: str = "auto") -> "ScanResult":  # noqa: F821
+    """Parse a scan file, auto-detecting format if needed."""
+    from cauldron.parsers.nmap_parser import parse_nmap_xml
+    from cauldron.parsers.masscan_parser import parse_masscan
+
+    if fmt == "nmap":
+        return parse_nmap_xml(file)
+    if fmt == "masscan":
+        return parse_masscan(file)
+
+    # Auto-detect: read first bytes
+    content = file.read_text(encoding="utf-8", errors="ignore")[:2000]
+    stripped = content.strip()
+
+    # JSON → masscan
+    if stripped.startswith("[") or stripped.startswith("{"):
+        return parse_masscan(file)
+
+    # XML — check scanner attribute
+    if 'scanner="masscan"' in stripped:
+        return parse_masscan(file)
+
+    # Default: nmap XML
+    return parse_nmap_xml(file)
+
+
 @cli.command()
 @click.argument("file", type=click.Path(exists=True, path_type=Path))
 @click.option("--source", "-s", default=None, help="Scan source name/IP (where was scan run from)")
-@click.option("--masscan", is_flag=True, default=False, help="Parse as Masscan output (default: Nmap XML)")
-def brew(file: Path, source: str | None, masscan: bool):
+@click.option("--format", "fmt", type=click.Choice(["auto", "nmap", "masscan"]), default="auto",
+              help="Scan file format (default: auto-detect)")
+def brew(file: Path, source: str | None, fmt: str):
     """Import scan results into the cauldron.
 
-    FILE is the path to an Nmap XML (-oX) or Masscan output file.
+    FILE is the path to an Nmap XML (-oX) or Masscan (-oX/-oJ) output file.
+    Format is auto-detected from file content.
     """
     console.print(BANNER)
-
-    if masscan:
-        console.print("[yellow]Masscan parser not yet implemented. Coming soon![/yellow]")
-        raise SystemExit(1)
 
     # Auto-detect scan source from filename if not provided
     if not source:
@@ -97,17 +121,17 @@ def brew(file: Path, source: str | None, masscan: bool):
     console.print(f"[dim]  Source: {source}[/dim]")
     console.print()
 
-    # Parse
+    # Parse — auto-detect or use explicit format
     with console.status("[bold green]Parsing scan file..."):
-        from cauldron.parsers.nmap_parser import parse_nmap_xml
-
         try:
-            scan = parse_nmap_xml(file)
+            scan = _parse_scan_file(file, fmt)
         except Exception as e:
             console.print(f"[bold red]x Failed to parse:[/bold red] {e}")
             raise SystemExit(1)
 
-    console.print(f"  [green]+[/green] Parsed {len(scan.hosts_up)} live hosts, {scan.total_services} services")
+    scanner_label = f" ({scan.scanner})" if scan.scanner != "nmap" else ""
+
+    console.print(f"  [green]+[/green] Parsed {len(scan.hosts_up)} live hosts, {scan.total_services} services{scanner_label}")
 
     if not scan.hosts_up:
         console.print("[yellow]  ! No live hosts found in scan. Nothing to import.[/yellow]")
