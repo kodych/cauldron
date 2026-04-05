@@ -866,7 +866,8 @@ def _upsert_vulnerability(
             v.has_exploit = $has_exploit,
             v.exploit_url = $exploit_url,
             v.epss = $epss,
-            v.source = 'nvd'
+            v.source = 'nvd',
+            v.confidence = 'check'
         ON MATCH SET
             v.cvss = COALESCE($cvss, v.cvss),
             v.severity = COALESCE($severity, v.severity),

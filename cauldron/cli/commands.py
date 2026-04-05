@@ -735,7 +735,30 @@ def serve(host: str, port: int, reload: bool):
 
 
 @cli.command()
-@click.option("--format", "fmt", type=click.Choice(["pdf", "html", "json"]), default="html")
-def pour(fmt: str):
-    """Export a report from the cauldron (coming soon)."""
-    console.print(f"[yellow]Report generation ({fmt}) not yet implemented. Coming soon![/yellow]")
+@click.option("--format", "fmt", type=click.Choice(["md", "json", "html"]), default="md",
+              help="Report format (default: markdown)")
+@click.option("-o", "--output", default=None, type=click.Path(), help="Output file (default: stdout)")
+@click.option("--top", default=20, help="Number of top findings to include")
+def pour(fmt: str, output: str | None, top: int):
+    """Export scan report from the cauldron."""
+    from cauldron.graph.connection import verify_connection
+
+    if not verify_connection():
+        console.print("[bold red]x Cannot connect to Neo4j.[/bold red]")
+        raise SystemExit(1)
+
+    with console.status("[bold green]Generating report..."):
+        from cauldron.report import generate_markdown, generate_json, generate_html
+
+        if fmt == "json":
+            content = generate_json(top=top)
+        elif fmt == "html":
+            content = generate_html(top=top)
+        else:
+            content = generate_markdown(top=top)
+
+    if output:
+        Path(output).write_text(content, encoding="utf-8")
+        console.print(f"[green]+[/green] Report saved to [cyan]{output}[/cyan]")
+    else:
+        console.print(content)

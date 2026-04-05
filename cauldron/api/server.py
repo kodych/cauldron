@@ -939,6 +939,27 @@ def update_service_bruteforceable(ip: str, port: int, body: BruteforceableUpdate
     return {"ok": True}
 
 
+@app.get("/api/v1/report")
+def get_report(
+    fmt: str = Query("md", description="Format: md, json, html"),
+    top: int = Query(20, description="Number of top findings"),
+):
+    """Generate and download scan report."""
+    _check_neo4j()
+    from cauldron.report import generate_markdown, generate_json, generate_html
+    from fastapi.responses import PlainTextResponse
+
+    if fmt == "json":
+        content = generate_json(top=top)
+        return PlainTextResponse(content, media_type="application/json")
+    elif fmt == "html":
+        content = generate_html(top=top)
+        return PlainTextResponse(content, media_type="text/html")
+    else:
+        content = generate_markdown(top=top)
+        return PlainTextResponse(content, media_type="text/markdown")
+
+
 @app.delete("/api/v1/reset")
 def reset_database():
     """Clear all nodes and relationships from the database."""
