@@ -142,10 +142,11 @@ def discover_attack_paths(
     for path in paths:
         path.score = _score_path(path)
 
-    # Deduplicate by (source_ip, target_ip), keep highest scoring
-    seen: dict[tuple, AttackPath] = {}
+    # Deduplicate by target IP — same vuln host from different sources = noise
+    # Keep the highest scoring path to each target
+    seen: dict[str, AttackPath] = {}
     for path in paths:
-        key = tuple(n.ip for n in path.nodes)
+        key = path.target_ip
         if key not in seen or path.score > seen[key].score:
             seen[key] = path
 
