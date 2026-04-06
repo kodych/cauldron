@@ -25,8 +25,8 @@ export function ImportPanel({ onImported }: Props) {
   const [includeNotes, setIncludeNotes] = useState(false);
 
   const handleFile = useCallback((f: File) => {
-    if (!f.name.endsWith('.xml')) {
-      setError('Only Nmap XML files (.xml) are supported');
+    if (!f.name.endsWith('.xml') && !f.name.endsWith('.json')) {
+      setError('Supported formats: Nmap XML, Masscan XML/JSON');
       return;
     }
     setFile(f);
@@ -127,7 +127,7 @@ export function ImportPanel({ onImported }: Props) {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".xml"
+          accept=".xml,.json"
           className="hidden"
           onChange={(e) => {
             if (e.target.files?.[0]) handleFile(e.target.files[0]);
@@ -142,7 +142,7 @@ export function ImportPanel({ onImported }: Props) {
         ) : (
           <div>
             <Upload size={20} className="mx-auto text-gray-600 mb-1" />
-            <p className="text-xs text-gray-500">Drop Nmap XML here or click to browse</p>
+            <p className="text-xs text-gray-500">Drop scan file here or click to browse</p>
           </div>
         )}
       </div>
