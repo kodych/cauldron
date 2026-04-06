@@ -95,14 +95,14 @@ export function Layout() {
         {!collapsed && (
           <div className="flex-1 overflow-y-auto">
             {showHostDetail && selectedHost ? (
-              <HostDetail ip={selectedHost} onBack={handleBackFromDetail} />
+              <HostDetail ip={selectedHost} onBack={handleBackFromDetail} onDataChanged={() => setDataVersion((v) => v + 1)} />
             ) : (
               <>
                 {activeTab === 'stats' && <StatsPanel refreshKey={graphKey} />}
                 {activeTab === 'hosts' && (
                   <HostList onSelectHost={handleSelectHost} selectedHost={selectedHost} />
                 )}
-                {activeTab === 'paths' && <AttackPaths onSelectPath={setSelectedPathIps} refreshKey={dataVersion} />}
+                {activeTab === 'paths' && <AttackPaths onSelectPath={setSelectedPathIps} onSelectHost={handleSelectHost} refreshKey={dataVersion} />}
                 {activeTab === 'collect' && <CollectPanel />}
                 {activeTab === 'import' && <ImportPanel onImported={handleImported} />}
               </>

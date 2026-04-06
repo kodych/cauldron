@@ -18,10 +18,11 @@ const PATH_FILTERS: { value: PathFilter; label: string }[] = [
 
 interface AttackPathsProps {
   onSelectPath?: (ips: string[] | null) => void;
+  onSelectHost?: (ip: string) => void;
   refreshKey?: number;
 }
 
-export function AttackPaths({ onSelectPath, refreshKey = 0 }: AttackPathsProps) {
+export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: AttackPathsProps) {
   const [filter, setFilter] = useState<PathFilter>('all');
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   // Always fetch all paths (include check), filter client-side
@@ -123,6 +124,7 @@ export function AttackPaths({ onSelectPath, refreshKey = 0 }: AttackPathsProps) 
                   onSelectPath?.(ips);
                 }
               }}
+              onSelectHost={onSelectHost}
             />
           ))
         )}
@@ -131,8 +133,9 @@ export function AttackPaths({ onSelectPath, refreshKey = 0 }: AttackPathsProps) 
   );
 }
 
-function PathCard({ path, index, selected, onSelect }: {
+function PathCard({ path, index, selected, onSelect, onSelectHost }: {
   path: AttackPathOut; index: number; selected?: boolean; onSelect?: () => void;
+  onSelectHost?: (ip: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -203,15 +206,24 @@ function PathCard({ path, index, selected, onSelect }: {
               <div className="absolute left-0 top-1.5 h-2.5 w-2.5 rounded-full bg-gray-700 border-2 border-gray-900" />
 
               <div className="text-xs">
-                <p className="text-gray-300 font-mono">
-                  {node.ip}
+                <p className="font-mono">
+                  {node.role !== 'scan_source' && onSelectHost ? (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onSelectHost(node.ip); }}
+                      className="text-gray-300 hover:text-indigo-400 hover:underline transition-colors"
+                    >
+                      {node.ip}
+                    </button>
+                  ) : (
+                    <span className="text-gray-300">{node.ip}</span>
+                  )}
                   {node.hostname && <span className="text-gray-600 font-sans ml-1">({node.hostname})</span>}
                 </p>
                 <p className="text-gray-600">{node.role} {node.segment && `· ${node.segment}`}</p>
                 {node.vulns.map((v) => (
                   <div key={v.cve_id} className="flex items-start gap-1.5 mt-0.5 ml-2">
                     <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : getConfidenceColor(v.confidence) }} />
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <span className="text-gray-400">{v.cve_id}</span>
                       {v.title && <span className="text-gray-500 ml-1">— {v.title}</span>}
                       <span className="ml-1 font-mono" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
