@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Crosshair, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
@@ -6,17 +6,48 @@ import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors'
 import { formatCvss } from '../utils/format';
 import type { PathsResponse, AttackPathOut } from '../types';
 
+type PathFilter = 'all' | 'confirmed' | 'confirmed_likely' | 'exploit' | 'target';
+
+const PATH_FILTERS: { value: PathFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'exploit', label: 'Exploit' },
+  { value: 'confirmed_likely', label: 'Confirmed+Likely' },
+  { value: 'confirmed', label: 'Confirmed' },
+  { value: 'target', label: 'Targets' },
+];
+
 interface AttackPathsProps {
   onSelectPath?: (ips: string[] | null) => void;
+  refreshKey?: number;
 }
 
-export function AttackPaths({ onSelectPath }: AttackPathsProps) {
-  const [includeCheck, setIncludeCheck] = useState(false);
+export function AttackPaths({ onSelectPath, refreshKey = 0 }: AttackPathsProps) {
+  const [filter, setFilter] = useState<PathFilter>('all');
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  // Always fetch all paths (include check), filter client-side
   const { data, loading, error } = useApi<PathsResponse>(
-    () => api.getAttackPaths({ top: 50, include_check: includeCheck }),
-    [includeCheck],
+    () => api.getAttackPaths({ top: 100, include_check: true }),
+    [refreshKey],
   );
+
+  const filteredPaths = useMemo(() => {
+    if (!data) return [];
+    return data.paths.filter((p) => {
+      switch (filter) {
+        case 'confirmed':
+          return p.nodes.some((n) => n.vulns?.some((v) => v.confidence === 'confirmed'));
+        case 'confirmed_likely':
+          return p.nodes.some((n) => n.vulns?.some((v) =>
+            v.confidence === 'confirmed' || v.confidence === 'likely'));
+        case 'exploit':
+          return p.has_exploits;
+        case 'target':
+          return p.nodes.some((n) => n.role && ['domain_controller', 'database', 'mail_server'].includes(n.role));
+        default:
+          return true;
+      }
+    });
+  }, [data, filter]);
 
   if (loading) {
     return (
@@ -36,18 +67,23 @@ export function AttackPaths({ onSelectPath }: AttackPathsProps) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Controls */}
-      <div className="flex items-center justify-between border-b border-gray-800 px-3 py-2">
-        <p className="text-xs text-gray-500">{data.paths.length} paths</p>
-        <label className="flex items-center gap-1.5 text-xs text-gray-500">
-          <input
-            type="checkbox"
-            checked={includeCheck}
-            onChange={(e) => setIncludeCheck(e.target.checked)}
-            className="rounded border-gray-600 bg-gray-800 text-indigo-500 focus:ring-indigo-500"
-          />
-          Include check-level
-        </label>
+      {/* Filter bar */}
+      <div className="flex items-center gap-1 border-b border-gray-800 px-2 py-1.5">
+        <p className="text-xs text-gray-500 mr-1">{filteredPaths.length} paths</p>
+        <div className="flex-1" />
+        {PATH_FILTERS.map((f) => (
+          <button
+            key={f.value}
+            onClick={() => { setFilter(f.value); setSelectedIndex(null); onSelectPath?.(null); }}
+            className={`rounded px-1.5 py-0.5 text-xs transition-colors ${
+              filter === f.value
+                ? 'bg-indigo-600 text-white'
+                : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
       </div>
 
       {/* Summary */}
@@ -70,12 +106,12 @@ export function AttackPaths({ onSelectPath }: AttackPathsProps) {
 
       {/* Path list */}
       <div className="flex-1 overflow-y-auto">
-        {data.paths.length === 0 ? (
+        {filteredPaths.length === 0 ? (
           <div className="p-4 text-center text-xs text-gray-600">
-            No attack paths found
+            {filter === 'all' ? 'No attack paths found' : `No paths matching "${filter}" filter`}
           </div>
         ) : (
-          data.paths.map((path, i) => (
+          filteredPaths.map((path, i) => (
             <PathCard key={i} path={path} index={i + 1} selected={selectedIndex === i}
               onSelect={() => {
                 if (selectedIndex === i) {

@@ -14,6 +14,7 @@ interface Props {
   onSelectHost: (ip: string | null) => void;
   highlightPathIps?: string[] | null;
   onClearPath?: () => void;
+  onDataChanged?: () => void;
 }
 
 interface HostVulnInfo {
@@ -28,7 +29,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -41,11 +42,12 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; ip: string; owned: boolean; target: boolean;
   } | null>(null);
+  const [localDataVersion, setLocalDataVersion] = useState(0);
 
   const { data, loading, error, refetch } = useApi<GraphResponse>(() => api.getGraph(1000), []);
   const { data: pathsData } = useApi<PathsResponse>(
     () => api.getAttackPaths({ top: 50, include_check: true }),
-    [],
+    [localDataVersion],
   );
   const { data: hostsData, refetch: refetchHosts } = useApi<HostListResponse>(
     () => api.getHosts({ limit: 1000 }),
@@ -472,8 +474,9 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       const base = { ...attrs, size, label, forceLabel, color: nodeColor };
 
       // Path highlight mode: dim everything except selected path
+      // Node IDs can be host:{ip}, source:{name}, or host:{name} (merged pivot)
       const pathNodeIds = highlightPathIps
-        ? new Set(highlightPathIps.map((ip) => `host:${ip}`))
+        ? new Set(highlightPathIps.flatMap((ip) => [`host:${ip}`, `source:${ip}`]))
         : null;
 
       if (pathNodeIds) {
@@ -512,7 +515,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
 
       // Path highlight mode
       const pathNodeIds = highlightPathIps
-        ? new Set(highlightPathIps.map((ip) => `host:${ip}`))
+        ? new Set(highlightPathIps.flatMap((ip) => [`host:${ip}`, `source:${ip}`]))
         : null;
 
       if (pathNodeIds) {
@@ -790,7 +793,9 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
             onClick={async () => {
               await api.setHostOwned(contextMenu.ip, !contextMenu.owned);
               setContextMenu(null);
-              refetchHosts();  // Only refresh host data, not graph structure
+              refetchHosts();
+              setLocalDataVersion((v) => v + 1);
+              onDataChanged?.();
             }}
           >
             <span>{contextMenu.owned ? '🔓' : '🔒'}</span>
@@ -803,7 +808,9 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
             onClick={async () => {
               await api.setHostTarget(contextMenu.ip, !contextMenu.target);
               setContextMenu(null);
-              refetchHosts();  // Only refresh host data, not graph structure
+              refetchHosts();
+              setLocalDataVersion((v) => v + 1);
+              onDataChanged?.();
             }}
           >
             <span>🎯</span>
