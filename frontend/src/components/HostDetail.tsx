@@ -8,6 +8,7 @@ import type { HostOut, VulnOut, VulnStatus } from '../types';
 interface Props {
   ip: string;
   onBack: () => void;
+  onDataChanged?: () => void;
 }
 
 const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: React.ReactNode }[] = [
@@ -16,7 +17,7 @@ const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: R
   { value: 'mitigated', label: 'Mitigated', color: '#3b82f6', icon: <Shield size={10} /> },
 ];
 
-export function HostDetail({ ip, onBack }: Props) {
+export function HostDetail({ ip, onBack, onDataChanged }: Props) {
   const { data, loading, error, refetch } = useApi<HostOut>(() => api.getHost(ip), [ip]);
   const [hostNotesOpen, setHostNotesOpen] = useState(false);
   const [hostNotesText, setHostNotesText] = useState('');
@@ -132,7 +133,7 @@ export function HostDetail({ ip, onBack }: Props) {
         {/* Services */}
         <ServicesList services={data.services} vulns={data.vulnerabilities} hostIp={ip} onUpdated={refetch} />
 
-        <VulnsList vulns={data.vulnerabilities} hostIp={ip} onUpdated={refetch} />
+        <VulnsList vulns={data.vulnerabilities} hostIp={ip} onUpdated={() => { refetch(); onDataChanged?.(); }} />
       </div>
     </div>
   );
