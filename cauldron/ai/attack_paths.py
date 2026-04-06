@@ -1,13 +1,15 @@
 """Attack path discovery and scoring engine.
 
-Discovers DIRECT attack paths from scan sources to vulnerable hosts.
-Each path is one hop: ScanSource -> Target Host with vulnerability.
+Builds engagement-aware attack paths from current positions (owned hosts +
+scan sources) toward targets and vulnerable hosts.
 
-Three distinct concepts (never conflated):
-1. Reachability — ScanSource->SCANNED_FROM->Host (what we can see)
-2. Attack paths — ScanSource -> Host with vulnerability (what we can exploit)
-3. True pivoting — host compromised via RCE bridges to a new network
-   (detected when Host.ip matches ScanSource.name across different scans)
+Path types:
+1. Direct attack — owned/scan position → vulnerable host (1 hop)
+2. Pivot chain — owned → exploit RCE on host → reach new hosts (2+ hops)
+3. Local privesc — vulnerabilities on owned hosts for privilege escalation
+4. To-target — paths from owned positions toward target-marked hosts
+
+Scoring prioritizes: target hosts > has_exploit > high CVSS > fewer hops.
 """
 
 from __future__ import annotations
@@ -100,10 +102,11 @@ def discover_attack_paths(
     target_role: str | None = None,
     target_ip: str | None = None,
 ) -> list[AttackPath]:
-    """Discover direct attack paths from scan sources to vulnerable hosts.
+    """Discover attack paths from current positions toward targets.
 
-    Every path is DIRECT: ScanSource -> Target with vulnerability.
-    Multi-hop paths only exist through true pivot hosts (Phase 2, future).
+    Positions = scan sources + owned hosts.
+    Targets = target-marked hosts + high-value roles.
+    Paths show actionable next steps for the engagement.
 
     Args:
         target_role: Filter paths to targets with this role.
@@ -112,21 +115,29 @@ def discover_attack_paths(
     Returns:
         List of AttackPath objects, sorted by score (highest first).
     """
-    paths = []
+    paths: list[AttackPath] = []
 
     with get_session() as session:
-        # Find all direct attack paths (scanner -> vulnerable host)
-        paths = _find_direct_paths(session, target_role, target_ip)
+        # Gather our positions: scan sources + owned hosts
+        positions = _get_attacker_positions(session)
 
-        # Find pivot paths (scanner -> pivot host -> hosts in pivot's scan)
-        pivot_paths = _find_pivot_paths(session, target_role, target_ip)
-        paths.extend(pivot_paths)
+        # 1. Direct paths: position → vulnerable host
+        direct = _find_direct_paths(session, target_role, target_ip)
+        paths.extend(direct)
+
+        # 2. Pivot paths through owned/scan-source hosts
+        pivot = _find_pivot_paths(session, target_role, target_ip)
+        paths.extend(pivot)
+
+        # 3. Lateral from owned: owned host → adjacent vulnerable hosts
+        lateral = _find_lateral_paths(session, positions, target_role, target_ip)
+        paths.extend(lateral)
 
     # Score all paths
     for path in paths:
         path.score = _score_path(path)
 
-    # Deduplicate by (source_ip, target_ip, top_vuln), keep highest scoring
+    # Deduplicate by (source_ip, target_ip), keep highest scoring
     seen: dict[tuple, AttackPath] = {}
     for path in paths:
         key = tuple(n.ip for n in path.nodes)
@@ -136,6 +147,16 @@ def discover_attack_paths(
     paths = list(seen.values())
     paths.sort(key=lambda p: p.score, reverse=True)
     return paths
+
+
+def _get_attacker_positions(session) -> set[str]:
+    """Get all IPs where we have access: scan sources + owned hosts."""
+    positions: set[str] = set()
+    for r in session.run("MATCH (ss:ScanSource) RETURN ss.name AS ip"):
+        positions.add(r["ip"])
+    for r in session.run("MATCH (h:Host) WHERE h.owned = true RETURN h.ip AS ip"):
+        positions.add(r["ip"])
+    return positions
 
 
 def _find_direct_paths(
@@ -180,6 +201,7 @@ def _find_direct_paths(
              count(DISTINCT svc) AS service_count
         RETURN src.name AS source,
                h.ip AS ip, h.hostname AS hostname, h.role AS role,
+               h.target AS is_target, h.owned AS is_owned,
                seg.cidr AS segment, service_count,
                max_cvss, has_exploit, vulns
         """,
@@ -193,6 +215,10 @@ def _find_direct_paths(
         if not vuln_list:
             continue
 
+        # Skip already-owned hosts for direct paths (we already have access)
+        if record.get("is_owned"):
+            continue
+
         target_node = PathNode(
             ip=record["ip"],
             hostname=record["hostname"],
@@ -203,6 +229,7 @@ def _find_direct_paths(
             service_count=record["service_count"] or 0,
             vulns=vuln_list,
         )
+        target_node._is_target = bool(record.get("is_target"))  # type: ignore[attr-defined]
 
         source_node = PathNode(ip=record["source"], role="scan_source")
 
@@ -335,6 +362,107 @@ def _find_pivot_paths(
                 hop_count=2,
                 max_cvss=max(pivot_info.max_cvss, target_node.max_cvss),
                 has_exploits=pivot_info.has_exploit or target_node.has_exploit,
+                attack_methods=methods,
+            )
+            paths.append(path)
+
+    return paths
+
+
+def _find_lateral_paths(
+    session,
+    positions: set[str],
+    target_role: str | None,
+    target_ip: str | None,
+) -> list[AttackPath]:
+    """Find lateral movement paths from owned hosts.
+
+    Owned host → vulnerable hosts in same or reachable segments.
+    This discovers paths that don't go through ScanSource relationships.
+    """
+    # Get owned hosts only (not scan sources — those are covered by direct paths)
+    owned_result = session.run(
+        "MATCH (h:Host) WHERE h.owned = true RETURN h.ip AS ip, h.role AS role"
+    )
+    owned_hosts = list(owned_result)
+    if not owned_hosts:
+        return []
+
+    paths = []
+    for owned in owned_hosts:
+        owned_ip = owned["ip"]
+
+        # Find vulnerable hosts in same or reachable segments
+        where_clauses = ["h.ip <> $owned_ip"]
+        params: dict = {"owned_ip": owned_ip}
+
+        if target_ip:
+            where_clauses.append("h.ip = $target_ip")
+            params["target_ip"] = target_ip
+        elif target_role:
+            where_clauses.append("h.role = $target_role")
+            params["target_role"] = target_role
+
+        where_str = " AND ".join(where_clauses)
+
+        # Find vulnerable hosts reachable from owned position
+        # All hosts in Neo4j are reachable (nmap found them)
+        result = session.run(
+            f"""
+            MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
+            WHERE {where_str}
+            AND (r.checked_status IS NULL OR r.checked_status <> 'false_positive')
+            AND h.owned <> true
+            WITH h,
+                 collect(DISTINCT {{
+                     cve: v.cve_id, cvss: v.cvss,
+                     has_exploit: v.has_exploit, desc: v.description,
+                     confidence: v.confidence, enables_pivot: v.enables_pivot
+                 }}) AS vulns,
+                 max(v.cvss) AS max_cvss,
+                 max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
+            OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
+            OPTIONAL MATCH (h)-[:HAS_SERVICE]->(svc:Service)
+            WITH h, vulns, max_cvss, has_exploit, seg,
+                 count(DISTINCT svc) AS service_count
+            RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
+                   h.target AS is_target,
+                   seg.cidr AS segment, service_count,
+                   max_cvss, has_exploit, vulns
+            """,
+            **params,
+        )
+
+        for rec in result:
+            vuln_list = _parse_vulns(rec["vulns"])
+            if not vuln_list:
+                continue
+
+            target_node = PathNode(
+                ip=rec["ip"],
+                hostname=rec["hostname"],
+                role=rec["role"] or "unknown",
+                segment=rec["segment"],
+                max_cvss=rec["max_cvss"] or 0.0,
+                has_exploit=bool(rec["has_exploit"]),
+                service_count=rec["service_count"] or 0,
+                vulns=vuln_list,
+            )
+            target_node._is_target = bool(rec.get("is_target"))  # type: ignore[attr-defined]
+
+            source_node = PathNode(
+                ip=owned_ip,
+                role=owned["role"] or "owned",
+            )
+
+            methods = ["lateral"] + _get_attack_methods(vuln_list)
+
+            path = AttackPath(
+                nodes=[source_node, target_node],
+                target_role=target_node.role,
+                hop_count=1,
+                max_cvss=target_node.max_cvss,
+                has_exploits=target_node.has_exploit,
                 attack_methods=methods,
             )
             paths.append(path)
@@ -491,9 +619,17 @@ def _score_path(path: AttackPath) -> float:
     score += hop_bonus
 
     # 5. Attack method quality (0-10 points)
-    method_scores = {"exploit": 3.0, "relay": 2.5, "credential": 2.0, "cve": 1.0}
+    method_scores = {"exploit": 3.0, "relay": 2.5, "credential": 2.0, "lateral": 1.5, "cve": 1.0}
     method_bonus = sum(method_scores.get(m, 0.0) for m in path.attack_methods)
     score += min(method_bonus, 10.0)
+
+    # 6. Target bonus (0-20 points) — paths to target-marked hosts
+    target_node = path.nodes[-1] if path.nodes else None
+    if target_node:
+        # Check if target is marked as target in Neo4j
+        # We encode this in the path during construction
+        if getattr(target_node, '_is_target', False):
+            score += 20.0
 
     return round(score, 1)
 

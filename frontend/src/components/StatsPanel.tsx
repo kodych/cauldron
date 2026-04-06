@@ -3,8 +3,8 @@ import { api } from '../api/client';
 import { getRoleColor } from '../utils/colors';
 import type { StatsResponse } from '../types';
 
-export function StatsPanel() {
-  const { data: stats, loading, error } = useApi<StatsResponse>(() => api.getStats(), []);
+export function StatsPanel({ refreshKey = 0 }: { refreshKey?: number }) {
+  const { data: stats, loading, error } = useApi<StatsResponse>(() => api.getStats(), [refreshKey]);
 
   if (loading) {
     return <LoadingState />;
@@ -24,7 +24,9 @@ export function StatsPanel() {
     { label: 'Hosts', value: stats.hosts, color: 'text-indigo-400' },
     { label: 'Services', value: stats.services, color: 'text-blue-400' },
     { label: 'Vulnerabilities', value: stats.vulnerabilities, color: 'text-red-400' },
+    { label: 'Findings', value: stats.findings ?? 0, color: 'text-orange-400' },
     { label: 'Scan Sources', value: stats.scan_sources, color: 'text-green-400' },
+    { label: 'Segments', value: stats.segments, color: 'text-cyan-400' },
   ];
 
   const sortedRoles = Object.entries(stats.roles).sort(([, a], [, b]) => b - a);

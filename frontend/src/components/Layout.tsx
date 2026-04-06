@@ -96,7 +96,7 @@ export function Layout() {
               <HostDetail ip={selectedHost} onBack={handleBackFromDetail} />
             ) : (
               <>
-                {activeTab === 'stats' && <StatsPanel />}
+                {activeTab === 'stats' && <StatsPanel refreshKey={graphKey} />}
                 {activeTab === 'hosts' && (
                   <HostList onSelectHost={handleSelectHost} selectedHost={selectedHost} />
                 )}
