@@ -175,8 +175,8 @@ def _find_direct_paths(
     2. Host has at least one vulnerability (HAS_VULN)
     3. Host matches target filter (role or IP)
     """
-    # Build target filter
-    where_clauses = []
+    # Build target filter — always exclude false positives
+    where_clauses = ["(r.checked_status IS NULL OR r.checked_status <> 'false_positive')"]
     params: dict = {}
 
     if target_ip:
@@ -186,12 +186,12 @@ def _find_direct_paths(
         where_clauses.append("h.role = $target_role")
         params["target_role"] = target_role
 
-    where_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    where_str = "WHERE " + " AND ".join(where_clauses)
 
     result = session.run(
         f"""
         MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
-        MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+        MATCH (h)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
         {where_str}
         WITH src, h,
              collect(DISTINCT {{
@@ -328,8 +328,9 @@ def _find_pivot_paths(
             WHERE other.name <> $int_source
             WITH h, collect(other.name) AS other_sources
             WHERE size(other_sources) = 0
-            MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
-            WHERE {where_str}
+            MATCH (h)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
+            WHERE (r.checked_status IS NULL OR r.checked_status <> 'false_positive')
+            AND {where_str}
             WITH h,
                  collect(DISTINCT {{
                      cve: v.cve_id, cvss: v.cvss,
@@ -546,7 +547,8 @@ def _get_host_info(session, ip: str) -> PathNode | None:
         MATCH (h:Host {ip: $ip})
         OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
         OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
-        OPTIONAL MATCH (s)-[:HAS_VULN]->(v:Vulnerability)
+        OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
+        WHERE r IS NULL OR r.checked_status IS NULL OR r.checked_status <> 'false_positive'
         RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                seg.cidr AS segment,
                count(DISTINCT s) AS service_count,
@@ -653,7 +655,8 @@ def get_path_summary() -> dict:
         vuln_result = session.run(
             """
             MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
-                  -[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
+                  -[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
+            WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
             WITH DISTINCT h, max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
                  max(CASE WHEN v.confidence = 'confirmed' THEN 3
