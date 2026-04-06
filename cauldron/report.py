@@ -116,11 +116,35 @@ def _query_bruteforceable() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _query_notes() -> dict:
+    """Get host-level and service-level pentester notes."""
+    result: dict = {"host_notes": [], "service_notes": []}
+    with get_session() as s:
+        # Host notes
+        rows = list(s.run("""
+            MATCH (h:Host)
+            WHERE h.notes IS NOT NULL AND h.notes <> ''
+            RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role, h.notes AS notes
+            ORDER BY h.ip
+        """))
+        result["host_notes"] = [dict(r) for r in rows]
+
+        # Service notes
+        rows = list(s.run("""
+            MATCH (h:Host)-[:HAS_SERVICE]->(svc:Service)
+            WHERE svc.notes IS NOT NULL AND svc.notes <> ''
+            RETURN h.ip AS ip, svc.port AS port, svc.name AS name, svc.notes AS notes
+            ORDER BY h.ip, svc.port
+        """))
+        result["service_notes"] = [dict(r) for r in rows]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Collect all data
 # ---------------------------------------------------------------------------
 
-def _collect_report_data(top: int = 20) -> dict:
+def _collect_report_data(top: int = 20, include_notes: bool = False) -> dict:
     """Collect all data needed for report generation."""
     stats = get_graph_stats()
     roles = get_host_role_distribution()
@@ -132,6 +156,7 @@ def _collect_report_data(top: int = 20) -> dict:
     brute = _query_bruteforceable()
     path_summary = get_path_summary()
     paths = discover_attack_paths()
+    notes = _query_notes() if include_notes else {"host_notes": [], "service_notes": []}
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -143,6 +168,8 @@ def _collect_report_data(top: int = 20) -> dict:
         "vuln_stats": vuln_stats,
         "checked_vulns": checked,
         "bruteforceable": brute,
+        "notes": notes,
+        "include_notes": include_notes,
         "path_summary": path_summary,
         "attack_paths": [
             {
@@ -175,9 +202,9 @@ def _collect_report_data(top: int = 20) -> dict:
 # JSON format
 # ---------------------------------------------------------------------------
 
-def generate_json(top: int = 20) -> str:
+def generate_json(top: int = 20, include_notes: bool = False) -> str:
     """Generate JSON report."""
-    data = _collect_report_data(top=top)
+    data = _collect_report_data(top=top, include_notes=include_notes)
     return json.dumps(data, indent=2, default=str, ensure_ascii=False)
 
 
@@ -185,9 +212,9 @@ def generate_json(top: int = 20) -> str:
 # Markdown format
 # ---------------------------------------------------------------------------
 
-def generate_markdown(top: int = 20) -> str:
+def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
     """Generate Markdown report — AI-compatible, structured, no recommendations."""
-    data = _collect_report_data(top=top)
+    data = _collect_report_data(top=top, include_notes=include_notes)
     lines: list[str] = []
 
     def w(line: str = "") -> None:
@@ -257,15 +284,28 @@ def generate_markdown(top: int = 20) -> str:
 
     w("### 2.2 All Hosts")
     w()
-    w("| IP | Role | OS | Services | Vulns | Max CVSS | Exploits |")
-    w("|----|------|-----|----------|-------|----------|----------|")
+    # Build host notes lookup for the table
+    host_notes_map: dict[str, str] = {}
+    if data["include_notes"]:
+        for hn in data["notes"]["host_notes"]:
+            host_notes_map[hn["ip"]] = hn["notes"]
+    if data["include_notes"]:
+        w("| IP | Role | OS | Services | Vulns | Max CVSS | Exploits | Notes |")
+        w("|----|------|-----|----------|-------|----------|----------|-------|")
+    else:
+        w("| IP | Role | OS | Services | Vulns | Max CVSS | Exploits |")
+        w("|----|------|-----|----------|-------|----------|----------|")
     for h in data["hosts"]:
         ip = h["ip"]
         role = h["role"] or "-"
         os_name = h["os"] or "-"
         cvss = f"{h['max_cvss']:.1f}" if h["max_cvss"] else "-"
         exp = str(h["exploit_count"]) if h["exploit_count"] else "-"
-        w(f"| {ip} | {role} | {os_name} | {h['svc_count']} | {h['vuln_count']} | {cvss} | {exp} |")
+        if data["include_notes"]:
+            note = host_notes_map.get(ip, "-").replace("\n", " ").replace("|", "/")
+            w(f"| {ip} | {role} | {os_name} | {h['svc_count']} | {h['vuln_count']} | {cvss} | {exp} | {note} |")
+        else:
+            w(f"| {ip} | {role} | {os_name} | {h['svc_count']} | {h['vuln_count']} | {cvss} | {exp} |")
     w()
 
     # --- 3. Critical Findings ---
@@ -401,6 +441,35 @@ def generate_markdown(top: int = 20) -> str:
                 w(f"| {c['ip']} | {c['port']} | {c['cve_id']} | {cvss} |")
             w()
 
+    # --- 7. Pentester Notes ---
+    if data["include_notes"]:
+        host_notes = data["notes"]["host_notes"]
+        svc_notes = data["notes"]["service_notes"]
+        if host_notes or svc_notes:
+            w("## 7. Pentester Notes")
+            w()
+            if host_notes:
+                w("### Host Notes")
+                w()
+                for hn in host_notes:
+                    label = hn["ip"]
+                    if hn.get("hostname"):
+                        label += f" ({hn['hostname']})"
+                    w(f"**{label}** [{hn.get('role', 'unknown')}]")
+                    w()
+                    w(f"> {hn['notes'].replace(chr(10), chr(10) + '> ')}")
+                    w()
+            if svc_notes:
+                w("### Service Notes")
+                w()
+                w("| Host | Port | Service | Notes |")
+                w("|------|------|---------|-------|")
+                for sn in svc_notes:
+                    note = sn["notes"].replace("\n", " ").replace("|", "/")
+                    name = sn.get("name") or "-"
+                    w(f"| {sn['ip']} | {sn['port']} | {name} | {note} |")
+                w()
+
     # --- Footer ---
     w("---")
     w("*Generated by Cauldron v0.1.0 — Network Attack Path Discovery*")
@@ -412,9 +481,9 @@ def generate_markdown(top: int = 20) -> str:
 # HTML format
 # ---------------------------------------------------------------------------
 
-def generate_html(top: int = 20) -> str:
+def generate_html(top: int = 20, include_notes: bool = False) -> str:
     """Generate self-contained HTML report from Markdown."""
-    md_content = generate_markdown(top=top)
+    md_content = generate_markdown(top=top, include_notes=include_notes)
 
     # Simple Markdown-to-HTML via basic conversion
     # Use a minimal CSS-only approach — no JS dependencies

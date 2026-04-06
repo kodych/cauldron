@@ -38,7 +38,15 @@ export function HostList({ onSelectHost, selectedHost }: Props) {
     return (
       h.ip.includes(q) ||
       (h.hostname?.toLowerCase().includes(q)) ||
-      h.role.toLowerCase().includes(q)
+      h.role.toLowerCase().includes(q) ||
+      (h.notes?.toLowerCase().includes(q)) ||
+      h.services.some(
+        (s) =>
+          (s.product?.toLowerCase().includes(q)) ||
+          (s.name?.toLowerCase().includes(q)) ||
+          (s.notes?.toLowerCase().includes(q)),
+      ) ||
+      h.vulnerabilities.some((v) => v.cve_id.toLowerCase().includes(q))
     );
   });
 

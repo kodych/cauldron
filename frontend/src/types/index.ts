@@ -49,6 +49,7 @@ export interface HostOut {
   has_changes: boolean;
   owned: boolean;
   target: boolean;
+  notes: string | null;
   services: ServiceOut[];
   vulnerabilities: VulnOut[];
 }

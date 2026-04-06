@@ -1,5 +1,5 @@
-import { useState, useCallback, useMemo, useRef } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare } from 'lucide-react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -18,6 +18,33 @@ const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: R
 
 export function HostDetail({ ip, onBack }: Props) {
   const { data, loading, error, refetch } = useApi<HostOut>(() => api.getHost(ip), [ip]);
+  const [hostNotesOpen, setHostNotesOpen] = useState(false);
+  const [hostNotesText, setHostNotesText] = useState('');
+  const hostNotesSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Sync notes text when data loads or changes
+  useEffect(() => {
+    if (data && hostNotesOpen) {
+      setHostNotesText(data.notes || '');
+    }
+  }, [data, hostNotesOpen]);
+
+  const handleToggleHostNotes = useCallback(() => {
+    if (!hostNotesOpen && data) {
+      setHostNotesText(data.notes || '');
+    }
+    setHostNotesOpen((v) => !v);
+  }, [hostNotesOpen, data]);
+
+  const handleHostNotesChange = useCallback((value: string) => {
+    setHostNotesText(value);
+    if (hostNotesSaveRef.current) clearTimeout(hostNotesSaveRef.current);
+    hostNotesSaveRef.current = setTimeout(async () => {
+      try {
+        await api.updateHostNotes(ip, value || null);
+      } catch (e) { console.error('Failed to save host notes:', e); }
+    }, 500);
+  }, [ip]);
 
   if (loading) {
     return (
@@ -72,6 +99,31 @@ export function HostDetail({ ip, onBack }: Props) {
           )}
           {data.os_name && (
             <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
+          )}
+        </div>
+        {/* Host Notes */}
+        <div className="mt-2">
+          <button
+            onClick={handleToggleHostNotes}
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-xs transition-colors ${
+              hostNotesOpen
+                ? 'bg-blue-900/30 text-blue-400 font-semibold'
+                : data.notes
+                  ? 'bg-blue-900/20 text-blue-400/70'
+                  : 'bg-gray-800 text-gray-600 hover:text-blue-400'
+            }`}
+          >
+            <StickyNote size={11} />
+            {data.notes ? 'Host Notes' : 'Add Host Notes'}
+          </button>
+          {hostNotesOpen && (
+            <textarea
+              value={hostNotesText}
+              onChange={(e) => handleHostNotesChange(e.target.value)}
+              placeholder="Add host-level notes... (auto-saves)"
+              className="mt-1 w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
+              rows={3}
+            />
           )}
         </div>
       </div>

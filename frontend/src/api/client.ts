@@ -125,6 +125,9 @@ export const api = {
   updateServiceNotes: (ip: string, port: number, notes: string | null) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/services/${port}/notes`, { notes }),
 
+  updateHostNotes: (ip: string, notes: string | null) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/notes`, { notes }),
+
   resetDatabase: async (): Promise<{ ok: boolean }> => {
     const url = new URL(`${BASE}/reset`, window.location.origin);
     const res = await fetch(url.toString(), { method: 'DELETE' });
