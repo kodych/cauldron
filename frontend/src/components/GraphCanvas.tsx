@@ -12,6 +12,7 @@ import type { GraphResponse, PathsResponse, HostListResponse, VulnOut } from '..
 interface Props {
   selectedHost: string | null;
   onSelectHost: (ip: string | null) => void;
+  highlightPathIps?: string[] | null;
 }
 
 interface HostVulnInfo {
@@ -26,7 +27,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -468,6 +469,18 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       }
       const base = { ...attrs, size, label, forceLabel, color: nodeColor };
 
+      // Path highlight mode: dim everything except selected path
+      const pathNodeIds = highlightPathIps
+        ? new Set(highlightPathIps.map((ip) => `host:${ip}`))
+        : null;
+
+      if (pathNodeIds) {
+        if (pathNodeIds.has(node)) {
+          return { ...base, size: base.size * 1.5, forceLabel: true, zIndex: 10 };
+        }
+        return { ...base, color: base.color + '15', label: '', size: 2, zIndex: -1 };
+      }
+
       // Attack-only mode: dim nodes not in any attack path
       if (attackOnly && !attackNodeIds.has(node)) {
         if (selectedNodeId && node === selectedNodeId) {
@@ -495,6 +508,18 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         return { ...attrs, hidden: true };
       }
 
+      // Path highlight mode
+      const pathNodeIds = highlightPathIps
+        ? new Set(highlightPathIps.map((ip) => `host:${ip}`))
+        : null;
+
+      if (pathNodeIds) {
+        if (pathNodeIds.has(src) && pathNodeIds.has(tgt)) {
+          return { ...attrs, color: '#ef4444', size: 2.5, zIndex: 10 };
+        }
+        return { ...attrs, hidden: true };
+      }
+
       // Attack-only mode: hide topology edges
       if (attackOnly && edgeType === 'topology') {
         return { ...attrs, hidden: true };
@@ -510,7 +535,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     });
 
     sigma.refresh();
-  }, [selectedHost, graph, attackOnly, attackNodeIds, hiddenNodes]);
+  }, [selectedHost, graph, attackOnly, attackNodeIds, hiddenNodes, highlightPathIps]);
 
   // Tooltip data
   const tooltipData = useMemo(() => {
