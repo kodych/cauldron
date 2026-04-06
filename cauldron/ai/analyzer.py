@@ -180,23 +180,35 @@ def _apply_ai_cves(response: str, pairs: list[tuple[str, str]] | None = None) ->
                 if not cve_id.startswith("CVE-"):
                     continue
 
-                cvss_raw = cve.get("cvss")
-                cvss = float(cvss_raw) if cvss_raw is not None else 0.0
-                severity = cve.get("severity", "MEDIUM")
-                has_exploit = bool(cve.get("has_exploit", False))
-                description = cve.get("description", "")
+                # Verify CVE via NVD API — never trust AI-generated CVSS/description
+                from cauldron.ai.cve_enricher import verify_cve_via_nvd
 
-                # Create Vulnerability node
+                verified = verify_cve_via_nvd(cve_id)
+                if verified:
+                    # Use real NVD data instead of AI hallucinations
+                    cvss = verified.cvss or 0.0
+                    severity = verified.severity or "MEDIUM"
+                    has_exploit = verified.has_exploit
+                    description = verified.description or ""
+                    exploit_url = verified.exploit_url
+                else:
+                    # CVE not in NVD or rejected — skip it entirely
+                    logger.info("AI CVE %s not verified by NVD — skipping", cve_id)
+                    continue
+
+                # Create Vulnerability node with verified NVD data
                 session.run(
                     """
                     MERGE (v:Vulnerability {cve_id: $cve_id})
                     ON CREATE SET
                         v.cvss = $cvss, v.severity = $severity,
                         v.has_exploit = $has_exploit, v.description = $description,
-                        v.source = 'ai', v.confidence = 'likely'
+                        v.exploit_url = $exploit_url,
+                        v.source = 'ai', v.confidence = 'check'
                     """,
                     cve_id=cve_id, cvss=cvss, severity=severity,
                     has_exploit=has_exploit, description=description,
+                    exploit_url=exploit_url,
                 )
 
                 # Link to matching services using exact product+version from our data
