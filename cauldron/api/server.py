@@ -1042,6 +1042,46 @@ def update_service_notes(ip: str, port: int, body: ServiceNotesUpdate):
     return {"ok": True}
 
 
+@app.get("/api/v1/vulns")
+def list_vulns():
+    """List all unique vulnerabilities with affected host counts."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        result = list(session.run("""
+            MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
+            WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
+            RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
+                   v.confidence AS confidence, v.source AS source,
+                   v.description AS description,
+                   count(DISTINCT h.ip) AS host_count,
+                   collect(DISTINCT {ip: h.ip, port: s.port}) AS targets
+            ORDER BY v.has_exploit DESC, v.cvss DESC
+        """))
+
+    vulns = []
+    for r in result:
+        targets = sorted(
+            [{"ip": t["ip"], "port": t["port"]} for t in r["targets"] if t.get("ip")],
+            key=lambda t: (t["ip"], t["port"]),
+        )
+        vulns.append({
+            "cve_id": r["cve_id"],
+            "cvss": r["cvss"],
+            "has_exploit": bool(r["has_exploit"]),
+            "confidence": r["confidence"],
+            "source": r["source"],
+            "description": (r["description"] or "")[:200],
+            "host_count": r["host_count"],
+            "targets": targets,
+            "ips": sorted(set(t["ip"] for t in targets)),
+            "sockets": sorted(set(f"{t['ip']}:{t['port']}" for t in targets)),
+        })
+
+    return {"vulns": vulns, "total": len(vulns)}
+
+
 @app.get("/api/v1/report")
 def get_report(
     fmt: str = Query("md", description="Format: md, json, html"),

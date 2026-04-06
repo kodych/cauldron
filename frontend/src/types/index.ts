@@ -133,6 +133,19 @@ export interface TopologyResponse {
   total_reach_edges: number;
 }
 
+export interface VulnListItem {
+  cve_id: string;
+  cvss: number | null;
+  has_exploit: boolean;
+  confidence: string | null;
+  source: string | null;
+  description: string;
+  host_count: number;
+  targets: Array<{ ip: string; port: number }>;
+  ips: string[];
+  sockets: string[];
+}
+
 export interface CollectHostOut {
   ip: string;
   hostname: string | null;
