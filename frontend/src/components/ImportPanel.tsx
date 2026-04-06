@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import { Upload, FileText, Play, Check, AlertCircle, Brain, Trash2 } from 'lucide-react';
+import { Upload, FileText, Play, Check, AlertCircle, Brain, Trash2, Download } from 'lucide-react';
 import { api } from '../api/client';
 import type { ImportResponse, AnalyzeResponse } from '../types';
 
@@ -315,6 +315,24 @@ export function ImportPanel({ onImported }: Props) {
           <p className="text-xs text-red-400">{error}</p>
         </div>
       )}
+
+      {/* === EXPORT REPORT === */}
+      <div className="border-t border-gray-800 pt-3">
+        <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Export Report</p>
+        <div className="flex gap-2">
+          {(['md', 'json', 'html'] as const).map((fmt) => (
+            <a
+              key={fmt}
+              href={`/api/v1/report?fmt=${fmt}`}
+              download={`cauldron_report.${fmt === 'md' ? 'md' : fmt}`}
+              className="flex-1 flex items-center justify-center gap-1 rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-indigo-950/30 hover:text-indigo-400 transition-colors"
+            >
+              <Download size={11} />
+              {fmt.toUpperCase()}
+            </a>
+          ))}
+        </div>
+      </div>
 
       {/* === CLEAR DATABASE === */}
       <div className="border-t border-gray-800 pt-3">

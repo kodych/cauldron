@@ -291,9 +291,52 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       setHoveredNode(null);
     });
 
+    // --- Node drag-and-drop ---
+    let draggedNode: string | null = null;
+    let isDragging = false;
+
+    sigma.on('downNode', ({ node, event }) => {
+      draggedNode = node;
+      isDragging = false;
+      // Disable camera drag while dragging a node
+      sigma.getCamera().disable();
+      event.original.preventDefault();
+      event.original.stopPropagation();
+    });
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!draggedNode) return;
+      isDragging = true;
+      const coords = sigma.viewportToGraph({ x: e.offsetX, y: e.offsetY });
+      graph.setNodeAttribute(draggedNode, 'x', coords.x);
+      graph.setNodeAttribute(draggedNode, 'y', coords.y);
+    };
+
+    const handleMouseUp = () => {
+      if (draggedNode) {
+        // If it was just a click (not drag), let clickNode handle it
+        if (isDragging) {
+          // Suppress the click after drag
+          sigma.getCamera().enable();
+        } else {
+          sigma.getCamera().enable();
+        }
+        draggedNode = null;
+        isDragging = false;
+      }
+    };
+
+    const container = containerRef.current;
+    container.addEventListener('mousemove', handleMouseMove);
+    container.addEventListener('mouseup', handleMouseUp);
+    container.addEventListener('mouseleave', handleMouseUp);
+
     sigmaRef.current = sigma;
 
     return () => {
+      container.removeEventListener('mousemove', handleMouseMove);
+      container.removeEventListener('mouseup', handleMouseUp);
+      container.removeEventListener('mouseleave', handleMouseUp);
       sigma.kill();
       sigmaRef.current = null;
     };
@@ -380,7 +423,8 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
         }
       }
 
-      const base = { ...attrs, size, label, forceLabel };
+      const color = attrs.color as string;
+      const base = { ...attrs, size, label, forceLabel, color };
 
       // Attack-only mode: dim nodes not in any attack path
       if (attackOnly && !attackNodeIds.has(node)) {
