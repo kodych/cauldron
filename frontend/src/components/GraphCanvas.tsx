@@ -21,6 +21,8 @@ interface HostVulnInfo {
   isNew: boolean;
   isStale: boolean;
   hasChanges: boolean;
+  owned: boolean;
+  target: boolean;
   topVulns: VulnOut[];
 }
 
@@ -34,13 +36,16 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
   const [showFilters, setShowFilters] = useState(false);
   const [filterVulnOnly, setFilterVulnOnly] = useState(false);
   const [filterRoles, setFilterRoles] = useState<Set<string>>(new Set());
+  const [contextMenu, setContextMenu] = useState<{
+    x: number; y: number; ip: string; owned: boolean; target: boolean;
+  } | null>(null);
 
   const { data, loading, error, refetch } = useApi<GraphResponse>(() => api.getGraph(1000), []);
   const { data: pathsData } = useApi<PathsResponse>(
     () => api.getAttackPaths({ top: 50, include_check: true }),
     [],
   );
-  const { data: hostsData } = useApi<HostListResponse>(
+  const { data: hostsData, refetch: refetchHosts } = useApi<HostListResponse>(
     () => api.getHosts({ limit: 1000 }),
     [],
   );
@@ -52,21 +57,24 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     if (!hostsData) return map;
     for (const h of hostsData.hosts) {
       const vulns = h.vulnerabilities;
+      const activeVulns = vulns.filter((v) => v.checked_status !== 'false_positive');
       // Sort vulns: highest confidence first, then by CVSS
       const confOrder: Record<string, number> = { confirmed: 0, likely: 1, check: 2 };
-      const sorted = [...vulns].sort((a, b) => {
+      const sorted = [...activeVulns].sort((a, b) => {
         const ca = confOrder[a.confidence] ?? 2;
         const cb = confOrder[b.confidence] ?? 2;
         if (ca !== cb) return ca - cb;
         return (b.cvss || 0) - (a.cvss || 0);
       });
       map.set(h.ip, {
-        vulnCount: vulns.length,
-        maxCvss: vulns.length > 0 ? Math.max(...vulns.map((v) => v.cvss)) : -1,
-        hasExploit: vulns.some((v) => v.has_exploit),
+        vulnCount: activeVulns.length,
+        maxCvss: activeVulns.length > 0 ? Math.max(...activeVulns.map((v) => v.cvss)) : -1,
+        hasExploit: activeVulns.some((v) => v.has_exploit),
         isNew: h.is_new,
         isStale: h.is_stale,
         hasChanges: h.has_changes,
+        owned: h.owned,
+        target: h.target,
         topVulns: sorted.slice(0, 5),
       });
     }
@@ -280,6 +288,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
     sigma.on('clickStage', () => {
       onSelectHost(null);
+      setContextMenu(null);
     });
 
     sigma.on('enterNode', ({ node, event }) => {
@@ -289,6 +298,22 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
     sigma.on('leaveNode', () => {
       setHoveredNode(null);
+    });
+
+    // --- Right-click context menu (owned/target) ---
+    sigma.on('rightClickNode' as any, ({ node, event }: { node: string; event: any }) => {
+      event.original.preventDefault();
+      const attrs = graph.getNodeAttributes(node);
+      if (attrs.nodeType !== 'host' || !attrs.ip) return;
+      const ip = attrs.ip as string;
+      const info = hostVulnMapRef.current.get(ip);
+      setContextMenu({
+        x: event.original.clientX,
+        y: event.original.clientY,
+        ip,
+        owned: info?.owned ?? false,
+        target: info?.target ?? false,
+      });
     });
 
     // --- Node drag-and-drop ---
@@ -327,9 +352,11 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
     };
 
     const container = containerRef.current;
+    const handleContextMenu = (e: MouseEvent) => e.preventDefault();
     container.addEventListener('mousemove', handleMouseMove);
     container.addEventListener('mouseup', handleMouseUp);
     container.addEventListener('mouseleave', handleMouseUp);
+    container.addEventListener('contextmenu', handleContextMenu);
 
     sigmaRef.current = sigma;
 
@@ -337,6 +364,7 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
       container.removeEventListener('mousemove', handleMouseMove);
       container.removeEventListener('mouseup', handleMouseUp);
       container.removeEventListener('mouseleave', handleMouseUp);
+      container.removeEventListener('contextmenu', handleContextMenu);
       sigma.kill();
       sigmaRef.current = null;
     };
@@ -421,10 +449,24 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
           label = `⚠ ${label}`;
           forceLabel = true;
         }
+
+        // Owned/Target markers
+        if (info.owned) {
+          label = `🔓 ${label}`;
+          forceLabel = true;
+        }
+        if (info.target) {
+          label = `🎯 ${label}`;
+          forceLabel = true;
+        }
       }
 
-      const color = attrs.color as string;
-      const base = { ...attrs, size, label, forceLabel, color };
+      let nodeColor = attrs.color as string;
+      // Owned hosts: green tint ring effect via brighter color
+      if (info?.owned && !attrs.isScanSource) {
+        nodeColor = '#22c55e';  // green — we have access
+      }
+      const base = { ...attrs, size, label, forceLabel, color: nodeColor };
 
       // Attack-only mode: dim nodes not in any attack path
       if (attackOnly && !attackNodeIds.has(node)) {
@@ -705,6 +747,45 @@ export function GraphCanvas({ selectedHost, onSelectHost }: Props) {
 
       </div>
       {renderTooltip()}
+
+      {/* Right-click context menu for owned/target */}
+      {contextMenu && (
+        <div
+          className="fixed z-[999] rounded-lg bg-gray-900 border border-gray-700 shadow-xl py-1 min-w-[160px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onMouseLeave={() => setContextMenu(null)}
+        >
+          <div className="px-3 py-1 text-xs text-gray-500 font-mono border-b border-gray-800">
+            {contextMenu.ip}
+          </div>
+          <button
+            className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-800 flex items-center gap-2"
+            onClick={async () => {
+              await api.setHostOwned(contextMenu.ip, !contextMenu.owned);
+              setContextMenu(null);
+              refetch(); refetchHosts();
+            }}
+          >
+            <span>{contextMenu.owned ? '🔓' : '🔒'}</span>
+            <span className={contextMenu.owned ? 'text-green-400' : 'text-gray-400'}>
+              {contextMenu.owned ? 'Unmark Owned' : 'Mark as Owned'}
+            </span>
+          </button>
+          <button
+            className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-800 flex items-center gap-2"
+            onClick={async () => {
+              await api.setHostTarget(contextMenu.ip, !contextMenu.target);
+              setContextMenu(null);
+              refetch(); refetchHosts();
+            }}
+          >
+            <span>🎯</span>
+            <span className={contextMenu.target ? 'text-red-400' : 'text-gray-400'}>
+              {contextMenu.target ? 'Remove Target' : 'Set as Target'}
+            </span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

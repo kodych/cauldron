@@ -78,8 +78,9 @@ export function HostList({ onSelectHost, selectedHost }: Props) {
 
 function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean; onClick: () => void }) {
   const [expanded, setExpanded] = useState(false);
-  const vulnCount = host.vulnerabilities.length;
-  const maxCvss = vulnCount > 0 ? Math.max(...host.vulnerabilities.map((v) => v.cvss || 0)) : 0;
+  const activeVulns = host.vulnerabilities.filter((v) => v.checked_status !== 'false_positive');
+  const vulnCount = activeVulns.length;
+  const maxCvss = vulnCount > 0 ? Math.max(...activeVulns.map((v) => v.cvss || 0)) : 0;
 
 
   return (
@@ -132,7 +133,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               CHANGED
             </span>
           )}
-          {vulnCount > 0 && host.vulnerabilities.some((v) => v.has_exploit) ? (
+          {vulnCount > 0 && activeVulns.some((v) => v.has_exploit) ? (
             <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
               EXPLOIT
             </span>
@@ -141,6 +142,16 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               VULN
             </span>
           ) : null}
+          {host.owned && (
+            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-xs text-green-400 font-semibold">
+              OWNED
+            </span>
+          )}
+          {host.target && (
+            <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
+              TARGET
+            </span>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation();

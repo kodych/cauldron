@@ -5,6 +5,7 @@ export interface StatsResponse {
   services: number;
   segments: number;
   vulnerabilities: number;
+  findings: number;
   scan_sources: number;
   roles: Record<string, number>;
 }
@@ -45,6 +46,8 @@ export interface HostOut {
   is_new: boolean;
   is_stale: boolean;
   has_changes: boolean;
+  owned: boolean;
+  target: boolean;
   services: ServiceOut[];
   vulnerabilities: VulnOut[];
 }

@@ -121,7 +121,7 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
       <div className="flex items-center gap-1.5 px-3 py-2">
         <Bug size={13} className="text-red-400" />
         <span className="text-xs font-medium text-gray-400">
-          Vulnerabilities ({grouped.length}{grouped.length !== vulns.length ? ` on ${vulns.length} ports` : ''})
+          Vulnerabilities ({grouped.filter(g => g.vuln.checked_status !== 'false_positive').length}{grouped.length !== vulns.length ? ` on ${vulns.filter(v => v.checked_status !== 'false_positive').length} ports` : ''})
         </span>
       </div>
       <div className="px-3 pb-2 space-y-1">

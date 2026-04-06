@@ -42,6 +42,7 @@ class StatsResponse(BaseModel):
     services: int
     segments: int
     vulnerabilities: int
+    findings: int
     scan_sources: int
     roles: dict[str, int]
 
@@ -82,6 +83,8 @@ class HostOut(BaseModel):
     is_new: bool = False
     is_stale: bool = False
     has_changes: bool = False
+    owned: bool = False
+    target: bool = False
     services: list[ServiceOut] = []
     vulnerabilities: list[VulnOut] = []
 
@@ -154,11 +157,17 @@ class AnalyzeResponse(BaseModel):
     topology: dict[str, Any]
     path_summary: dict[str, Any]
     ai_false_positives: int = 0
+    ai_vulns_kept: int = 0
+    ai_vulns_dismissed: int = 0
 
 
 class VulnStatusUpdate(BaseModel):
     status: str | None = None  # exploited, false_positive, mitigated, or null to clear
     port: int | None = None  # port to scope status to (same CVE on different ports = independent)
+
+
+class HostMarkerUpdate(BaseModel):
+    value: bool
 
 
 class GraphNode(BaseModel):
@@ -317,6 +326,7 @@ def get_stats():
         services=stats["services"],
         segments=stats["segments"],
         vulnerabilities=stats["vulnerabilities"],
+        findings=stats["findings"],
         scan_sources=stats["scan_sources"],
         roles=roles,
     )
@@ -383,6 +393,7 @@ def list_hosts(
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
+                   h.owned AS owned, h.target AS target,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {{
                        port: s.port, protocol: s.protocol, state: s.state,
@@ -434,6 +445,8 @@ def list_hosts(
                 is_new=h_is_new,
                 is_stale=h_is_stale,
                 has_changes=h_has_changes,
+                owned=bool(record.get("owned")),
+                target=bool(record.get("target")),
                 services=services,
                 vulnerabilities=vulns,
             ))
@@ -463,6 +476,7 @@ def get_host(ip: str):
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
+                   h.owned AS owned, h.target AS target,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {
                        port: s.port, protocol: s.protocol, state: s.state,
@@ -513,6 +527,8 @@ def get_host(ip: str):
             is_new=h_is_new,
             is_stale=h_is_stale,
             has_changes=h_has_changes,
+            owned=bool(record.get("owned")),
+            target=bool(record.get("target")),
             services=services,
             vulnerabilities=vulns,
         )
@@ -622,7 +638,8 @@ def get_graph(
             WITH h ORDER BY h.ip LIMIT $limit
             OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
-                   h.os_name AS os_name, seg.cidr AS segment
+                   h.os_name AS os_name, h.owned AS owned, h.target AS target,
+                   seg.cidr AS segment
             """,
             limit=limit,
         )
@@ -638,6 +655,8 @@ def get_graph(
                     "role": r["role"] or "unknown",
                     "os_name": r["os_name"],
                     "segment": r["segment"],
+                    "owned": bool(r.get("owned")),
+                    "target": bool(r.get("target")),
                 },
             ))
             seen_nodes.add(node_id)
@@ -837,11 +856,15 @@ def run_analysis(
 
     # Phase 6: AI (optional)
     ai_fp_count = 0
+    ai_kept = 0
+    ai_dismissed = 0
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
             ai_result = analyze_graph()
             ai_fp_count = ai_result.false_positives_found
+            ai_kept = ai_result.vulns_kept
+            ai_dismissed = ai_result.vulns_dismissed
 
     return AnalyzeResponse(
         classification=classification,
@@ -851,6 +874,8 @@ def run_analysis(
         topology=topo_stats,
         path_summary=summary,
         ai_false_positives=ai_fp_count,
+        ai_vulns_kept=ai_kept,
+        ai_vulns_dismissed=ai_dismissed,
     )
 
 
@@ -861,6 +886,28 @@ def get_default_creds(ip: str, port: int):
 
     creds = get_creds_for_graph_service(ip, port)
     return {"ip": ip, "port": port, "creds": creds}
+
+
+@app.patch("/api/v1/hosts/{ip}/owned")
+def update_host_owned(ip: str, body: HostMarkerUpdate):
+    """Mark/unmark a host as owned (compromised)."""
+    _check_neo4j()
+    from cauldron.graph.ingestion import set_host_owned
+
+    if not set_host_owned(ip, body.value):
+        raise HTTPException(status_code=404, detail=f"Host {ip} not found")
+    return {"ok": True}
+
+
+@app.patch("/api/v1/hosts/{ip}/target")
+def update_host_target(ip: str, body: HostMarkerUpdate):
+    """Mark/unmark a host as target (engagement goal)."""
+    _check_neo4j()
+    from cauldron.graph.ingestion import set_host_target
+
+    if not set_host_target(ip, body.value):
+        raise HTTPException(status_code=404, detail=f"Host {ip} not found")
+    return {"ok": True}
 
 
 @app.patch("/api/v1/hosts/{ip}/vulns/{vuln_id}/status")

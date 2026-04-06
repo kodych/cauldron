@@ -120,7 +120,9 @@ def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
             h.mac_vendor = $mac_vendor,
             h.state = $state,
             h.role = $role,
-            h.role_confidence = $role_confidence
+            h.role_confidence = $role_confidence,
+            h.owned = false,
+            h.target = false
         ON MATCH SET
             h.last_seen = $ts,
             h.state = $state,
@@ -333,20 +335,25 @@ def get_graph_stats() -> dict:
             MATCH (h:Host) WITH count(h) as hosts
             OPTIONAL MATCH (s:Service) WITH hosts, count(s) as services
             OPTIONAL MATCH (seg:NetworkSegment) WITH hosts, services, count(seg) as segments
-            OPTIONAL MATCH (v:Vulnerability) WITH hosts, services, segments, count(v) as vulns
-            OPTIONAL MATCH (src:ScanSource) WITH hosts, services, segments, vulns, count(src) as sources
-            RETURN hosts, services, segments, vulns, sources
+            OPTIONAL MATCH ()-[r:HAS_VULN]->(v:Vulnerability)
+            WITH hosts, services, segments, r, v
+            WITH hosts, services, segments,
+                 count(DISTINCT CASE WHEN r.checked_status IS NULL OR r.checked_status <> 'false_positive' THEN v END) as vulns,
+                 sum(CASE WHEN v IS NOT NULL AND (r.checked_status IS NULL OR r.checked_status <> 'false_positive') THEN 1 ELSE 0 END) as findings
+            OPTIONAL MATCH (src:ScanSource) WITH hosts, services, segments, vulns, findings, count(src) as sources
+            RETURN hosts, services, segments, vulns, findings, sources
             """
         )
         record = result.single()
         if record is None:
-            return {"hosts": 0, "services": 0, "segments": 0, "vulnerabilities": 0, "scan_sources": 0}
+            return {"hosts": 0, "services": 0, "segments": 0, "vulnerabilities": 0, "findings": 0, "scan_sources": 0}
 
         return {
             "hosts": record["hosts"],
             "services": record["services"],
             "segments": record["segments"],
             "vulnerabilities": record["vulns"],
+            "findings": record["findings"],
             "scan_sources": record["sources"],
         }
 
@@ -428,4 +435,40 @@ def classify_graph_hosts() -> dict:
                 role_name = classification.role.value
                 stats["roles"][role_name] = stats["roles"].get(role_name, 0) + 1
 
+            # Auto-target domain controllers
+            if classification.role.value == "domain_controller":
+                session.run(
+                    "MATCH (h:Host {ip: $ip}) WHERE h.target <> true SET h.target = true",
+                    ip=ip,
+                )
+
     return stats
+
+
+def set_host_owned(ip: str, owned: bool) -> bool:
+    """Mark a host as owned (compromised) or unmark it.
+
+    When marking as owned, target is automatically cleared — goal achieved.
+    """
+    with get_session() as session:
+        if owned:
+            result = session.run(
+                "MATCH (h:Host {ip: $ip}) SET h.owned = true, h.target = false RETURN h.ip",
+                ip=ip,
+            )
+        else:
+            result = session.run(
+                "MATCH (h:Host {ip: $ip}) SET h.owned = false RETURN h.ip",
+                ip=ip,
+            )
+        return result.single() is not None
+
+
+def set_host_target(ip: str, target: bool) -> bool:
+    """Mark a host as target (engagement goal) or unmark it."""
+    with get_session() as session:
+        result = session.run(
+            "MATCH (h:Host {ip: $ip}) SET h.target = $target RETURN h.ip",
+            ip=ip, target=target,
+        )
+        return result.single() is not None

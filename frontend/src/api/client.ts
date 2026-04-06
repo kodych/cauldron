@@ -105,6 +105,12 @@ export const api = {
   runAnalysis: (options?: { nvd?: boolean; ai?: boolean }) =>
     post<AnalyzeResponse>('/analyze', options),
 
+  setHostOwned: (ip: string, owned: boolean) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/owned`, { value: owned }),
+
+  setHostTarget: (ip: string, target: boolean) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/target`, { value: target }),
+
   getDefaultCreds: (ip: string, port: number) =>
     get<{ ip: string; port: number; creds: Array<{ username: string; password: string }> }>(
       `/hosts/${ip}/services/${port}/default-creds`,
