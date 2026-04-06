@@ -733,7 +733,8 @@ def serve(host: str, port: int, reload: bool):
               help="Report format (default: markdown)")
 @click.option("-o", "--output", default=None, type=click.Path(), help="Output file (default: stdout)")
 @click.option("--top", default=20, help="Number of top findings to include")
-def pour(fmt: str, output: str | None, top: int):
+@click.option("--notes", is_flag=True, default=False, help="Include pentester notes in report")
+def pour(fmt: str, output: str | None, top: int, notes: bool):
     """Export scan report from the cauldron."""
     from cauldron.graph.connection import verify_connection
 
@@ -745,11 +746,11 @@ def pour(fmt: str, output: str | None, top: int):
         from cauldron.report import generate_markdown, generate_json, generate_html
 
         if fmt == "json":
-            content = generate_json(top=top)
+            content = generate_json(top=top, include_notes=notes)
         elif fmt == "html":
-            content = generate_html(top=top)
+            content = generate_html(top=top, include_notes=notes)
         else:
-            content = generate_markdown(top=top)
+            content = generate_markdown(top=top, include_notes=notes)
 
     if output:
         Path(output).write_text(content, encoding="utf-8")

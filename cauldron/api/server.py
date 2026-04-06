@@ -86,6 +86,7 @@ class HostOut(BaseModel):
     has_changes: bool = False
     owned: bool = False
     target: bool = False
+    notes: str | None = None
     services: list[ServiceOut] = []
     vulnerabilities: list[VulnOut] = []
 
@@ -395,7 +396,7 @@ def list_hosts(
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
-                   h.owned AS owned, h.target AS target,
+                   h.owned AS owned, h.target AS target, h.notes AS notes,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {{
                        port: s.port, protocol: s.protocol, state: s.state,
@@ -449,6 +450,7 @@ def list_hosts(
                 has_changes=h_has_changes,
                 owned=bool(record.get("owned")),
                 target=bool(record.get("target")),
+                notes=record.get("notes"),
                 services=services,
                 vulnerabilities=vulns,
             ))
@@ -478,7 +480,7 @@ def get_host(ip: str):
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
-                   h.owned AS owned, h.target AS target,
+                   h.owned AS owned, h.target AS target, h.notes AS notes,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
                    collect(DISTINCT {
                        port: s.port, protocol: s.protocol, state: s.state,
@@ -531,6 +533,7 @@ def get_host(ip: str):
             has_changes=h_has_changes,
             owned=bool(record.get("owned")),
             target=bool(record.get("target")),
+            notes=record.get("notes"),
             services=services,
             vulnerabilities=vulns,
         )
@@ -912,6 +915,32 @@ def update_host_target(ip: str, body: HostMarkerUpdate):
     return {"ok": True}
 
 
+class HostNotesUpdate(BaseModel):
+    notes: str | None = None
+
+
+@app.patch("/api/v1/hosts/{ip}/notes")
+def update_host_notes(ip: str, body: HostNotesUpdate):
+    """Update pentester notes on a host."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host {ip: $ip})
+            SET h.notes = $notes
+            RETURN h.ip AS ip
+            """,
+            ip=ip,
+            notes=body.notes,
+        )
+        if not result.single():
+            raise HTTPException(status_code=404, detail=f"Host {ip} not found")
+
+    return {"ok": True}
+
+
 @app.patch("/api/v1/hosts/{ip}/vulns/{vuln_id}/status")
 def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
     """Update checked status for a vulnerability on a specific host."""
@@ -1017,6 +1046,7 @@ def update_service_notes(ip: str, port: int, body: ServiceNotesUpdate):
 def get_report(
     fmt: str = Query("md", description="Format: md, json, html"),
     top: int = Query(20, description="Number of top findings"),
+    notes: bool = Query(False, description="Include pentester notes in report"),
 ):
     """Generate and download scan report."""
     _check_neo4j()
@@ -1024,13 +1054,13 @@ def get_report(
     from fastapi.responses import PlainTextResponse
 
     if fmt == "json":
-        content = generate_json(top=top)
+        content = generate_json(top=top, include_notes=notes)
         return PlainTextResponse(content, media_type="application/json")
     elif fmt == "html":
-        content = generate_html(top=top)
+        content = generate_html(top=top, include_notes=notes)
         return PlainTextResponse(content, media_type="text/html")
     else:
-        content = generate_markdown(top=top)
+        content = generate_markdown(top=top, include_notes=notes)
         return PlainTextResponse(content, media_type="text/markdown")
 
 

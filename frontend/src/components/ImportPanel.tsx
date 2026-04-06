@@ -22,6 +22,7 @@ export function ImportPanel({ onImported }: Props) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [analyzeElapsed, setAnalyzeElapsed] = useState(0);
+  const [includeNotes, setIncludeNotes] = useState(false);
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.endsWith('.xml')) {
@@ -319,11 +320,20 @@ export function ImportPanel({ onImported }: Props) {
       {/* === EXPORT REPORT === */}
       <div className="border-t border-gray-800 pt-3">
         <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Export Report</p>
+        <label className="flex items-center gap-2 px-1 mb-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={includeNotes}
+            onChange={(e) => setIncludeNotes(e.target.checked)}
+            className="rounded border-gray-600 bg-gray-800 text-blue-500"
+          />
+          <span className="text-xs text-gray-400">Include notes</span>
+        </label>
         <div className="flex gap-2">
           {(['md', 'json', 'html'] as const).map((fmt) => (
             <a
               key={fmt}
-              href={`/api/v1/report?fmt=${fmt}`}
+              href={`/api/v1/report?fmt=${fmt}${includeNotes ? '&notes=true' : ''}`}
               download={`cauldron_report.${fmt === 'md' ? 'md' : fmt}`}
               className="flex-1 flex items-center justify-center gap-1 rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-indigo-950/30 hover:text-indigo-400 transition-colors"
             >
