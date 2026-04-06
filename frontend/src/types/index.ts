@@ -18,6 +18,7 @@ export interface ServiceOut {
   product: string | null;
   version: string | null;
   bruteforceable: boolean;
+  notes: string | null;
   is_new: boolean;
   is_stale: boolean;
 }

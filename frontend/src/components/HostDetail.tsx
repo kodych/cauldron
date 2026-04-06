@@ -1,5 +1,5 @@
-import { useState, useCallback, useMemo } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key } from 'lucide-react';
+import { useState, useCallback, useMemo, useRef } from 'react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -349,6 +349,27 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
     finally { setCredsLoading(false); }
   }, [hostIp, credsPort]);
 
+  const [notesPort, setNotesPort] = useState<number | null>(null);
+  const [notesText, setNotesText] = useState('');
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleToggleNotes = useCallback((port: number, currentNotes: string | null) => {
+    if (notesPort === port) { setNotesPort(null); return; }
+    setNotesPort(port);
+    setNotesText(currentNotes || '');
+  }, [notesPort]);
+
+  const handleNotesChange = useCallback((value: string) => {
+    setNotesText(value);
+    // Auto-save after 500ms of inactivity
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        await api.updateServiceNotes(hostIp, notesPort!, value || null);
+      } catch (e) { console.error('Failed to save notes:', e); }
+    }, 500);
+  }, [hostIp, notesPort]);
+
   return (
     <div className="border-b border-gray-800">
       <div className="flex items-center gap-1.5 px-3 py-2">
@@ -412,6 +433,19 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                     <Key size={9} className="inline mr-0.5 -mt-px" />CREDS
                   </button>
                 )}
+                <button
+                  onClick={() => handleToggleNotes(s.port, s.notes)}
+                  className={`shrink-0 rounded px-1 py-0 text-xs transition-colors ${
+                    notesPort === s.port
+                      ? 'bg-blue-900/30 text-blue-400 font-semibold'
+                      : s.notes
+                        ? 'bg-blue-900/20 text-blue-400/70'
+                        : 'bg-gray-800 text-gray-600 hover:text-blue-400'
+                  }`}
+                  title={s.notes ? 'Edit notes' : 'Add notes'}
+                >
+                  <MessageSquare size={9} className="inline mr-0.5 -mt-px" />{s.notes ? 'NOTE' : '+'}
+                </button>
               </div>
               {credsPort === s.port && (
                 <div className="ml-16 mb-1 rounded bg-yellow-950/20 border border-yellow-800/30 px-2 py-1">
@@ -439,6 +473,17 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                   ) : (
                     <span className="text-xs text-gray-500">No known default credentials</span>
                   )}
+                </div>
+              )}
+              {notesPort === s.port && (
+                <div className="ml-16 mb-1">
+                  <textarea
+                    value={notesText}
+                    onChange={(e) => handleNotesChange(e.target.value)}
+                    placeholder="Add notes... (auto-saves)"
+                    className="w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
+                    rows={3}
+                  />
                 </div>
               )}
             </div>

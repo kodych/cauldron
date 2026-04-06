@@ -55,6 +55,7 @@ class ServiceOut(BaseModel):
     product: str | None = None
     version: str | None = None
     bruteforceable: bool = False
+    notes: str | None = None
     is_new: bool = False
     is_stale: bool = False
 
@@ -295,6 +296,7 @@ def _parse_service_record(s: dict, host_first_seen: str | None = None,
         product=s.get("product"),
         version=s.get("version"),
         bruteforceable=bool(s.get("bruteforceable") or s.get("bruteforceable_manual")),
+        notes=s.get("notes"),
         is_new=is_new,
         is_stale=is_stale,
     )
@@ -398,7 +400,7 @@ def list_hosts(
                    collect(DISTINCT {{
                        port: s.port, protocol: s.protocol, state: s.state,
                        name: s.name, product: s.product, version: s.version,
-                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual,
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual, notes: s.notes,
                        first_seen: s.first_seen, last_seen: s.last_seen
                    }}) AS services,
                    collect(DISTINCT {{
@@ -481,7 +483,7 @@ def get_host(ip: str):
                    collect(DISTINCT {
                        port: s.port, protocol: s.protocol, state: s.state,
                        name: s.name, product: s.product, version: s.version,
-                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual,
+                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual, notes: s.notes,
                        first_seen: s.first_seen, last_seen: s.last_seen
                    }) AS services,
                    collect(DISTINCT {
@@ -982,6 +984,31 @@ def update_service_bruteforceable(ip: str, port: int, body: BruteforceableUpdate
                 status_code=404,
                 detail=f"Service port {port} not found on host {ip}",
             )
+
+    return {"ok": True}
+
+
+class ServiceNotesUpdate(BaseModel):
+    notes: str | None = None
+
+
+@app.patch("/api/v1/hosts/{ip}/services/{port}/notes")
+def update_service_notes(ip: str, port: int, body: ServiceNotesUpdate):
+    """Update notes on a service (pentester's working notes)."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})
+            SET s.notes = $notes
+            RETURN s.port AS port
+            """,
+            ip=ip, port=port, notes=body.notes,
+        )
+        if not result.single():
+            raise HTTPException(status_code=404, detail=f"Service port {port} not found on host {ip}")
 
     return {"ok": True}
 
