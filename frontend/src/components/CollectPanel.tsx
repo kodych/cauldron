@@ -1,8 +1,9 @@
 import { useState, useCallback } from 'react';
-import { Clipboard, Check, Terminal, Filter, Hash } from 'lucide-react';
+import { Clipboard, Check, Terminal, Filter, Hash, Bug, ChevronDown, ChevronUp } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import type { CollectResponse } from '../types';
+import { getCvssColor } from '../utils/colors';
+import type { CollectResponse, VulnListItem } from '../types';
 
 const QUICK_FILTERS = [
   { name: 'smb', label: 'SMB', desc: 'Port 445' },
@@ -27,6 +28,11 @@ export function CollectPanel() {
   const [result, setResult] = useState<CollectResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showVulns, setShowVulns] = useState(false);
+  const { data: vulnData } = useApi<{ vulns: VulnListItem[]; total: number }>(
+    () => showVulns ? api.getVulns() : Promise.resolve({ vulns: [], total: 0 }),
+    [showVulns],
+  );
 
   const runCollect = useCallback(async (filter?: string, port?: number) => {
     setLoading(true);
@@ -123,6 +129,29 @@ export function CollectPanel() {
         </div>
       </div>
 
+      {/* By Vulnerability section */}
+      <div className="p-2 border-b border-gray-800">
+        <button
+          onClick={() => setShowVulns(!showVulns)}
+          className="flex items-center gap-1.5 w-full text-left"
+        >
+          <Bug size={13} className="text-red-400" />
+          <span className="text-xs font-medium text-gray-400 flex-1">By Vulnerability</span>
+          {showVulns ? <ChevronUp size={13} className="text-gray-600" /> : <ChevronDown size={13} className="text-gray-600" />}
+        </button>
+
+        {showVulns && vulnData && vulnData.vulns.length > 0 && (
+          <div className="mt-2 space-y-0.5 max-h-[50vh] overflow-y-auto">
+            {vulnData.vulns.map((v) => (
+              <VulnCollectRow key={v.cve_id} vuln={v} />
+            ))}
+          </div>
+        )}
+        {showVulns && vulnData && vulnData.vulns.length === 0 && (
+          <p className="mt-2 text-xs text-gray-600">No vulnerabilities found. Run analysis first.</p>
+        )}
+      </div>
+
       {/* Results */}
       {loading && (
         <div className="p-4 text-center">
@@ -178,9 +207,105 @@ export function CollectPanel() {
         </div>
       )}
 
-      {!result && !loading && !error && (
+      {!result && !loading && !error && !showVulns && (
         <div className="p-4 text-center text-xs text-gray-600">
           Select a filter to collect targets
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function PortGroupedTargets({ targets }: { targets: Array<{ ip: string; port: number }> }) {
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  // Group by port
+  const groups = new Map<number, string[]>();
+  for (const t of targets) {
+    const list = groups.get(t.port) || [];
+    if (!list.includes(t.ip)) list.push(t.ip);
+    groups.set(t.port, list);
+  }
+  const sortedPorts = [...groups.keys()].sort((a, b) => a - b);
+
+  const copyList = useCallback(async (text: string, key: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
+  }, []);
+
+  return (
+    <div className="font-mono text-xs space-y-1">
+      {sortedPorts.map((port) => {
+        const ips = groups.get(port) || [];
+        return (
+          <div key={port}>
+            <div className="flex items-center gap-1.5 mb-0.5">
+              <span className="text-gray-500">:{port}</span>
+              <span className="text-gray-700">({ips.length})</span>
+              <div className="flex-1" />
+              <button
+                onClick={() => copyList(ips.join('\n'), `ip:${port}`)}
+                className="flex items-center gap-0.5 rounded bg-gray-800 px-1 py-0 text-gray-600 hover:text-gray-300"
+                title={`Copy ${ips.length} IPs`}
+              >
+                {copiedKey === `ip:${port}` ? <Check size={9} className="text-green-400" /> : <Clipboard size={9} />}
+                <span className="text-[10px]">IP</span>
+              </button>
+              <button
+                onClick={() => copyList(ips.map(ip => `${ip}:${port}`).join('\n'), `sock:${port}`)}
+                className="flex items-center gap-0.5 rounded bg-gray-800 px-1 py-0 text-gray-600 hover:text-gray-300"
+                title={`Copy ${ips.length} IP:${port} sockets`}
+              >
+                {copiedKey === `sock:${port}` ? <Check size={9} className="text-green-400" /> : <Clipboard size={9} />}
+                <span className="text-[10px]">Socket</span>
+              </button>
+            </div>
+            {ips.map((ip) => (
+              <div key={ip} className="pl-4 text-green-400 py-0 hover:bg-gray-800/30">{ip}</div>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+function VulnCollectRow({ vuln }: { vuln: VulnListItem }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const cvssColor = vuln.cvss ? getCvssColor(vuln.cvss) : '#6b7280';
+
+  return (
+    <div className="rounded bg-gray-800/30">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left hover:bg-gray-800/50 transition-colors"
+      >
+        <span className="text-xs font-mono font-semibold" style={{ color: cvssColor }}>
+          {vuln.cvss?.toFixed(1) || 'N/A'}
+        </span>
+        <span className="text-xs text-gray-300 flex-1 truncate">{vuln.cve_id}</span>
+        {vuln.has_exploit && (
+          <span className="shrink-0 rounded px-1 py-0 text-xs bg-red-900/30 text-red-400 font-semibold">EXP</span>
+        )}
+        <span className="text-xs text-gray-500">{vuln.host_count}h</span>
+        {expanded ? <ChevronUp size={11} className="text-gray-600" /> : <ChevronDown size={11} className="text-gray-600" />}
+      </button>
+
+      {expanded && (
+        <div className="px-2 pb-2">
+          {vuln.description && (
+            <p className="text-xs text-gray-500 mb-1.5">{vuln.description}</p>
+          )}
+          <div className="flex items-center gap-1 mb-1">
+            <span className="text-xs text-gray-600">{vuln.source}</span>
+            <span className="text-xs text-gray-700">·</span>
+            <span className="text-xs text-gray-600">{vuln.confidence}</span>
+          </div>
+          <PortGroupedTargets targets={vuln.targets} />
         </div>
       )}
     </div>

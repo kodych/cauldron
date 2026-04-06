@@ -11,6 +11,7 @@ import type {
   ImportResponse,
   AnalyzeResponse,
   VulnStatus,
+  VulnListItem,
 } from '../types';
 
 const BASE = '/api/v1';
@@ -88,6 +89,8 @@ export const api = {
     get<CollectResponse>('/collect', params as Record<string, string | number>),
 
   getCollectFilters: () => get<Record<string, string>>('/collect/filters'),
+
+  getVulns: () => get<{ vulns: VulnListItem[]; total: number }>('/vulns'),
 
   importScan: async (file: File, source?: string): Promise<ImportResponse> => {
     const url = new URL(`${BASE}/import`, window.location.origin);
