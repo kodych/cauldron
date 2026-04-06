@@ -13,6 +13,7 @@ interface Props {
   selectedHost: string | null;
   onSelectHost: (ip: string | null) => void;
   highlightPathIps?: string[] | null;
+  onClearPath?: () => void;
 }
 
 interface HostVulnInfo {
@@ -27,7 +28,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -290,6 +291,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps }: Pr
     sigma.on('clickStage', () => {
       onSelectHost(null);
       setContextMenu(null);
+      onClearPath?.();
     });
 
     sigma.on('enterNode', ({ node, event }) => {

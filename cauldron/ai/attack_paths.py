@@ -125,11 +125,16 @@ def discover_attack_paths(
         direct = _find_direct_paths(session, target_role, target_ip)
         paths.extend(direct)
 
-        # 2. Pivot paths through owned/scan-source hosts
+        # Collect IPs already reachable via direct paths
+        direct_target_ips = {p.target_ip for p in direct}
+
+        # 2. Pivot paths — only for hosts NOT reachable directly
         pivot = _find_pivot_paths(session, target_role, target_ip)
+        # Filter: keep only pivot paths to targets not already in direct paths
+        pivot = [p for p in pivot if p.target_ip not in direct_target_ips]
         paths.extend(pivot)
 
-        # 3. Lateral from owned: owned host → adjacent vulnerable hosts
+        # 3. Lateral from owned: owned host → vulnerable hosts
         lateral = _find_lateral_paths(session, positions, target_role, target_ip)
         paths.extend(lateral)
 
@@ -313,11 +318,15 @@ def _find_pivot_paths(
 
         where_str = " AND ".join(where_clauses)
 
-        # Find targets ONLY reachable through pivot (not visible from external scan)
+        # Find targets ONLY reachable through pivot
+        # Target visible from internal scan AND from NO other scan source
         target_result = session.run(
             f"""
             MATCH (src:ScanSource {{name: $int_source}})-[:SCANNED_FROM]->(h:Host)
-            WHERE NOT ((:ScanSource {{name: $ext_source}})-[:SCANNED_FROM]->(h))
+            OPTIONAL MATCH (other:ScanSource)-[:SCANNED_FROM]->(h)
+            WHERE other.name <> $int_source
+            WITH h, collect(other.name) AS other_sources
+            WHERE size(other_sources) = 0
             MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
             WHERE {where_str}
             WITH h,

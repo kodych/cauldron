@@ -120,6 +120,7 @@ export function Layout() {
           selectedHost={selectedHost}
           onSelectHost={handleSelectHost}
           highlightPathIps={selectedPathIps}
+          onClearPath={() => setSelectedPathIps(null)}
         />
       </div>
     </div>
