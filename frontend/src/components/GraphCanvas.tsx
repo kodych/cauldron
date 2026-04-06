@@ -790,7 +790,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
             onClick={async () => {
               await api.setHostOwned(contextMenu.ip, !contextMenu.owned);
               setContextMenu(null);
-              refetch(); refetchHosts();
+              refetchHosts();  // Only refresh host data, not graph structure
             }}
           >
             <span>{contextMenu.owned ? '🔓' : '🔒'}</span>
@@ -803,7 +803,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
             onClick={async () => {
               await api.setHostTarget(contextMenu.ip, !contextMenu.target);
               setContextMenu(null);
-              refetch(); refetchHosts();
+              refetchHosts();  // Only refresh host data, not graph structure
             }}
           >
             <span>🎯</span>
