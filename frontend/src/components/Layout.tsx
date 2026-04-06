@@ -104,7 +104,10 @@ export function Layout() {
                 )}
                 {activeTab === 'paths' && <AttackPaths onSelectPath={setSelectedPathIps} onSelectHost={handleSelectHost} refreshKey={dataVersion} />}
                 {activeTab === 'collect' && <CollectPanel />}
-                {activeTab === 'import' && <ImportPanel onImported={handleImported} />}
+                {/* ImportPanel stays mounted (hidden) so analysis doesn't abort on tab switch */}
+                <div className={activeTab === 'import' ? '' : 'hidden'}>
+                  <ImportPanel onImported={handleImported} />
+                </div>
               </>
             )}
           </div>
