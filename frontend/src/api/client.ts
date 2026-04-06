@@ -122,6 +122,9 @@ export const api = {
   updateServiceBruteforceable: (ip: string, port: number, bruteforceable: boolean) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/services/${port}/bruteforceable`, { bruteforceable }),
 
+  updateServiceNotes: (ip: string, port: number, notes: string | null) =>
+    patch<{ ok: boolean }>(`/hosts/${ip}/services/${port}/notes`, { notes }),
+
   resetDatabase: async (): Promise<{ ok: boolean }> => {
     const url = new URL(`${BASE}/reset`, window.location.origin);
     const res = await fetch(url.toString(), { method: 'DELETE' });
