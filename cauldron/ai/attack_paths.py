@@ -300,6 +300,7 @@ def _find_pivot_paths(
         ]
         params: dict = {
             "int_source": int_source,
+            "ext_source": ext_source,
             "pivot_ip": pivot_ip,
         }
 
@@ -312,10 +313,11 @@ def _find_pivot_paths(
 
         where_str = " AND ".join(where_clauses)
 
-        # Find targets discovered by the internal scan that have vulns
+        # Find targets ONLY reachable through pivot (not visible from external scan)
         target_result = session.run(
             f"""
             MATCH (src:ScanSource {{name: $int_source}})-[:SCANNED_FROM]->(h:Host)
+            WHERE NOT ((:ScanSource {{name: $ext_source}})-[:SCANNED_FROM]->(h))
             MATCH (h)-[:HAS_SERVICE]->(s:Service)-[:HAS_VULN]->(v:Vulnerability)
             WHERE {where_str}
             WITH h,

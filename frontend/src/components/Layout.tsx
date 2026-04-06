@@ -20,6 +20,7 @@ export function Layout() {
   const [selectedHost, setSelectedHost] = useState<string | null>(null);
   const [showHostDetail, setShowHostDetail] = useState(false);
   const [graphKey, setGraphKey] = useState(0);
+  const [selectedPathIps, setSelectedPathIps] = useState<string[] | null>(null);
 
   const handleSelectHost = useCallback((ip: string | null) => {
     setSelectedHost(ip);
@@ -100,7 +101,7 @@ export function Layout() {
                 {activeTab === 'hosts' && (
                   <HostList onSelectHost={handleSelectHost} selectedHost={selectedHost} />
                 )}
-                {activeTab === 'paths' && <AttackPaths />}
+                {activeTab === 'paths' && <AttackPaths onSelectPath={setSelectedPathIps} />}
                 {activeTab === 'collect' && <CollectPanel />}
                 {activeTab === 'import' && <ImportPanel onImported={handleImported} />}
               </>
@@ -118,6 +119,7 @@ export function Layout() {
           key={graphKey}
           selectedHost={selectedHost}
           onSelectHost={handleSelectHost}
+          highlightPathIps={selectedPathIps}
         />
       </div>
     </div>

@@ -6,8 +6,13 @@ import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors'
 import { formatCvss } from '../utils/format';
 import type { PathsResponse, AttackPathOut } from '../types';
 
-export function AttackPaths() {
+interface AttackPathsProps {
+  onSelectPath?: (ips: string[] | null) => void;
+}
+
+export function AttackPaths({ onSelectPath }: AttackPathsProps) {
   const [includeCheck, setIncludeCheck] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const { data, loading, error } = useApi<PathsResponse>(
     () => api.getAttackPaths({ top: 50, include_check: includeCheck }),
     [includeCheck],
@@ -71,7 +76,18 @@ export function AttackPaths() {
           </div>
         ) : (
           data.paths.map((path, i) => (
-            <PathCard key={i} path={path} index={i + 1} />
+            <PathCard key={i} path={path} index={i + 1} selected={selectedIndex === i}
+              onSelect={() => {
+                if (selectedIndex === i) {
+                  setSelectedIndex(null);
+                  onSelectPath?.(null);
+                } else {
+                  setSelectedIndex(i);
+                  const ips = path.nodes.map((n) => n.ip);
+                  onSelectPath?.(ips);
+                }
+              }}
+            />
           ))
         )}
       </div>
@@ -79,14 +95,16 @@ export function AttackPaths() {
   );
 }
 
-function PathCard({ path, index }: { path: AttackPathOut; index: number }) {
+function PathCard({ path, index, selected, onSelect }: {
+  path: AttackPathOut; index: number; selected?: boolean; onSelect?: () => void;
+}) {
   const [expanded, setExpanded] = useState(false);
 
 
   return (
-    <div className="border-b border-gray-800/50">
+    <div className={`border-b border-gray-800/50 ${selected ? 'bg-indigo-950/30' : ''}`}>
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => { setExpanded(!expanded); onSelect?.(); }}
         className="w-full px-3 py-2.5 text-left hover:bg-gray-800/30 transition-colors"
       >
         <div className="flex items-center gap-2">
