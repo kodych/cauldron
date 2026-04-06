@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import Generator
 
 from neo4j import Driver, GraphDatabase, Session
 
 from cauldron.config import settings
+
+# Suppress Neo4j driver deprecation warnings (NotificationDisabledCategory)
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="neo4j")
 
 _driver: Driver | None = None
 
@@ -16,9 +20,17 @@ def get_driver() -> Driver:
     """Get or create the Neo4j driver singleton."""
     global _driver
     if _driver is None:
+        # Disable "property does not exist" warnings from Neo4j
+        # These fire when querying notes/owned/target before first SET
+        try:
+            from neo4j import NotificationDisabledClassification
+            disabled = [NotificationDisabledClassification.UNRECOGNIZED]
+        except ImportError:
+            disabled = None
         _driver = GraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
+            **({"notifications_disabled_classifications": disabled} if disabled else {}),
         )
     return _driver
 
