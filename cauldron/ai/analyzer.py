@@ -49,6 +49,7 @@ class AnalysisResult:
     false_positives_found: int = 0
     vulns_kept: int = 0
     vulns_dismissed: int = 0
+    targets_set: int = 0
 
 
 def is_ai_available() -> bool:
@@ -83,10 +84,22 @@ def analyze_graph() -> AnalysisResult:
     # Phase 3: Contextual engagement triage
     # AI reviews ALL vulns with engagement context (owned/target/scan sources)
     # and dismisses noise — keeping only gold findings
-    kept, dismissed = _contextual_vuln_triage()
+    kept, dismissed, targets = _contextual_vuln_triage()
     result.vulns_kept = kept
     result.vulns_dismissed = dismissed
     result.false_positives_found = dismissed
+    result.targets_set = targets
+
+    # Recount AI CVEs that survived triage (not dismissed)
+    with get_session() as session:
+        surviving = session.run(
+            """
+            MATCH ()-[r:HAS_VULN]->(v:Vulnerability {source: 'ai'})
+            WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
+            RETURN count(DISTINCT v.cve_id) AS c
+            """
+        ).single()
+        result.cves_found = surviving["c"] if surviving else 0
 
     return result
 
@@ -403,18 +416,20 @@ TARGET HOSTS (engagement goals): {', '.join(target_lines) if target_lines else '
     # Batch hosts: 15 per API call
     total_kept = 0
     total_dismissed = 0
+    total_targets = 0
 
     for i in range(0, len(hosts), 15):
         batch = hosts[i:i + 15]
         batch_num = i // 15 + 1
         batch_total = (len(hosts) + 14) // 15
         logger.info("AI triage batch %d/%d (%d hosts)", batch_num, batch_total, len(batch))
-        k, d = _triage_batch(batch, ip_map, reverse_map, context)
-        logger.info("AI triage batch %d result: kept=%d, dismissed=%d", batch_num, k, d)
+        k, d, t = _triage_batch(batch, ip_map, reverse_map, context)
+        logger.info("AI triage batch %d result: kept=%d, dismissed=%d, targets=%d", batch_num, k, d, t)
         total_kept += k
         total_dismissed += d
+        total_targets += t
 
-    return total_kept, total_dismissed
+    return total_kept, total_dismissed, total_targets
 
 
 def _triage_batch(
@@ -422,7 +437,7 @@ def _triage_batch(
     ip_map: dict[str, str],
     reverse_map: dict[str, str],
     context: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Send a batch of hosts to AI for contextual triage."""
     lines = []
     vuln_count = 0
@@ -481,7 +496,7 @@ CRITICAL: Do NOT dismiss CAULDRON-* IDs just because they are not standard CVEs.
 If unsure, KEEP. Missing a real vuln is worse than keeping noise.
 
 Respond with ONLY JSON:
-[{{"id": "host-N", "vulns": [
+[{{"id": "host-N", "suggest_target": true, "vulns": [
   {{"cve_id": "CVE-YYYY-NNNNN", "port": 443, "verdict": "keep"}},
   {{"cve_id": "CAULDRON-041", "port": 5432, "verdict": "keep"}},
   {{"cve_id": "CVE-YYYY-NNNNN", "port": 22, "verdict": "dismiss", "reason": "Local privesc, host not owned"}}
@@ -491,24 +506,31 @@ Rules:
 - "cve_id" field contains the vulnerability ID exactly as shown above (CVE-* or CAULDRON-*)
 - verdict must be "keep" or "dismiss"
 - reason required for dismiss, optional for keep
+- "suggest_target": true — set on hosts that should be priority targets
+  (domain controllers, critical databases, mail servers, management interfaces)
+  Only suggest targets that are NOT already marked as TARGET
 - Include ALL vulns for each host (don't omit any)
 - Respond with ONLY the JSON, no other text"""
 
     response = _call_claude(prompt, max_tokens=4096)
     if not response:
-        return vuln_count, 0  # If AI fails, keep everything
+        return vuln_count, 0, 0  # If AI fails, keep everything
 
     return _apply_triage(response, reverse_map)
 
 
-def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int]:
-    """Parse triage response and apply dismiss verdicts to Neo4j."""
+def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int, int]:
+    """Parse triage response and apply dismiss verdicts + target suggestions.
+
+    Returns: (kept, dismissed, targets_set)
+    """
     data = _parse_json_response(response)
     if not isinstance(data, list):
-        return 0, 0
+        return 0, 0, 0
 
     kept = 0
     dismissed = 0
+    targets_set = 0
 
     with get_session() as session:
         for item in data:
@@ -517,6 +539,21 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int]
             alias = item.get("id", "")
             real_ip = reverse_map.get(alias, alias)
 
+            # AI target suggestion
+            if item.get("suggest_target"):
+                result = session.run(
+                    """
+                    MATCH (h:Host {ip: $ip})
+                    WHERE h.target <> true AND h.owned <> true
+                    SET h.target = true
+                    RETURN h.ip AS ip
+                    """,
+                    ip=real_ip,
+                )
+                if result.single():
+                    targets_set += 1
+                    logger.info("AI suggested target: %s", real_ip)
+
             for v in item.get("vulns", []):
                 if not isinstance(v, dict):
                     continue
@@ -524,29 +561,43 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int]
                 cve_id = v.get("cve_id", "")
                 port = v.get("port")
 
-                if not cve_id or not isinstance(port, int):
+                if not cve_id:
                     continue
 
                 if verdict == "dismiss":
                     reason = v.get("reason", "AI triage: not exploitable in engagement context")
-                    result = session.run(
-                        """
-                        MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})
-                              -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
-                        WHERE r.checked_status IS NULL
-                        SET r.checked_status = 'false_positive',
-                            r.ai_fp_reason = $reason
-                        RETURN v.cve_id AS cve_id
-                        """,
-                        ip=real_ip, port=port, cve_id=cve_id, reason=reason,
-                    )
+                    if isinstance(port, int) and port > 0:
+                        result = session.run(
+                            """
+                            MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})
+                                  -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
+                            WHERE r.checked_status IS NULL
+                            SET r.checked_status = 'false_positive',
+                                r.ai_fp_reason = $reason
+                            RETURN v.cve_id AS cve_id
+                            """,
+                            ip=real_ip, port=port, cve_id=cve_id, reason=reason,
+                        )
+                    else:
+                        # No port — dismiss on all ports
+                        result = session.run(
+                            """
+                            MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)
+                                  -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
+                            WHERE r.checked_status IS NULL
+                            SET r.checked_status = 'false_positive',
+                                r.ai_fp_reason = $reason
+                            RETURN count(r) AS cnt
+                            """,
+                            ip=real_ip, cve_id=cve_id, reason=reason,
+                        )
                     if result.single():
                         dismissed += 1
-                        logger.info("AI triage DISMISS: %s on %s:%d — %s", cve_id, real_ip, port, reason)
+                        logger.info("AI triage DISMISS: %s on %s — %s", cve_id, real_ip, reason)
                 elif verdict == "keep":
                     kept += 1
 
-    return kept, dismissed
+    return kept, dismissed, targets_set
 
 
 # ---------------------------------------------------------------------------

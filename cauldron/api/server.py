@@ -70,6 +70,7 @@ class VulnOut(BaseModel):
     description: str | None = None
     enables_pivot: bool | None = None
     checked_status: str | None = None
+    ai_fp_reason: str | None = None
     port: int | None = None
     source: str | None = None  # exploit_db, nvd, ai
 
@@ -161,6 +162,8 @@ class AnalyzeResponse(BaseModel):
     ai_false_positives: int = 0
     ai_vulns_kept: int = 0
     ai_vulns_dismissed: int = 0
+    ai_targets_set: int = 0
+    ai_cves_found: int = 0
 
 
 class VulnStatusUpdate(BaseModel):
@@ -226,6 +229,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         description=v.get("description"),
         enables_pivot=v.get("enables_pivot"),
         checked_status=v.get("checked_status"),
+        ai_fp_reason=v.get("ai_fp_reason"),
         port=v.get("port"),
         source=v.get("source"),
     )
@@ -408,7 +412,7 @@ def list_hosts(
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot, checked_status: r.checked_status,
+                       enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source
                    }}) AS vulns
             """,
@@ -492,7 +496,7 @@ def get_host(ip: str):
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
-                       enables_pivot: v.enables_pivot, checked_status: r.checked_status,
+                       enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source
                    }) AS vulns
             """,
@@ -863,6 +867,8 @@ def run_analysis(
     ai_fp_count = 0
     ai_kept = 0
     ai_dismissed = 0
+    ai_targets = 0
+    ai_cves = 0
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
@@ -870,6 +876,12 @@ def run_analysis(
             ai_fp_count = ai_result.false_positives_found
             ai_kept = ai_result.vulns_kept
             ai_dismissed = ai_result.vulns_dismissed
+            ai_cves = ai_result.cves_found
+            ai_targets = ai_result.targets_set
+
+    # Recalculate path summary after AI (FP may have changed)
+    if ai and (ai_dismissed or ai_cves):
+        summary = get_path_summary()
 
     return AnalyzeResponse(
         classification=classification,
@@ -881,6 +893,8 @@ def run_analysis(
         ai_false_positives=ai_fp_count,
         ai_vulns_kept=ai_kept,
         ai_vulns_dismissed=ai_dismissed,
+        ai_targets_set=ai_targets,
+        ai_cves_found=ai_cves,
     )
 
 

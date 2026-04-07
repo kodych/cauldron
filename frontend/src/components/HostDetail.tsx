@@ -294,6 +294,9 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           {vuln.description && (
             <p className="text-xs text-gray-500">{vuln.description}</p>
           )}
+          {vuln.ai_fp_reason && (
+            <p className="text-xs text-yellow-600 italic">AI: {vuln.ai_fp_reason}</p>
+          )}
           <div className="flex items-center gap-1 flex-wrap text-xs text-gray-600">
             {vuln.enables_pivot === true && (
               <span className="rounded bg-red-900/30 px-1 py-0.5 text-red-400">RCE</span>

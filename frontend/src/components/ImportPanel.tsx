@@ -303,6 +303,30 @@ export function ImportPanel({ onImported }: Props) {
                   <span className="text-gray-300">{String(analyzeResult.path_summary.vulnerable_hosts)}</span>
                 </>
               )}
+              {(analyzeResult.ai_vulns_dismissed ?? 0) > 0 && (
+                <>
+                  <span className="text-gray-500">AI dismissed:</span>
+                  <span className="text-red-400">-{analyzeResult.ai_vulns_dismissed} vulns</span>
+                </>
+              )}
+              {(analyzeResult.ai_vulns_kept ?? 0) > 0 && (
+                <>
+                  <span className="text-gray-500">AI kept:</span>
+                  <span className="text-green-400">{analyzeResult.ai_vulns_kept} gold</span>
+                </>
+              )}
+              {(analyzeResult.ai_targets_set ?? 0) > 0 && (
+                <>
+                  <span className="text-gray-500">AI targets:</span>
+                  <span className="text-red-400">+{analyzeResult.ai_targets_set} targets</span>
+                </>
+              )}
+              {(analyzeResult.ai_cves_found ?? 0) > 0 && (
+                <>
+                  <span className="text-gray-500">AI CVEs:</span>
+                  <span className="text-purple-400">+{analyzeResult.ai_cves_found} new</span>
+                </>
+              )}
             </div>
             <p className="text-xs text-gray-500">Reloading page...</p>
           </div>

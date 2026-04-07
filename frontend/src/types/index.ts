@@ -33,6 +33,7 @@ export interface VulnOut {
   description: string | null;
   enables_pivot: boolean | null;
   checked_status: string | null;
+  ai_fp_reason: string | null;
   port: number | null;
   source: string | null; // exploit_db, nvd, ai
 }
@@ -174,6 +175,10 @@ export interface AnalyzeResponse {
   cve_enrichment: { enriched?: number; cached?: number } | null;
   topology: { segments?: number; reach_edges?: number } | null;
   path_summary: PathSummary | null;
+  ai_vulns_kept?: number;
+  ai_vulns_dismissed?: number;
+  ai_targets_set?: number;
+  ai_cves_found?: number;
 }
 
 export type VulnStatus = 'exploited' | 'false_positive' | 'mitigated' | null;
