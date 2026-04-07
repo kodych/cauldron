@@ -398,8 +398,10 @@ def boil(nvd: bool, ai: bool, run_all: bool):
                 console.print(f"  [green]+[/green] AI kept [bold]{ai_result.vulns_kept}[/bold] gold vulnerabilities")
             if ai_result.vulns_dismissed:
                 console.print(f"  [yellow]![/yellow] AI dismissed {ai_result.vulns_dismissed} noise vulnerabilities")
+            if ai_result.targets_set:
+                console.print(f"  [red]>[/red] AI suggested {ai_result.targets_set} priority targets")
             if not any([ai_result.cves_found, ai_result.ambiguous_classified,
-                        ai_result.vulns_kept, ai_result.vulns_dismissed]):
+                        ai_result.vulns_kept, ai_result.vulns_dismissed, ai_result.targets_set]):
                 console.print("  [dim]  No findings to triage[/dim]")
 
     console.print()
