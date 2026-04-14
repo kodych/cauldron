@@ -907,6 +907,54 @@ def get_default_creds(ip: str, port: int):
     return {"ip": ip, "port": port, "creds": creds}
 
 
+@app.get("/api/v1/hosts/{ip}/services/{port}/vulns/{vuln_id}/commands")
+def get_exploit_commands(ip: str, port: int, vuln_id: str):
+    """Generate exploit commands for a specific vulnerability on a host:port."""
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+    from cauldron.exploits.commands import generate_commands
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})-[:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
+            RETURN s.product AS product, s.version AS version, s.name AS name,
+                   v.exploit_module AS module, v.source AS source
+            LIMIT 1
+            """,
+            ip=ip, port=port, vuln_id=vuln_id,
+        )
+        record = result.single()
+
+    if not record:
+        return {"ip": ip, "port": port, "vuln_id": vuln_id, "commands": []}
+
+    # Get tags from exploit_db if available
+    tags: list[str] = []
+    module = record.get("module")
+    if record.get("source") == "exploit_db":
+        from cauldron.exploits.matcher import ExploitDB
+        db = ExploitDB()
+        for rule in db._rules:
+            if rule.get("cve") == vuln_id or rule.get("id") == vuln_id:
+                tags = rule.get("tags", [])
+                if not module:
+                    module = rule.get("module")
+                break
+
+    commands = generate_commands(
+        vuln_id=vuln_id,
+        ip=ip,
+        port=port,
+        product=record.get("product"),
+        module=module,
+        cve=vuln_id if vuln_id.startswith("CVE-") else None,
+        tags=tags,
+    )
+
+    return {"ip": ip, "port": port, "vuln_id": vuln_id, "commands": commands}
+
+
 @app.patch("/api/v1/hosts/{ip}/owned")
 def update_host_owned(ip: str, body: HostMarkerUpdate):
     """Mark/unmark a host as owned (compromised)."""

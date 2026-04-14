@@ -321,6 +321,9 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
               {vuln.exploit_url}
             </a>
           )}
+          {/* Exploit Commands */}
+          <ExploitCommands hostIp={hostIp} port={ports[0] || vuln.port || 0} vulnId={vuln.cve_id} />
+
           {/* Status buttons */}
           <div className="flex items-center gap-1 pt-1 border-t border-gray-700/50">
             <span className="text-xs text-gray-600 mr-1">Status:</span>
@@ -549,6 +552,70 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
           <p className="text-xs text-gray-600">No services</p>
         )}
       </div>
+    </div>
+  );
+}
+
+
+function ExploitCommands({ hostIp, port, vulnId }: { hostIp: string; port: number; vulnId: string }) {
+  const [open, setOpen] = useState(false);
+  const [commands, setCommands] = useState<Array<{ tool: string; command: string; description: string }>>([]);
+  const [loading, setLoading] = useState(false);
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  const handleToggle = useCallback(async () => {
+    if (open) { setOpen(false); return; }
+    setOpen(true);
+    if (commands.length > 0) return;
+    setLoading(true);
+    try {
+      const res = await api.getExploitCommands(hostIp, port, vulnId);
+      setCommands(res.commands);
+    } catch { setCommands([]); }
+    finally { setLoading(false); }
+  }, [open, commands.length, hostIp, port, vulnId]);
+
+  const copyCommand = useCallback(async (cmd: string, idx: number) => {
+    await navigator.clipboard.writeText(cmd);
+    setCopiedIdx(idx);
+    setTimeout(() => setCopiedIdx(null), 2000);
+  }, []);
+
+  if (port === 0) return null;
+
+  return (
+    <div>
+      <button
+        onClick={handleToggle}
+        className={`text-xs rounded px-1.5 py-0.5 transition-colors ${
+          open ? 'bg-green-900/30 text-green-400 font-semibold' : 'bg-gray-800 text-gray-600 hover:text-green-400'
+        }`}
+      >
+        ⚡ Commands
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {loading && <p className="text-xs text-gray-500">Loading...</p>}
+          {!loading && commands.length === 0 && <p className="text-xs text-gray-600">No commands available</p>}
+          {commands.map((cmd, i) => (
+            <div key={i} className="rounded bg-gray-900 border border-gray-800 p-1.5">
+              <div className="flex items-center gap-1.5 mb-1">
+                <span className="text-xs text-green-400 font-semibold">{cmd.tool}</span>
+                <span className="text-xs text-gray-600 flex-1">{cmd.description}</span>
+                <button
+                  onClick={() => copyCommand(cmd.command, i)}
+                  className="shrink-0 rounded px-1.5 py-0.5 text-xs bg-gray-800 text-gray-500 hover:text-green-400 hover:bg-green-950/30 transition-colors"
+                >
+                  {copiedIdx === i ? '✓' : '📋'}
+                </button>
+              </div>
+              <pre className="text-xs font-mono text-green-300 bg-black/30 rounded px-2 py-1 overflow-x-auto whitespace-pre-wrap break-all select-all">
+                {cmd.command}
+              </pre>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

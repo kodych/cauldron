@@ -92,6 +92,11 @@ export const api = {
 
   getVulns: () => get<{ vulns: VulnListItem[]; total: number }>('/vulns'),
 
+  getExploitCommands: (ip: string, port: number, vulnId: string) =>
+    get<{ commands: Array<{ tool: string; command: string; description: string }> }>(
+      `/hosts/${ip}/services/${port}/vulns/${encodeURIComponent(vulnId)}/commands`,
+    ),
+
   importScan: async (file: File, source?: string): Promise<ImportResponse> => {
     const url = new URL(`${BASE}/import`, window.location.origin);
     if (source) url.searchParams.set('source', source);
