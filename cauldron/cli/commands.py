@@ -345,6 +345,8 @@ def boil(nvd: bool, ai: bool, run_all: bool):
         console.print(f"  [green]+[/green] Found {cve_stats['total_cves_found']} CVEs across {cve_stats['services_with_cves']} services")
         if cve_stats["from_cache"]:
             console.print(f"  [dim]  ({cve_stats['from_cache']} from cache, {cve_stats['api_calls']} API calls)[/dim]")
+        if cve_stats.get("skipped"):
+            console.print(f"  [dim]  ({cve_stats['skipped']} services skipped — no version/CPE)[/dim]")
         if cve_stats["errors"]:
             console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
     else:

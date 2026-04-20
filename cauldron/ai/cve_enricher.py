@@ -792,6 +792,7 @@ def enrich_services_from_graph() -> dict:
         "from_cache": 0,
         "api_calls": 0,
         "errors": 0,
+        "skipped": 0,
         "cpe_queries": 0,
         "keyword_queries": 0,
     }
@@ -837,7 +838,12 @@ def enrich_services_from_graph() -> dict:
         enrichment = enrich_service(product or "", version or "", cache, cpe_list)
 
         if enrichment.error:
-            stats["errors"] += 1
+            # "No CPE and no version" / "Missing product" — not real errors,
+            # just services we don't have enough data to query
+            if "No CPE" in enrichment.error or "Missing product" in enrichment.error:
+                stats["skipped"] = stats.get("skipped", 0) + 1
+            else:
+                stats["errors"] += 1
             continue
 
         if enrichment.from_cache:
