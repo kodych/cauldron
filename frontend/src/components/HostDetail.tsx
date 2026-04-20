@@ -1,9 +1,10 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
+import { ExploitCommands } from './ExploitCommands';
 
 interface Props {
   ip: string;
@@ -21,31 +22,67 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
   const { data, loading, error, refetch } = useApi<HostOut>(() => api.getHost(ip), [ip]);
   const [hostNotesOpen, setHostNotesOpen] = useState(false);
   const [hostNotesText, setHostNotesText] = useState('');
+  const [hostNotesDirty, setHostNotesDirty] = useState(false);
+  const [ipCopied, setIpCopied] = useState(false);
+  const [toggleBusy, setToggleBusy] = useState(false);
   const hostNotesSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Sync notes text when data loads or changes
+  // Reset notes panel state when switching to a different host
   useEffect(() => {
-    if (data && hostNotesOpen) {
-      setHostNotesText(data.notes || '');
-    }
-  }, [data, hostNotesOpen]);
+    setHostNotesOpen(false);
+    setHostNotesText('');
+    setHostNotesDirty(false);
+  }, [ip]);
 
   const handleToggleHostNotes = useCallback(() => {
     if (!hostNotesOpen && data) {
       setHostNotesText(data.notes || '');
+      setHostNotesDirty(false);
     }
     setHostNotesOpen((v) => !v);
   }, [hostNotesOpen, data]);
 
   const handleHostNotesChange = useCallback((value: string) => {
     setHostNotesText(value);
+    setHostNotesDirty(true);
     if (hostNotesSaveRef.current) clearTimeout(hostNotesSaveRef.current);
     hostNotesSaveRef.current = setTimeout(async () => {
       try {
         await api.updateHostNotes(ip, value || null);
+        setHostNotesDirty(false);
       } catch (e) { console.error('Failed to save host notes:', e); }
     }, 500);
   }, [ip]);
+
+  const handleCopyIp = useCallback(async () => {
+    await navigator.clipboard.writeText(ip);
+    setIpCopied(true);
+    setTimeout(() => setIpCopied(false), 1500);
+  }, [ip]);
+
+  const handleToggleOwned = useCallback(async () => {
+    if (!data) return;
+    setToggleBusy(true);
+    try {
+      await api.setHostOwned(ip, !data.owned);
+      refetch();
+      onDataChanged?.();
+    } finally {
+      setToggleBusy(false);
+    }
+  }, [ip, data, refetch, onDataChanged]);
+
+  const handleToggleTarget = useCallback(async () => {
+    if (!data) return;
+    setToggleBusy(true);
+    try {
+      await api.setHostTarget(ip, !data.target);
+      refetch();
+      onDataChanged?.();
+    } finally {
+      setToggleBusy(false);
+    }
+  }, [ip, data, refetch, onDataChanged]);
 
   if (loading) {
     return (
@@ -76,13 +113,22 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
       {/* Header */}
       <div className="border-b border-gray-800 px-3 py-2">
         <button onClick={onBack} className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 mb-2">
-          <ArrowLeft size={14} /> Back to list
+          <ArrowLeft size={14} /> Back
         </button>
         <div className="flex items-center gap-2">
           <div className="h-3 w-3 rounded-full shrink-0" style={{ backgroundColor: getRoleColor(data.role) }} />
-          <div>
-            <p className="text-sm font-mono text-gray-100 font-semibold">{data.ip}</p>
-            {data.hostname && <p className="text-xs text-gray-500">{data.hostname}</p>}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <p className="text-sm font-mono text-gray-100 font-semibold truncate">{data.ip}</p>
+              <button
+                onClick={handleCopyIp}
+                title="Copy IP"
+                className="rounded p-0.5 text-gray-500 hover:bg-gray-800 hover:text-gray-200"
+              >
+                {ipCopied ? <Check size={12} className="text-green-400" /> : <Clipboard size={12} />}
+              </button>
+            </div>
+            {data.hostname && <p className="text-xs text-gray-500 truncate">{data.hostname}</p>}
           </div>
         </div>
         <div className="flex flex-wrap gap-2 mt-2 text-xs">
@@ -102,6 +148,35 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
             <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
           )}
         </div>
+        {/* Owned / Target toggles */}
+        <div className="flex items-center gap-1.5 mt-2">
+          <button
+            onClick={handleToggleOwned}
+            disabled={toggleBusy}
+            title={data.owned ? 'Unmark as Owned' : 'Mark as Owned — we have access'}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+              data.owned
+                ? 'bg-green-900/40 text-green-400 font-semibold'
+                : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+            }`}
+          >
+            <Unlock size={11} />
+            {data.owned ? 'Owned' : 'Mark Owned'}
+          </button>
+          <button
+            onClick={handleToggleTarget}
+            disabled={toggleBusy}
+            title={data.target ? 'Unmark as Target' : 'Mark as Target — high-value'}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+              data.target
+                ? 'bg-red-900/40 text-red-400 font-semibold'
+                : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+            }`}
+          >
+            <Target size={11} />
+            {data.target ? 'Target' : 'Mark Target'}
+          </button>
+        </div>
         {/* Host Notes */}
         <div className="mt-2">
           <button
@@ -118,13 +193,18 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
             {data.notes ? 'Host Notes' : 'Add Host Notes'}
           </button>
           {hostNotesOpen && (
-            <textarea
-              value={hostNotesText}
-              onChange={(e) => handleHostNotesChange(e.target.value)}
-              placeholder="Add host-level notes... (auto-saves)"
-              className="mt-1 w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
-              rows={3}
-            />
+            <>
+              <textarea
+                value={hostNotesText}
+                onChange={(e) => handleHostNotesChange(e.target.value)}
+                placeholder="Add host-level notes... (auto-saves)"
+                className="mt-1 w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
+                rows={3}
+              />
+              {hostNotesDirty && (
+                <p className="text-xs text-gray-500 mt-0.5 italic">Saving…</p>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -557,65 +637,3 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
 }
 
 
-function ExploitCommands({ hostIp, port, vulnId }: { hostIp: string; port: number; vulnId: string }) {
-  const [open, setOpen] = useState(false);
-  const [commands, setCommands] = useState<Array<{ tool: string; command: string; description: string }>>([]);
-  const [loading, setLoading] = useState(false);
-  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
-
-  const handleToggle = useCallback(async () => {
-    if (open) { setOpen(false); return; }
-    setOpen(true);
-    if (commands.length > 0) return;
-    setLoading(true);
-    try {
-      const res = await api.getExploitCommands(hostIp, port, vulnId);
-      setCommands(res.commands);
-    } catch { setCommands([]); }
-    finally { setLoading(false); }
-  }, [open, commands.length, hostIp, port, vulnId]);
-
-  const copyCommand = useCallback(async (cmd: string, idx: number) => {
-    await navigator.clipboard.writeText(cmd);
-    setCopiedIdx(idx);
-    setTimeout(() => setCopiedIdx(null), 2000);
-  }, []);
-
-  if (port === 0) return null;
-
-  return (
-    <div>
-      <button
-        onClick={handleToggle}
-        className={`text-xs rounded px-1.5 py-0.5 transition-colors ${
-          open ? 'bg-green-900/30 text-green-400 font-semibold' : 'bg-gray-800 text-gray-600 hover:text-green-400'
-        }`}
-      >
-        ⚡ Commands
-      </button>
-      {open && (
-        <div className="mt-1 space-y-1">
-          {loading && <p className="text-xs text-gray-500">Loading...</p>}
-          {!loading && commands.length === 0 && <p className="text-xs text-gray-600">No commands available</p>}
-          {commands.map((cmd, i) => (
-            <div key={i} className="rounded bg-gray-900 border border-gray-800 p-1.5">
-              <div className="flex items-center gap-1.5 mb-1">
-                <span className="text-xs text-green-400 font-semibold">{cmd.tool}</span>
-                <span className="text-xs text-gray-600 flex-1">{cmd.description}</span>
-                <button
-                  onClick={() => copyCommand(cmd.command, i)}
-                  className="shrink-0 rounded px-1.5 py-0.5 text-xs bg-gray-800 text-gray-500 hover:text-green-400 hover:bg-green-950/30 transition-colors"
-                >
-                  {copiedIdx === i ? '✓' : '📋'}
-                </button>
-              </div>
-              <pre className="text-xs font-mono text-green-300 bg-black/30 rounded px-2 py-1 overflow-x-auto whitespace-pre-wrap break-all select-all">
-                {cmd.command}
-              </pre>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}

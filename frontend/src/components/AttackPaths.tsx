@@ -1,10 +1,11 @@
-import { useState, useMemo } from 'react';
-import { Crosshair, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react';
+import { useState, useMemo, useCallback } from 'react';
+import { Crosshair, ChevronDown, ChevronUp, AlertTriangle, Target, Unlock } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors';
 import { formatCvss } from '../utils/format';
 import type { PathsResponse, AttackPathOut } from '../types';
+import { ExploitCommands } from './ExploitCommands';
 
 type PathFilter = 'all' | 'confirmed' | 'confirmed_likely' | 'exploit' | 'target';
 
@@ -31,24 +32,41 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
     [refreshKey],
   );
 
-  const filteredPaths = useMemo(() => {
-    if (!data) return [];
-    return data.paths.filter((p) => {
-      switch (filter) {
-        case 'confirmed':
-          return p.nodes.some((n) => n.vulns?.some((v) => v.confidence === 'confirmed'));
-        case 'confirmed_likely':
-          return p.nodes.some((n) => n.vulns?.some((v) =>
-            v.confidence === 'confirmed' || v.confidence === 'likely'));
-        case 'exploit':
-          return p.has_exploits;
-        case 'target':
-          return p.nodes.some((n) => n.role && ['domain_controller', 'database', 'mail_server'].includes(n.role));
-        default:
-          return true;
-      }
-    });
-  }, [data, filter]);
+  const matchesFilter = useCallback((p: AttackPathOut, f: PathFilter) => {
+    switch (f) {
+      case 'confirmed':
+        return p.nodes.some((n) => n.vulns?.some((v) => v.confidence === 'confirmed'));
+      case 'confirmed_likely':
+        return p.nodes.some((n) => n.vulns?.some((v) =>
+          v.confidence === 'confirmed' || v.confidence === 'likely'));
+      case 'exploit':
+        return p.has_exploits;
+      case 'target':
+        // User-flagged targets + high-value roles
+        return p.nodes.some((n) =>
+          n.target === true ||
+          (n.role && ['domain_controller', 'database', 'mail_server'].includes(n.role))
+        );
+      default:
+        return true;
+    }
+  }, []);
+
+  const filteredPaths = useMemo(
+    () => data ? data.paths.filter((p) => matchesFilter(p, filter)) : [],
+    [data, filter, matchesFilter],
+  );
+
+  const filterCounts = useMemo(() => {
+    if (!data) return { all: 0, confirmed: 0, confirmed_likely: 0, exploit: 0, target: 0 } as Record<PathFilter, number>;
+    return {
+      all: data.paths.length,
+      confirmed: data.paths.filter((p) => matchesFilter(p, 'confirmed')).length,
+      confirmed_likely: data.paths.filter((p) => matchesFilter(p, 'confirmed_likely')).length,
+      exploit: data.paths.filter((p) => matchesFilter(p, 'exploit')).length,
+      target: data.paths.filter((p) => matchesFilter(p, 'target')).length,
+    };
+  }, [data, matchesFilter]);
 
   if (loading) {
     return (
@@ -69,22 +87,28 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
   return (
     <div className="flex flex-col h-full">
       {/* Filter bar */}
-      <div className="flex items-center gap-1 border-b border-gray-800 px-2 py-1.5">
+      <div className="flex flex-wrap items-center gap-1 border-b border-gray-800 px-2 py-1.5">
         <p className="text-xs text-gray-500 mr-1">{filteredPaths.length} paths</p>
-        <div className="flex-1" />
-        {PATH_FILTERS.map((f) => (
-          <button
-            key={f.value}
-            onClick={() => { setFilter(f.value); setSelectedIndex(null); onSelectPath?.(null); }}
-            className={`rounded px-1.5 py-0.5 text-xs transition-colors ${
-              filter === f.value
-                ? 'bg-indigo-600 text-white'
-                : 'bg-gray-800 text-gray-500 hover:text-gray-300'
-            }`}
-          >
-            {f.label}
-          </button>
-        ))}
+        <div className="flex-1 min-w-0" />
+        {PATH_FILTERS.map((f) => {
+          const count = filterCounts[f.value];
+          // Hide empty non-all filters to avoid dead buttons
+          if (f.value !== 'all' && count === 0) return null;
+          return (
+            <button
+              key={f.value}
+              onClick={() => { setFilter(f.value); setSelectedIndex(null); onSelectPath?.(null); }}
+              className={`rounded px-1.5 py-0.5 text-xs transition-colors ${
+                filter === f.value
+                  ? 'bg-indigo-600 text-white'
+                  : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+              }`}
+              title={`${count} paths`}
+            >
+              {f.label} <span className="opacity-70">{count}</span>
+            </button>
+          );
+        })}
       </div>
 
       {/* Summary */}
@@ -219,28 +243,50 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
                   )}
                   {node.hostname && <span className="text-gray-600 font-sans ml-1">({node.hostname})</span>}
                 </p>
-                <p className="text-gray-600">{node.role} {node.segment && `· ${node.segment}`}</p>
+                <p className="text-gray-600 flex items-center gap-1.5">
+                  <span>{node.role} {node.segment && `· ${node.segment}`}</span>
+                  {node.owned && (
+                    <span className="rounded bg-green-900/30 px-1 py-0 text-green-400 font-semibold flex items-center gap-0.5">
+                      <Unlock size={9} /> OWNED
+                    </span>
+                  )}
+                  {node.target && (
+                    <span className="rounded bg-red-900/30 px-1 py-0 text-red-400 font-semibold flex items-center gap-0.5">
+                      <Target size={9} /> TARGET
+                    </span>
+                  )}
+                </p>
                 {node.vulns.map((v) => (
-                  <div key={v.cve_id} className="flex items-start gap-1.5 mt-0.5 ml-2">
-                    <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : getConfidenceColor(v.confidence) }} />
-                    <div className="min-w-0 flex-1">
-                      <span className="text-gray-400">{v.cve_id}</span>
-                      {v.title && <span className="text-gray-500 ml-1">— {v.title}</span>}
-                      <span className="ml-1 font-mono" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
-                        [{formatCvss(v.cvss)}]
-                      </span>
-                      <span
-                        className="ml-1 font-medium"
-                        style={{ color: getConfidenceColor(v.confidence) }}
-                      >
-                        {v.confidence}
-                      </span>
-                      {v.has_exploit && (
-                        <span className="ml-1 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold text-xs">
-                          EXPLOIT
+                  <div key={v.cve_id + ':' + (v.port ?? '')} className="mt-0.5 ml-2">
+                    <div className="flex items-start gap-1.5">
+                      <Crosshair size={10} className="shrink-0 mt-0.5" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : getConfidenceColor(v.confidence) }} />
+                      <div className="min-w-0 flex-1">
+                        {v.port != null && (
+                          <span className="font-mono text-gray-500 mr-1">:{v.port}</span>
+                        )}
+                        <span className="text-gray-400">{v.cve_id}</span>
+                        {v.title && <span className="text-gray-500 ml-1">— {v.title}</span>}
+                        <span className="ml-1 font-mono" style={{ color: v.cvss > 0 ? getCvssColor(v.cvss) : '#6b7280' }}>
+                          [{formatCvss(v.cvss)}]
                         </span>
-                      )}
+                        <span
+                          className="ml-1 font-medium"
+                          style={{ color: getConfidenceColor(v.confidence) }}
+                        >
+                          {v.confidence}
+                        </span>
+                        {v.has_exploit && (
+                          <span className="ml-1 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold text-xs">
+                            EXPLOIT
+                          </span>
+                        )}
+                      </div>
                     </div>
+                    {v.port != null && (v.has_exploit || v.confidence === 'confirmed' || v.confidence === 'likely') && (
+                      <div className="mt-0.5 ml-4">
+                        <ExploitCommands hostIp={node.ip} port={v.port} vulnId={v.cve_id} compact />
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

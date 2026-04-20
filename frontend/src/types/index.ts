@@ -68,6 +68,7 @@ export interface VulnInfoOut {
   confidence: string;
   enables_pivot: boolean | null;
   method: string;
+  port: number | null;
 }
 
 export interface PathNodeOut {
@@ -75,6 +76,8 @@ export interface PathNodeOut {
   hostname: string | null;
   role: string;
   segment: string | null;
+  owned: boolean;
+  target: boolean;
   vulns: VulnInfoOut[];
 }
 

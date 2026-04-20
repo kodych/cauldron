@@ -46,6 +46,7 @@ class VulnInfo:
     confidence: str = "check"  # confirmed | likely | check
     enables_pivot: bool | None = None  # True = RCE/shell, False = relay/misconfig
     method: str = ""  # exploit | relay | credential | cve
+    port: int | None = None
 
 
 @dataclass
@@ -197,7 +198,8 @@ def _find_direct_paths(
              collect(DISTINCT {{
                  cve: v.cve_id, cvss: v.cvss,
                  has_exploit: v.has_exploit, desc: v.description,
-                 confidence: v.confidence, enables_pivot: v.enables_pivot
+                 confidence: v.confidence, enables_pivot: v.enables_pivot,
+                 port: s.port
              }}) AS vulns,
              max(v.cvss) AS max_cvss,
              max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -335,7 +337,8 @@ def _find_pivot_paths(
                  collect(DISTINCT {{
                      cve: v.cve_id, cvss: v.cvss,
                      has_exploit: v.has_exploit, desc: v.description,
-                     confidence: v.confidence, enables_pivot: v.enables_pivot
+                     confidence: v.confidence, enables_pivot: v.enables_pivot,
+                     port: s.port
                  }}) AS vulns,
                  max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -430,7 +433,8 @@ def _find_lateral_paths(
                  collect(DISTINCT {{
                      cve: v.cve_id, cvss: v.cvss,
                      has_exploit: v.has_exploit, desc: v.description,
-                     confidence: v.confidence, enables_pivot: v.enables_pivot
+                     confidence: v.confidence, enables_pivot: v.enables_pivot,
+                     port: s.port
                  }}) AS vulns,
                  max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -498,6 +502,7 @@ def _parse_vulns(raw_vulns: list[dict]) -> list[VulnInfo]:
             confidence=v.get("confidence") or "check",
             enables_pivot=v.get("enables_pivot"),
             method=method,
+            port=v.get("port"),
         ))
     # Sort by confidence (confirmed first), then exploitable, then CVSS
     conf_order = {"confirmed": 0, "likely": 1, "check": 2}
@@ -557,7 +562,8 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                collect(DISTINCT {cve: v.cve_id, cvss: v.cvss,
                        has_exploit: v.has_exploit, desc: v.description,
                        confidence: v.confidence,
-                       enables_pivot: v.enables_pivot}) AS vulns
+                       enables_pivot: v.enables_pivot,
+                       port: s.port}) AS vulns
         """,
         ip=ip,
     )

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Clipboard, Check, Terminal, Filter, Hash, Bug, ChevronDown, ChevronUp } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
@@ -21,7 +21,11 @@ const QUICK_FILTERS = [
   { name: 'brute', label: 'Brute', desc: 'Bruteforceable services' },
 ];
 
-export function CollectPanel() {
+interface CollectPanelProps {
+  refreshKey?: number;
+}
+
+export function CollectPanel({ refreshKey = 0 }: CollectPanelProps) {
   const [activeFilter, setActiveFilter] = useState<string | null>(null);
   const [customPort, setCustomPort] = useState('');
   const [copiedType, setCopiedType] = useState<'ip' | 'socket' | null>(null);
@@ -31,7 +35,7 @@ export function CollectPanel() {
   const [showVulns, setShowVulns] = useState(false);
   const { data: vulnData } = useApi<{ vulns: VulnListItem[]; total: number }>(
     () => showVulns ? api.getVulns() : Promise.resolve({ vulns: [], total: 0 }),
-    [showVulns],
+    [showVulns, refreshKey],
   );
 
   const runCollect = useCallback(async (filter?: string, port?: number) => {
@@ -52,6 +56,22 @@ export function CollectPanel() {
       setLoading(false);
     }
   }, []);
+
+  // Refresh active filter when data changes elsewhere (e.g. FP toggle)
+  const lastFilterRef = useRef<string | null>(null);
+  lastFilterRef.current = activeFilter;
+  useEffect(() => {
+    if (refreshKey === 0) return;
+    const f = lastFilterRef.current;
+    if (!f) return;
+    if (f.startsWith('port:')) {
+      const p = parseInt(f.slice(5));
+      if (p > 0) runCollect(undefined, p);
+    } else {
+      runCollect(f);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   const handleFilterClick = useCallback((name: string) => {
     runCollect(name);

@@ -5,9 +5,11 @@ import type { ImportResponse, AnalyzeResponse } from '../types';
 
 interface Props {
   onImported?: () => void;
+  onAnalyzed?: () => void;
+  onReset?: () => void;
 }
 
-export function ImportPanel({ onImported }: Props) {
+export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -73,14 +75,14 @@ export function ImportPanel({ onImported }: Props) {
     try {
       const result = await api.runAnalysis({ nvd: useNvd, ai: useAi });
       setAnalyzeResult(result);
-      setTimeout(() => window.location.reload(), 1500);
+      onAnalyzed?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Analysis failed');
     } finally {
       setAnalyzing(false);
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     }
-  }, [useNvd, useAi]);
+  }, [useNvd, useAi, onAnalyzed]);
 
   const resetForm = useCallback(() => {
     setFile(null);
@@ -96,14 +98,14 @@ export function ImportPanel({ onImported }: Props) {
       await api.resetDatabase();
       resetForm();
       setAnalyzeResult(null);
-      setTimeout(() => window.location.reload(), 500);
+      onReset?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Reset failed');
     } finally {
       setResetting(false);
       setConfirmReset(false);
     }
-  }, [resetForm]);
+  }, [resetForm, onReset]);
 
   return (
     <div className="p-3 space-y-3">
@@ -328,7 +330,6 @@ export function ImportPanel({ onImported }: Props) {
                 </>
               )}
             </div>
-            <p className="text-xs text-gray-500">Reloading page...</p>
           </div>
         )}
       </div>

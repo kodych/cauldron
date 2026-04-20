@@ -34,9 +34,23 @@ export function Layout() {
     setShowHostDetail(false);
   }, []);
 
+  const bumpDataVersion = useCallback(() => setDataVersion((v) => v + 1), []);
+
   const handleImported = useCallback(() => {
-    // Force graph refresh by changing key
+    // Force graph refresh by changing key, and propagate data version bump
     setGraphKey((k) => k + 1);
+    setDataVersion((v) => v + 1);
+  }, []);
+
+  const handleClearPath = useCallback(() => setSelectedPathIps(null), []);
+
+  const handleReset = useCallback(() => {
+    // Kill graph state (empty DB) and refresh all panels
+    setSelectedHost(null);
+    setShowHostDetail(false);
+    setSelectedPathIps(null);
+    setGraphKey((k) => k + 1);
+    setDataVersion((v) => v + 1);
   }, []);
 
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -94,22 +108,27 @@ export function Layout() {
         {/* Panel content */}
         {!collapsed && (
           <div className="flex-1 overflow-y-auto">
-            {showHostDetail && selectedHost ? (
-              <HostDetail ip={selectedHost} onBack={handleBackFromDetail} onDataChanged={() => setDataVersion((v) => v + 1)} />
-            ) : (
-              <>
-                {activeTab === 'stats' && <StatsPanel refreshKey={graphKey} />}
-                {activeTab === 'hosts' && (
-                  <HostList onSelectHost={handleSelectHost} selectedHost={selectedHost} />
-                )}
-                {activeTab === 'paths' && <AttackPaths onSelectPath={setSelectedPathIps} onSelectHost={handleSelectHost} refreshKey={dataVersion} />}
-                {activeTab === 'collect' && <CollectPanel />}
-                {/* ImportPanel stays mounted (hidden) so analysis doesn't abort on tab switch */}
-                <div className={activeTab === 'import' ? '' : 'hidden'}>
-                  <ImportPanel onImported={handleImported} />
-                </div>
-              </>
+            {/* Host detail overlays tab content but tabs stay mounted so filters/scroll survive */}
+            {showHostDetail && selectedHost && (
+              <HostDetail ip={selectedHost} onBack={handleBackFromDetail} onDataChanged={bumpDataVersion} />
             )}
+            <div className={showHostDetail ? 'hidden' : ''}>
+              <div className={activeTab === 'stats' ? '' : 'hidden'}>
+                <StatsPanel refreshKey={dataVersion} />
+              </div>
+              <div className={activeTab === 'hosts' ? '' : 'hidden'}>
+                <HostList onSelectHost={handleSelectHost} selectedHost={selectedHost} refreshKey={dataVersion} />
+              </div>
+              <div className={activeTab === 'paths' ? '' : 'hidden'}>
+                <AttackPaths onSelectPath={setSelectedPathIps} onSelectHost={handleSelectHost} refreshKey={dataVersion} />
+              </div>
+              <div className={activeTab === 'collect' ? '' : 'hidden'}>
+                <CollectPanel refreshKey={dataVersion} />
+              </div>
+              <div className={activeTab === 'import' ? '' : 'hidden'}>
+                <ImportPanel onImported={handleImported} onAnalyzed={handleImported} onReset={handleReset} />
+              </div>
+            </div>
           </div>
         )}
 
@@ -124,8 +143,9 @@ export function Layout() {
           selectedHost={selectedHost}
           onSelectHost={handleSelectHost}
           highlightPathIps={selectedPathIps}
-          onClearPath={() => setSelectedPathIps(null)}
-          onDataChanged={() => setDataVersion((v) => v + 1)}
+          onClearPath={handleClearPath}
+          onDataChanged={bumpDataVersion}
+          refreshKey={dataVersion}
         />
       </div>
     </div>

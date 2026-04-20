@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { Search, ChevronDown, ChevronUp } from 'lucide-react';
+import { Search, ChevronDown, ChevronUp, X } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor, getConfidenceColor } from '../utils/colors';
@@ -8,13 +8,14 @@ import type { HostListResponse, HostOut } from '../types';
 interface Props {
   onSelectHost: (ip: string | null) => void;
   selectedHost: string | null;
+  refreshKey?: number;
 }
 
-export function HostList({ onSelectHost, selectedHost }: Props) {
+export function HostList({ onSelectHost, selectedHost, refreshKey = 0 }: Props) {
   const [search, setSearch] = useState('');
   const { data, loading, error } = useApi<HostListResponse>(
     () => api.getHosts({ limit: 500 }),
-    [],
+    [refreshKey],
   );
 
   if (loading) {
@@ -58,11 +59,20 @@ export function HostList({ onSelectHost, selectedHost }: Props) {
           <Search size={14} className="absolute left-2.5 top-2 text-gray-500" />
           <input
             type="text"
-            placeholder="Filter hosts..."
+            placeholder="Filter hosts, CVE, product, notes..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full rounded bg-gray-800 py-1.5 pl-8 pr-3 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
+            className="w-full rounded bg-gray-800 py-1.5 pl-8 pr-7 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
           />
+          {search && (
+            <button
+              onClick={() => setSearch('')}
+              className="absolute right-1.5 top-1.5 rounded p-0.5 text-gray-500 hover:bg-gray-700 hover:text-gray-200"
+              title="Clear search"
+            >
+              <X size={12} />
+            </button>
+          )}
         </div>
         <p className="mt-1.5 text-xs text-gray-600">
           {filtered.length} of {data.total} hosts

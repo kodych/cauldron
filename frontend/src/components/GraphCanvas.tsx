@@ -15,6 +15,7 @@ interface Props {
   highlightPathIps?: string[] | null;
   onClearPath?: () => void;
   onDataChanged?: () => void;
+  refreshKey?: number;
 }
 
 interface HostVulnInfo {
@@ -29,7 +30,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged, refreshKey = 0 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -42,16 +43,14 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; ip: string; owned: boolean; target: boolean;
   } | null>(null);
-  const [localDataVersion, setLocalDataVersion] = useState(0);
-
   const { data, loading, error, refetch } = useApi<GraphResponse>(() => api.getGraph(1000), []);
   const { data: pathsData } = useApi<PathsResponse>(
     () => api.getAttackPaths({ top: 50, include_check: true }),
-    [localDataVersion],
+    [refreshKey],
   );
   const { data: hostsData, refetch: refetchHosts } = useApi<HostListResponse>(
     () => api.getHosts({ limit: 1000 }),
-    [],
+    [refreshKey],
   );
 
   // Build host vuln lookup from hosts data — stored in ref to avoid graph rebuilds
@@ -306,15 +305,17 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     });
 
     // --- Right-click context menu (owned/target) ---
-    sigma.on('rightClickNode' as any, ({ node, event }: { node: string; event: any }) => {
+    sigma.on('rightClickNode', ({ node, event }) => {
       event.original.preventDefault();
       const attrs = graph.getNodeAttributes(node);
       if (attrs.nodeType !== 'host' || !attrs.ip) return;
       const ip = attrs.ip as string;
       const info = hostVulnMapRef.current.get(ip);
+      // Only mouse events carry clientX/clientY
+      const orig = event.original as MouseEvent;
       setContextMenu({
-        x: event.original.clientX,
-        y: event.original.clientY,
+        x: orig.clientX ?? 0,
+        y: orig.clientY ?? 0,
         ip,
         owned: info?.owned ?? false,
         target: info?.target ?? false,
@@ -373,7 +374,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       sigma.kill();
       sigmaRef.current = null;
     };
-  }, [graph, onSelectHost]);
+  }, [graph, onSelectHost, onClearPath]);
 
   // Collect nodes that participate in attack paths
   const attackNodeIds = useMemo(() => {
@@ -780,10 +781,16 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
 
       {/* Right-click context menu for owned/target */}
       {contextMenu && (
+        <>
+          {/* Click-outside overlay */}
+          <div
+            className="fixed inset-0 z-[998]"
+            onClick={() => setContextMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setContextMenu(null); }}
+          />
         <div
           className="fixed z-[999] rounded-lg bg-gray-900 border border-gray-700 shadow-xl py-1 min-w-[160px]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
-          onMouseLeave={() => setContextMenu(null)}
         >
           <div className="px-3 py-1 text-xs text-gray-500 font-mono border-b border-gray-800">
             {contextMenu.ip}
@@ -794,7 +801,6 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               await api.setHostOwned(contextMenu.ip, !contextMenu.owned);
               setContextMenu(null);
               refetchHosts();
-              setLocalDataVersion((v) => v + 1);
               onDataChanged?.();
             }}
           >
@@ -809,7 +815,6 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               await api.setHostTarget(contextMenu.ip, !contextMenu.target);
               setContextMenu(null);
               refetchHosts();
-              setLocalDataVersion((v) => v + 1);
               onDataChanged?.();
             }}
           >
@@ -819,6 +824,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
             </span>
           </button>
         </div>
+        </>
       )}
     </div>
   );

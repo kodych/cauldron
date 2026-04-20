@@ -105,6 +105,7 @@ class VulnInfoOut(BaseModel):
     confidence: str = "check"
     enables_pivot: bool | None = None
     method: str = ""
+    port: int | None = None
 
 
 class PathNodeOut(BaseModel):
@@ -112,6 +113,8 @@ class PathNodeOut(BaseModel):
     hostname: str | None = None
     role: str = "unknown"
     segment: str | None = None
+    owned: bool = False
+    target: bool = False
     vulns: list[VulnInfoOut] = []
 
 
@@ -564,6 +567,20 @@ def get_attack_paths(
     # Limit
     paths = paths[:top]
 
+    # Fetch owned/target flags for all hosts in paths
+    from cauldron.graph.connection import get_session
+    flags: dict[str, dict[str, bool]] = {}
+    ips_in_paths = {n.ip for p in paths for n in p.nodes}
+    if ips_in_paths:
+        with get_session() as session:
+            for r in session.run(
+                "MATCH (h:Host) WHERE h.ip IN $ips "
+                "RETURN h.ip AS ip, coalesce(h.owned, false) AS owned, "
+                "coalesce(h.target, false) AS target",
+                ips=list(ips_in_paths),
+            ):
+                flags[r["ip"]] = {"owned": bool(r["owned"]), "target": bool(r["target"])}
+
     path_out = []
     for p in paths:
         nodes = [
@@ -572,10 +589,13 @@ def get_attack_paths(
                 hostname=n.hostname,
                 role=n.role,
                 segment=n.segment,
+                owned=flags.get(n.ip, {}).get("owned", False),
+                target=flags.get(n.ip, {}).get("target", False),
                 vulns=[VulnInfoOut(
                     cve_id=v.cve_id, cvss=v.cvss, has_exploit=v.has_exploit,
                     title=v.title, confidence=v.confidence,
                     enables_pivot=v.enables_pivot, method=v.method,
+                    port=v.port,
                 ) for v in n.vulns],
             )
             for n in p.nodes
