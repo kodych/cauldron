@@ -319,6 +319,87 @@ class TestProductCPEMap:
             assert len(parts) == 2, f"Bad CPE format for '{product}': '{cpe_vp}'"
 
 
+class TestCPEBuildPartType:
+    """Root fix: _build_cpe23 must pick OS part type for products NVD
+    registers as operating systems, otherwise wildcard application-typed
+    queries return zero matches for ESXi/MikroTik/PAN-OS/FortiOS."""
+
+    def test_app_product_uses_a_type(self):
+        from cauldron.ai.cve_enricher import _build_cpe23
+        cpe = _build_cpe23("apache", "http_server", "2.4.49")
+        assert cpe.startswith("cpe:2.3:a:")
+
+    def test_os_product_uses_o_type(self):
+        from cauldron.ai.cve_enricher import _build_cpe23
+        cpe = _build_cpe23("vmware", "esxi", "7.0")
+        assert cpe.startswith("cpe:2.3:o:")
+
+    def test_mikrotik_routeros_uses_o_type(self):
+        from cauldron.ai.cve_enricher import _build_cpe23
+        cpe = _build_cpe23("mikrotik", "routeros", "7.5")
+        assert cpe.startswith("cpe:2.3:o:")
+
+
+class TestCPEPrefixMatch:
+    """Root fix: nmap appends service suffixes to canonical product names
+    (e.g. 'VMware ESXi Server httpd'). The CPE lookup must still resolve
+    via prefix to the base 'vmware esxi' entry."""
+
+    def test_suffix_extended_product_resolves(self):
+        result = _get_cpe_for_service([], "VMware ESXi Server httpd", None)
+        assert result is not None
+        assert "vmware:esxi" in result
+
+    def test_soap_api_suffix_resolves(self):
+        result = _get_cpe_for_service([], "VMware vCenter Server SOAP API", "7.0.3")
+        assert result is not None
+        assert "vmware:vcenter_server:7.0.3" in result
+
+    def test_unrelated_prefix_does_not_match(self):
+        # 'SomeProduct' is not a prefix of anything in the map
+        result = _get_cpe_for_service([], "SomeProduct server", "1.0")
+        assert result is None
+
+
+class TestCPEVersionRelaxation:
+    """Root fix: NVD pins CVEs to major versions for some vendors (e.g.
+    vcenter_server:7.0) while nmap reports patch levels (7.0.3). When a
+    specific-version query returns zero CVEs, retry with version=*."""
+
+    def test_relax_removes_version(self):
+        from cauldron.ai.cve_enricher import _relax_cpe_version
+        relaxed = _relax_cpe_version("cpe:2.3:a:vmware:vcenter_server:7.0.3:*:*:*:*:*:*:*")
+        assert relaxed == "cpe:2.3:a:vmware:vcenter_server:*:*:*:*:*:*:*:*"
+
+    def test_relax_wildcard_returns_none(self):
+        from cauldron.ai.cve_enricher import _relax_cpe_version
+        assert _relax_cpe_version("cpe:2.3:a:foo:bar:*:*:*:*:*:*:*:*") is None
+
+    def test_relax_invalid_cpe_returns_none(self):
+        from cauldron.ai.cve_enricher import _relax_cpe_version
+        assert _relax_cpe_version("not-a-cpe") is None
+
+    @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
+    def test_specific_version_empty_triggers_retry(self, mock_cpe, tmp_path: Path):
+        """Empty result on specific version must trigger one wildcard retry."""
+        cache = CVECache(tmp_path / "cache.json")
+        mock_cpe.return_value = []
+
+        enrich_service("OpenSSH", "7.4", cache, cpe_list=[])
+        assert mock_cpe.call_count == 2
+        assert "openssh:7.4:" in mock_cpe.call_args_list[0][0][0]
+        assert "openssh:*:" in mock_cpe.call_args_list[1][0][0]
+
+    @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
+    def test_wildcard_version_no_retry(self, mock_cpe, tmp_path: Path):
+        """Wildcard version already — no retry even when result is empty."""
+        cache = CVECache(tmp_path / "cache.json")
+        mock_cpe.return_value = []
+
+        enrich_service("OpenSSH", None, cache, cpe_list=[])
+        assert mock_cpe.call_count == 1
+
+
 class TestEnrichService:
     def test_missing_product(self, tmp_path: Path):
         cache = CVECache(tmp_path / "cache.json")
@@ -393,9 +474,11 @@ class TestEnrichService:
         mock_cpe_query.return_value = []
 
         enrich_service("OpenSSH", "7.4", cache, cpe_list=[])
-        mock_cpe_query.assert_called_once()
-        call_args = mock_cpe_query.call_args[0][0]
-        assert "openbsd:openssh:7.4" in call_args
+        # First call uses the nmap-provided version; empty result triggers a
+        # wildcard-version retry (second call).
+        assert mock_cpe_query.call_count >= 1
+        first_call = mock_cpe_query.call_args_list[0][0][0]
+        assert "openbsd:openssh:7.4" in first_call
 
     @patch("cauldron.ai.cve_enricher._query_nvd_keyword")
     @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
@@ -411,14 +494,16 @@ class TestEnrichService:
 
     @patch("cauldron.ai.cve_enricher._query_nvd_keyword")
     @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
-    def test_cpe_404_no_version_no_keyword(self, mock_cpe, mock_kw, tmp_path: Path):
-        """When CPE 404 and no parseable version, no keyword search."""
+    def test_cpe_404_versionless_falls_back_to_keyword(self, mock_cpe, mock_kw, tmp_path: Path):
+        """When CPE returns 404 with no version, keyword search still fires —
+        the three-rule strategy keeps rule #3 (service-only) working when NVD
+        doesn't recognize the wildcard CPE."""
         cache = CVECache(tmp_path / "cache.json")
         mock_cpe.return_value = None
+        mock_kw.return_value = []
 
-        result = enrich_service("SomeProduct", "", cache, cpe_list=["cpe:/a:vendor:product"])
-        mock_kw.assert_not_called()
-        assert result.cves == []
+        enrich_service("SomeProduct", "", cache, cpe_list=["cpe:/a:vendor:product"])
+        mock_kw.assert_called_once()
 
     @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
     def test_fuzzy_version_in_fallback(self, mock_cpe, tmp_path: Path):
@@ -427,9 +512,10 @@ class TestEnrichService:
         mock_cpe.return_value = []
 
         enrich_service("PostgreSQL", "9.6.0 or later", cache, cpe_list=[])
-        mock_cpe.assert_called_once()
-        call_args = mock_cpe.call_args[0][0]
-        assert "postgresql:postgresql:9.6.0" in call_args
+        # Empty result triggers the wildcard-version retry.
+        assert mock_cpe.call_count >= 1
+        first_call = mock_cpe.call_args_list[0][0][0]
+        assert "postgresql:postgresql:9.6.0" in first_call
 
 
 class TestParseCVEExtended:

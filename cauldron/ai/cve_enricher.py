@@ -42,14 +42,16 @@ CACHE_FILE = CACHE_DIR / "cve_cache.json"
 # Rate limiting: track last request time
 _last_request_time: float = 0.0
 
-# Fallback: nmap product name -> CPE "vendor:product" for services without nmap CPE
-# Only used when nmap doesn't provide a CPE itself
+# Fallback: nmap product name -> CPE "vendor:product" for services without
+# nmap-provided CPE. Keys are matched lowercased, exact first then prefix —
+# so "VMware ESXi Server httpd" (with nmap's service suffix) resolves to
+# "vmware:esxi" via the "vmware esxi" prefix key.
 PRODUCT_CPE_MAP: dict[str, str] = {
-    # SSH
+    # --- SSH ---
     "openssh": "openbsd:openssh",
     "dropbear sshd": "matt_johnston:dropbear_ssh",
     "libssh": "libssh:libssh",
-    # Web servers
+    # --- Web servers ---
     "apache httpd": "apache:http_server",
     "nginx": "f5:nginx",
     "microsoft iis httpd": "microsoft:internet_information_services",
@@ -57,7 +59,7 @@ PRODUCT_CPE_MAP: dict[str, str] = {
     "apache tomcat": "apache:tomcat",
     "apache coyote": "apache:tomcat",
     "cherokee httpd": "cherokee-project:cherokee",
-    # Databases
+    # --- Databases ---
     "mysql": "oracle:mysql",
     "postgresql": "postgresql:postgresql",
     "mariadb": "mariadb:mariadb",
@@ -65,33 +67,51 @@ PRODUCT_CPE_MAP: dict[str, str] = {
     "mongodb": "mongodb:mongodb",
     "memcached": "memcached:memcached",
     "microsoft sql server": "microsoft:sql_server",
-    # FTP
+    # --- FTP ---
     "vsftpd": "vsftpd_project:vsftpd",
     "proftpd": "proftpd:proftpd",
     "pure-ftpd": "pureftpd:pure-ftpd",
     "filezilla ftpd": "filezilla-project:filezilla_server",
-    # Mail
+    # --- Mail ---
     "postfix smtpd": "postfix:postfix",
     "exim smtpd": "exim:exim",
     "dovecot": "dovecot:dovecot",
     "sendmail": "sendmail:sendmail",
     "microsoft exchange smtpd": "microsoft:exchange_server",
-    # DNS
+    "microsoft exchange server": "microsoft:exchange_server",
+    "microsoft exchange": "microsoft:exchange_server",
+    # --- DNS ---
     "isc bind": "isc:bind",
     "dnsmasq": "thekelleys:dnsmasq",
-    # SMB/File
+    # --- SMB/File ---
     "samba smbd": "samba:samba",
-    # Proxy
+    # --- Proxy / edge ---
     "squid http proxy": "squid-cache:squid",
     "haproxy": "haproxy:haproxy",
-    # Other
+    # --- Misc services ---
     "openvpn": "openvpn:openvpn",
     "openldap": "openldap:openldap",
     "elasticsearch": "elastic:elasticsearch",
     "jenkins": "jenkins:jenkins",
     "grafana": "grafana:grafana",
+    # --- Virtualization ---
     "vmware esxi": "vmware:esxi",
     "vmware esxi soap api": "vmware:esxi",
+    "vmware vcenter server": "vmware:vcenter_server",
+    "vmware vcenter": "vmware:vcenter_server",
+    # --- Messaging / middleware ---
+    "apache activemq": "apache:activemq",
+    # --- Collaboration ---
+    "atlassian confluence": "atlassian:confluence_server",
+    "atlassian jira": "atlassian:jira_server",
+    # --- Network gear ---
+    "mikrotik routeros": "mikrotik:routeros",
+    "routeros": "mikrotik:routeros",
+    # --- Edge / VPN ---
+    "citrix netscaler": "citrix:netscaler_application_delivery_controller",
+    "fortinet fortios": "fortinet:fortios",
+    "fortinet fortigate": "fortinet:fortios",
+    "palo alto pan-os": "paloaltonetworks:pan-os",
 }
 
 
@@ -199,8 +219,10 @@ _CPE_VENDOR_CORRECTIONS: dict[str, str] = {
     "microsoft:internet_information_server": "microsoft:internet_information_services",
 }
 
-# OS CPE products worth querying NVD for (have specific, useful CVEs)
-# Only when a specific version is present (no wildcard OS queries)
+# OS CPE products worth querying NVD for (have specific, useful CVEs).
+# NVD registers these as ``o:`` (operating system) type — application-typed
+# queries against them return zero matches. Network/appliance vendors that
+# ship as integrated OS belong here.
 _OS_CPE_PRODUCTS: set[str] = {
     "vmware:esxi",
     "cisco:ios",
@@ -209,6 +231,7 @@ _OS_CPE_PRODUCTS: set[str] = {
     "paloaltonetworks:pan-os",
     "fortinet:fortios",
     "juniper:junos",
+    "mikrotik:routeros",
 }
 
 # Regex to extract base version from fuzzy nmap version strings
@@ -252,8 +275,33 @@ def _cpe22_to_23(cpe: str) -> str | None:
 
 
 def _build_cpe23(vendor: str, product: str, version: str = "*") -> str:
-    """Build a CPE 2.3 string from components."""
-    return f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
+    """Build a CPE 2.3 string from components.
+
+    Picks the CPE part type (application ``a`` vs operating system ``o``) based
+    on whether the vendor:product is in the OS-registered set. Products like
+    ESXi, MikroTik RouterOS, PAN-OS, FortiOS, Cisco IOS are registered as
+    ``o:`` in NVD — application-typed queries against them return zero matches.
+    """
+    vp_key = f"{vendor}:{product}".lower()
+    part_type = "o" if vp_key in _OS_CPE_PRODUCTS else "a"
+    return f"cpe:2.3:{part_type}:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
+
+
+def _relax_cpe_version(cpe23: str) -> str | None:
+    """Rebuild a CPE 2.3 string with a wildcard version.
+
+    Used as a fallback when a specific-version query returns zero CVEs —
+    some vendors (notably VMware and Cisco) register CVEs against a major
+    version only (e.g. ``vcenter_server:7.0``) while nmap reports patch
+    levels (``7.0.3``) that never match literally.
+    """
+    parts = cpe23.split(":")
+    if len(parts) < 13 or parts[0] != "cpe" or parts[1] != "2.3":
+        return None
+    if parts[5] == "*":
+        return None
+    parts[5] = "*"
+    return ":".join(parts)
 
 
 def _extract_version(version_str: str | None) -> str:
@@ -286,10 +334,19 @@ def _get_cpe_for_service(cpe_list: list[str], product: str | None, version: str 
         if cpe23:
             return cpe23
 
-    # Fallback: use product name mapping
+    # Fallback: use product name mapping. Try exact match first, then
+    # prefix-based match — nmap frequently appends a service suffix to the
+    # canonical product name, e.g. "VMware ESXi Server httpd" for port 443
+    # or "VMware vCenter Server SOAP API" — we still want to map to the base
+    # vendor:product CPE.
     if product:
         product_lower = product.lower().strip()
         vendor_product = PRODUCT_CPE_MAP.get(product_lower)
+        if vendor_product is None:
+            for key in PRODUCT_CPE_MAP:
+                if product_lower.startswith(key + " ") or product_lower == key:
+                    vendor_product = PRODUCT_CPE_MAP[key]
+                    break
         if vendor_product:
             vendor, prod = vendor_product.split(":", 1)
             ver = _extract_version(version)
@@ -457,19 +514,12 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     has_version = _has_specific_version(cpe23)
     encoded_cpe = urllib.request.quote(cpe23)
 
-    if has_version:
-        # Specific version: fetch CVEs, we'll filter by relevance
-        url = f"{NVD_API_BASE}?virtualMatchString={encoded_cpe}&resultsPerPage=50"
-    else:
-        # No version: only recent CVEs (last ~1 year)
-        now = datetime.now(timezone.utc)
-        start = now.replace(year=now.year - 1, month=1, day=1)
-        start_str = start.strftime("%Y-%m-%dT00:00:00.000")
-        url = (
-            f"{NVD_API_BASE}?virtualMatchString={encoded_cpe}"
-            f"&pubStartDate={start_str}&resultsPerPage=50"
-            f"&cvssV3Severity=CRITICAL"
-        )
+    # NVD API quirk: virtualMatchString combined with pubStartDate or
+    # cvssV3Severity returns HTTP 404, so we cannot server-side filter by
+    # recency or severity. We request the maximum page size (2000) and
+    # filter/sort client-side. Without this, flagship CVEs would be squeezed
+    # out for any vendor whose NVD history exceeds 100 entries.
+    url = f"{NVD_API_BASE}?virtualMatchString={encoded_cpe}&resultsPerPage=2000"
 
     cves = _execute_nvd_query(url, f"CPE:{cpe23}")
 
@@ -480,32 +530,35 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     # Pentester filter: keep only CVEs with real engagement impact
     cves = [c for c in cves if _is_pentester_relevant(c)]
 
-    # Sort and cap results
-    if has_version:
-        # Specific version: sort by severity (most critical first)
-        cves.sort(key=lambda c: c.cvss or 0, reverse=True)
-    else:
-        # No version: take newest first, then re-sort by severity
-        cves.sort(key=lambda c: c.published or "", reverse=True)
-        cves = cves[:20]
-        cves.sort(key=lambda c: c.cvss or 0, reverse=True)
-
-    return cves[:20]
+    # Sort by severity desc. For specific-version queries we cap tight (20);
+    # for wildcard queries we keep a wider window (50) so a newly published
+    # flagship CVE isn't crowded out by a vendor's older high-severity CVEs.
+    cves.sort(key=lambda c: c.cvss or 0, reverse=True)
+    return cves[:20 if has_version else 50]
 
 
 def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     """Query NVD API using keywordSearch (fallback, less precise).
 
-    Validates results against CVE's CPE configurations to ensure
-    the CVE actually affects the target product, not just mentions it.
+    Validates results against CVE's CPE configurations to ensure the CVE
+    actually affects the target product, not just mentions it.
+
+    NVD quirk: keywordSearch combined with pubStartDate returns HTTP 404,
+    so date-restriction is not available server-side. With a versionless
+    query we drop ``keywordExactMatch`` to allow vendor-only searches (e.g.
+    "Veeam Backup" finding CVEs assigned to full "Veeam Backup & Replication"
+    products); the pentester CWE filter + severity sort compensates.
     """
     _rate_limit()
 
-    keyword = f"{product} {version}".strip()
+    versionless = not version or version == "*"
+    keyword = product.strip() if versionless else f"{product} {version}".strip()
     encoded = urllib.request.quote(keyword)
-    url = f"{NVD_API_BASE}?keywordSearch={encoded}&keywordExactMatch&resultsPerPage=20"
+    url = f"{NVD_API_BASE}?keywordSearch={encoded}&resultsPerPage=50"
+    if not versionless:
+        url += "&keywordExactMatch"
 
-    cves = _execute_nvd_query(url, f"keyword:{keyword}", product_hint=product)
+    cves = _execute_nvd_query(url, f"keyword:{keyword}", product_hint=product) or []
 
     # Pentester filter: only keep CVEs with real engagement impact
     cves = [c for c in cves if _is_pentester_relevant(c)]
@@ -513,7 +566,7 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     # Sort by severity
     cves.sort(key=lambda c: c.cvss or 0, reverse=True)
 
-    return cves[:10]
+    return cves[:20 if versionless else 10]
 
 
 def _execute_nvd_query(
@@ -760,13 +813,25 @@ def enrich_service(
     if cpe23:
         cpe_result = _query_nvd_cpe(cpe23)
         if cpe_result is None:
-            # CPE not recognized by NVD (404) — fall back to keyword search
+            # CPE not recognized by NVD (404) — fall back to keyword search.
+            # Applies the three-rule strategy: if we have a parseable version,
+            # search "product version"; otherwise search by product alone and
+            # let _query_nvd_keyword return top-critical recent entries.
             clean_ver = _extract_version(version)
-            if clean_ver != "*":
-                logger.info("CPE 404 for %s, falling back to keyword: %s %s", cpe23, product, clean_ver)
-                cves = _query_nvd_keyword(product, clean_ver)
-            else:
-                logger.info("CPE 404 for %s, no version for keyword fallback", cpe23)
+            logger.info("CPE 404 for %s, falling back to keyword: %s %s", cpe23, product, clean_ver)
+            cves = _query_nvd_keyword(product, clean_ver)
+        elif not cpe_result and _has_specific_version(cpe23):
+            # Specific-version query returned zero CVEs. Common NVD quirk: a
+            # vendor pins CVEs to major version only (e.g.
+            # vmware:vcenter_server:7.0) but nmap reports a patch level
+            # (7.0.3), so literal match fails. Retry once with the version
+            # wildcarded out — works across vendors (not a product-specific
+            # hack), and preserves the "top-critical CVEs for this service"
+            # principle because _query_nvd_cpe still filters by CVSS.
+            relaxed = _relax_cpe_version(cpe23)
+            if relaxed and relaxed != cpe23:
+                logger.info("CPE %s returned 0 CVEs, retrying with %s", cpe23, relaxed)
+                cves = _query_nvd_cpe(relaxed) or []
         else:
             cves = cpe_result
     elif version:
