@@ -14,6 +14,9 @@ from cauldron.ai.cve_enricher import (
     PRODUCT_CPE_MAP,
     _cpe22_to_23,
     _cve_applies_to,
+    _cve_is_dos_only,
+    _cve_is_gold,
+    _cve_is_local_only,
     _cve_matches_product,
     _extract_version,
     _get_cpe_for_service,
@@ -781,6 +784,114 @@ class TestCVEMatchesProduct:
     def test_no_configs_no_descriptions(self):
         cve_data = {}
         assert _cve_matches_product(cve_data, "anything") is False
+
+
+class TestCVEIsGold:
+    """Gold-only filter — enforces the three-rule enricher strategy
+    (versioned top-critical | versioned+exploit | versionless assume-latest)."""
+
+    def _cve(
+        self,
+        cvss: float = 7.5,
+        has_exploit: bool = False,
+        vector: str = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        published: str = "2024-01-01T00:00:00.000",
+    ) -> CVEInfo:
+        return CVEInfo(
+            cve_id="CVE-TEST-0001",
+            cvss=cvss,
+            cvss_vector=vector,
+            has_exploit=has_exploit,
+            published=published,
+        )
+
+    # --- Cross-cutting rejects ---
+
+    def test_local_vector_dropped_in_versioned(self):
+        cve = self._cve(cvss=9.8, has_exploit=True,
+                        vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_local_vector_dropped_in_versionless(self):
+        cve = self._cve(cvss=9.8, has_exploit=True,
+                        vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_is_gold(cve, versionless=True) is False
+
+    def test_physical_vector_dropped(self):
+        cve = self._cve(cvss=9.0, vector="CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_dos_only_dropped(self):
+        cve = self._cve(cvss=9.8, has_exploit=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    # --- Versioned rules (have nmap version) ---
+
+    def test_versioned_exploit_low_cvss_kept(self):
+        """Rule 2: has_exploit always wins (except local/DoS already rejected)."""
+        cve = self._cve(cvss=5.0, has_exploit=True)
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    def test_versioned_no_exploit_cvss_7_kept(self):
+        """Rule 1: CVSS >= 7 (top critical) kept."""
+        cve = self._cve(cvss=7.0, has_exploit=False)
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    def test_versioned_no_exploit_cvss_6_dropped(self):
+        cve = self._cve(cvss=6.9, has_exploit=False)
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_versioned_old_cve_kept_if_relevant(self):
+        """Versioned path trusts NVD — no recency cut. Old critical stays."""
+        cve = self._cve(cvss=9.0, has_exploit=True, published="2014-01-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    # --- Versionless rules (no version, wildcard CPE) ---
+
+    def test_versionless_recent_exploit_kept(self):
+        cve = self._cve(cvss=8.0, has_exploit=True, published="2024-06-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=True) is True
+
+    def test_versionless_recent_critical_kept(self):
+        cve = self._cve(cvss=9.8, has_exploit=False, published="2024-06-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=True) is True
+
+    def test_versionless_recent_cvss_8_no_exploit_dropped(self):
+        """Versionless path is stricter — without exploit need CVSS>=9."""
+        cve = self._cve(cvss=8.5, has_exploit=False, published="2024-06-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=True) is False
+
+    def test_versionless_exploit_low_cvss_dropped(self):
+        """Versionless: has_exploit alone isn't enough; need CVSS>=7 too."""
+        cve = self._cve(cvss=5.0, has_exploit=True, published="2024-06-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=True) is False
+
+    def test_versionless_old_exploit_dropped(self):
+        """Versionless path cuts old CVEs — even critical + exploit."""
+        cve = self._cve(cvss=9.8, has_exploit=True, published="2012-01-01T00:00:00.000")
+        assert _cve_is_gold(cve, versionless=True) is False
+
+    def test_versionless_missing_publish_date_treated_as_recent(self):
+        """Don't over-filter on absent publication date."""
+        cve = self._cve(cvss=9.8, has_exploit=True, published=None)
+        assert _cve_is_gold(cve, versionless=True) is True
+
+    # --- Vector-parser edge cases ---
+
+    def test_missing_vector_does_not_trigger_local_reject(self):
+        """A CVE with no vector string should pass the local/DoS gates."""
+        cve = self._cve(cvss=9.8, has_exploit=True, vector=None)
+        assert _cve_is_local_only(cve) is False
+        assert _cve_is_dos_only(cve) is False
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    def test_dos_with_integrity_loss_kept(self):
+        """Mixed impact (I:L + A:H) is NOT pure DoS — keep."""
+        cve = self._cve(cvss=8.2, has_exploit=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:H")
+        assert _cve_is_dos_only(cve) is False
+        assert _cve_is_gold(cve, versionless=False) is True
 
 
 class TestCVEAppliesTo:

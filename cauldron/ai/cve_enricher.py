@@ -491,6 +491,84 @@ def _is_pentester_relevant(cve: CVEInfo) -> bool:
     return False
 
 
+# --- Gold-only filter (versioned vs versionless strategy) ---
+
+def _cvss_tokens(cve: CVEInfo) -> set[str]:
+    """Split the CVSS vector string into metric tokens, upper-cased.
+
+    Substring matching on the raw vector string is unsafe because e.g. ``UI:N``
+    contains ``I:N`` — token-wise splitting keeps metric boundaries crisp.
+    """
+    if not cve.cvss_vector:
+        return set()
+    return {t.strip().upper() for t in cve.cvss_vector.split("/") if t.strip()}
+
+
+def _cve_is_local_only(cve: CVEInfo) -> bool:
+    """True if the CVE requires local or physical attack vector — of marginal
+    value on an external/internal network pentest unless chained from another
+    foothold. We drop these by default.
+    """
+    tokens = _cvss_tokens(cve)
+    return "AV:L" in tokens or "AV:P" in tokens
+
+
+def _cve_is_dos_only(cve: CVEInfo) -> bool:
+    """True if the CVE only impacts availability (pure DoS) — no confidentiality
+    or integrity loss. Useless for red-team gold hunting.
+    """
+    tokens = _cvss_tokens(cve)
+    if not tokens:
+        return False
+    return "C:N" in tokens and "I:N" in tokens and ("A:H" in tokens or "A:L" in tokens)
+
+
+def _cve_published_year(cve: CVEInfo) -> int | None:
+    """Parse publication year from the ISO timestamp NVD returns."""
+    if not cve.published:
+        return None
+    m = re.match(r"(\d{4})", cve.published)
+    return int(m.group(1)) if m else None
+
+
+def _cve_is_gold(cve: CVEInfo, versionless: bool) -> bool:
+    """Decide whether a CVE clears the "gold-only" bar for a pentester.
+
+    Mirrors the enricher strategy:
+      1. Version + public exploit  → always keep, unless local/physical.
+      2. Version, no exploit       → keep only if CVSS >= 7.0 (top critical).
+      3. No version (assume latest) → stricter: recent CVE AND (has_exploit
+         OR CVSS >= 9.0). Stops old high-CVSS CVEs from bulk-attaching to
+         modern deployments just because NVD listed them under the product.
+
+    Cross-cutting rejects applied in both modes:
+      - AV:L / AV:P — local or physical attack vector.
+      - Pure availability impact (DoS only).
+    """
+    # Cross-cutting: local/physical vectors are dead weight on a netscan.
+    if _cve_is_local_only(cve):
+        return False
+    # Pure DoS has no pentest gold in it.
+    if _cve_is_dos_only(cve):
+        return False
+
+    cvss = cve.cvss or 0.0
+
+    if versionless:
+        year = _cve_published_year(cve)
+        current_year = datetime.now(timezone.utc).year
+        if year is not None and year < current_year - 5:
+            return False
+        if cve.has_exploit and cvss >= 7.0:
+            return True
+        return cvss >= 9.0
+
+    # Versioned path
+    if cve.has_exploit:
+        return True
+    return cvss >= 7.0
+
+
 # --- NVD API queries ---
 
 def _has_specific_version(cpe23: str) -> bool:
@@ -544,8 +622,12 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     if cves is None:
         return None
 
-    # Pentester filter: keep only CVEs with real engagement impact
+    # Coarse pentester filter first (CWE + pattern), then the gold filter
+    # enforces the three-rule enricher strategy: versioned services demand
+    # has_exploit OR CVSS>=7; versionless services demand recency AND (exploit
+    # AND CVSS>=7) OR CVSS>=9. Local/DoS-only CVEs drop in both paths.
     cves = [c for c in cves if _is_pentester_relevant(c)]
+    cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version)]
 
     # Sort by severity desc. For specific-version queries we cap tight (20);
     # for wildcard queries we keep a wider window (50) so a newly published
@@ -581,8 +663,10 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
         version_hint=version if not versionless else None,
     ) or []
 
-    # Pentester filter: only keep CVEs with real engagement impact
+    # Same two-stage filter as the CPE path — coarse CWE+pattern relevance,
+    # then the strict gold-only bar tuned for versioned vs versionless.
     cves = [c for c in cves if _is_pentester_relevant(c)]
+    cves = [c for c in cves if _cve_is_gold(c, versionless=versionless)]
 
     # Sort by severity
     cves.sort(key=lambda c: c.cvss or 0, reverse=True)
