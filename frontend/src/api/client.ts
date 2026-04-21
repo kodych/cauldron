@@ -10,6 +10,7 @@ import type {
   CollectResponse,
   ImportResponse,
   AnalyzeResponse,
+  AnalysisJobStatus,
   VulnStatus,
   VulnListItem,
 } from '../types';
@@ -112,6 +113,39 @@ export const api = {
 
   runAnalysis: (options?: { nvd?: boolean; ai?: boolean }) =>
     post<AnalyzeResponse>('/analyze', options),
+
+  startAnalysis: (options?: { nvd?: boolean; ai?: boolean }) =>
+    post<{ job_id: string; status: string }>('/analyze/start', options, 30000),
+
+  getAnalysisStatus: (jobId: string) =>
+    get<AnalysisJobStatus>(`/analyze/status/${jobId}`),
+
+  runAnalysisWithProgress: async (
+    options: { nvd?: boolean; ai?: boolean } | undefined,
+    onProgress: (status: AnalysisJobStatus) => void,
+    pollIntervalMs = 1500,
+  ): Promise<AnalyzeResponse> => {
+    const { job_id } = await api.startAnalysis(options);
+    // Poll until done. No AbortController timeout — the server owns the work.
+    for (;;) {
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      let status: AnalysisJobStatus;
+      try {
+        status = await api.getAnalysisStatus(job_id);
+      } catch {
+        // Transient GET failure during long run — keep polling a few times
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        status = await api.getAnalysisStatus(job_id);
+      }
+      onProgress(status);
+      if (status.status === 'done' && status.result) {
+        return status.result;
+      }
+      if (status.status === 'failed') {
+        throw new Error(status.error || 'Analysis failed');
+      }
+    }
+  },
 
   setHostOwned: (ip: string, owned: boolean) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/owned`, { value: owned }),

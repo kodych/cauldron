@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import { Upload, FileText, Play, Check, AlertCircle, Brain, Trash2, Download } from 'lucide-react';
 import { api } from '../api/client';
-import type { ImportResponse, AnalyzeResponse } from '../types';
+import type { ImportResponse, AnalyzeResponse, AnalysisJobStatus } from '../types';
 
 interface Props {
   onImported?: () => void;
@@ -24,6 +24,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [analyzeElapsed, setAnalyzeElapsed] = useState(0);
+  const [analyzeProgress, setAnalyzeProgress] = useState<AnalysisJobStatus | null>(null);
   const [includeNotes, setIncludeNotes] = useState(false);
 
   const handleFile = useCallback((f: File) => {
@@ -69,11 +70,17 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
     setAnalyzing(true);
     setError(null);
     setAnalyzeResult(null);
+    setAnalyzeProgress(null);
     const start = Date.now();
     setAnalyzeElapsed(0);
     timerRef.current = setInterval(() => setAnalyzeElapsed(Date.now() - start), 1000);
     try {
-      const result = await api.runAnalysis({ nvd: useNvd, ai: useAi });
+      // Use background-job endpoint to survive 10+ minute NVD enrichment on
+      // large networks without hitting browser fetch timeout.
+      const result = await api.runAnalysisWithProgress(
+        { nvd: useNvd, ai: useAi },
+        (status) => setAnalyzeProgress(status),
+      );
       setAnalyzeResult(result);
       onAnalyzed?.();
     } catch (e) {
@@ -269,10 +276,31 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
                 </>
               )}
             </button>
-            {analyzing && analyzeElapsed > 5000 && (
-              <p className="text-xs text-orange-400/70 px-1 mt-1">
-                Large networks may take several minutes (NVD enrichment, exploit matching)...
-              </p>
+            {analyzing && analyzeProgress && (
+              <div className="mt-2 space-y-1">
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="uppercase tracking-wider text-orange-400 font-semibold w-16 shrink-0">
+                    {analyzeProgress.phase}
+                  </span>
+                  <span className="text-gray-400 flex-1 truncate">
+                    {analyzeProgress.message}
+                  </span>
+                  {analyzeProgress.total > 0 && (
+                    <span className="font-mono text-gray-500 shrink-0">
+                      {analyzeProgress.current}/{analyzeProgress.total}
+                      {analyzeProgress.phase === 'nvd' && ' services'}
+                    </span>
+                  )}
+                </div>
+                {analyzeProgress.total > 0 && (
+                  <div className="h-1 bg-gray-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-orange-500 transition-all duration-300"
+                      style={{ width: `${Math.min(100, (analyzeProgress.current / analyzeProgress.total) * 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
             )}
             {!analyzing && (
               <p className="text-xs text-gray-600 px-1 mt-1">

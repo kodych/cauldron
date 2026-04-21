@@ -697,14 +697,14 @@ class TestCVEMatchesProduct:
 
 
 class TestExecuteNVDRetry:
-    """Test that 403 retries are capped at 2."""
+    """Test that retries are capped and don't recurse infinitely."""
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
     @patch("cauldron.ai.cve_enricher._rate_limit")
     @patch("cauldron.ai.cve_enricher.time.sleep")
     def test_403_retries_capped(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
-        """Persistent 403 should retry max 2 times, not recurse infinitely."""
+        """Persistent 403 should retry a bounded number of times."""
         from cauldron.ai.cve_enricher import _execute_nvd_query
 
         mock_settings.nvd_api_key = None
@@ -712,12 +712,29 @@ class TestExecuteNVDRetry:
 
         result = _execute_nvd_query("https://example.com", "test")
         assert result == []
-        # 2 retries after initial attempt = 2 sleeps
-        assert mock_sleep.call_count == 2
+        # Initial attempt + 3 retries = 3 sleeps (exponential backoff)
+        assert mock_sleep.call_count == 3
+
+    @patch("cauldron.ai.cve_enricher.settings")
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    @patch("cauldron.ai.cve_enricher._rate_limit")
+    @patch("cauldron.ai.cve_enricher.time.sleep")
+    def test_transient_network_error_retries(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
+        """Transient URLError/OSError should also retry with backoff."""
+        import urllib.error
+        from cauldron.ai.cve_enricher import _execute_nvd_query
+
+        mock_settings.nvd_api_key = None
+        mock_urlopen.side_effect = urllib.error.URLError("Connection timed out")
+
+        result = _execute_nvd_query("https://example.com", "test")
+        assert result == []
+        # Initial attempt + 3 retries = 3 sleeps
+        assert mock_sleep.call_count == 3
 
 
 def urllib_403_error():
     """Create a sequence of 403 errors for testing."""
     import urllib.error
-    for _ in range(3):
+    for _ in range(4):
         yield urllib.error.HTTPError("https://nvd.nist.gov", 403, "Forbidden", {}, None)

@@ -185,3 +185,19 @@ export interface AnalyzeResponse {
 }
 
 export type VulnStatus = 'exploited' | 'false_positive' | 'mitigated' | null;
+
+export interface AnalysisJobStatus {
+  id: string;
+  status: 'running' | 'done' | 'failed';
+  phase: string;
+  current: number;
+  total: number;
+  message: string;
+  nvd: boolean;
+  ai: boolean;
+  started_at: number;
+  finished_at: number | null;
+  elapsed: number;
+  result: AnalyzeResponse | null;
+  error: string | null;
+}

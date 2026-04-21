@@ -546,12 +546,14 @@ def _execute_nvd_query(
         resp = urllib.request.urlopen(req, timeout=30)
         data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        if e.code == 403 and _retries < 2:
+        # 403 = rate limit, 503 = service unavailable — both retryable
+        if e.code in (403, 429, 500, 502, 503, 504) and _retries < 3:
+            backoff = 15 * (2 ** _retries)  # 15s, 30s, 60s
             logger.warning(
-                "NVD API rate limited (403) for %s. Retry %d/2, waiting 30s...",
-                context, _retries + 1,
+                "NVD API error %d for %s. Retry %d/3, waiting %ds...",
+                e.code, context, _retries + 1, backoff,
             )
-            time.sleep(30)
+            time.sleep(backoff)
             return _execute_nvd_query(url, context, product_hint, _retries + 1)
         if e.code == 404:
             logger.info("NVD CPE not found (404) for %s — will try keyword fallback", context)
@@ -559,7 +561,16 @@ def _execute_nvd_query(
         logger.error("NVD API error %d for %s", e.code, context)
         return []
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        logger.error("NVD API request failed for %s: %s", context, e)
+        # Transient network error — retry with exponential backoff
+        if _retries < 3:
+            backoff = 5 * (2 ** _retries)  # 5s, 10s, 20s
+            logger.warning(
+                "NVD API request failed for %s: %s. Retry %d/3, waiting %ds...",
+                context, e, _retries + 1, backoff,
+            )
+            time.sleep(backoff)
+            return _execute_nvd_query(url, context, product_hint, _retries + 1)
+        logger.error("NVD API request failed for %s after 3 retries: %s", context, e)
         return []
 
     # Normalize product hint for matching
@@ -774,11 +785,18 @@ def enrich_service(
     return EnrichmentResult(product=product, version=version or "", cves=cves)
 
 
-def enrich_services_from_graph() -> dict:
+def enrich_services_from_graph(
+    progress_callback=None,
+) -> dict:
     """Enrich all services in the Neo4j graph with CVE data.
 
     Reads services with CPE or product+version, queries NVD API,
     creates Vulnerability nodes and HAS_VULN relationships.
+
+    Args:
+        progress_callback: Optional callable(current, total, message) invoked
+            after each service is processed. Used to report progress from a
+            background analysis job.
 
     Returns:
         Dict with enrichment statistics.
@@ -833,8 +851,15 @@ def enrich_services_from_graph() -> dict:
         len(services),
     )
 
-    for product, version, cpe_list in unique_services:
+    total = len(unique_services)
+    for idx, (product, version, cpe_list) in enumerate(unique_services, 1):
         stats["services_checked"] += 1
+        if progress_callback:
+            label = f"{product or '?'}{(' ' + version) if version else ''}"
+            try:
+                progress_callback(idx, total, f"NVD: {label}")
+            except Exception:  # noqa: BLE001
+                pass
         enrichment = enrich_service(product or "", version or "", cache, cpe_list)
 
         if enrichment.error:

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -839,18 +842,16 @@ async def import_scan(
         tmp_path.unlink(missing_ok=True)
 
 
-@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
-def run_analysis(
-    nvd: bool = Query(False, description="Enable NVD CVE enrichment"),
-    ai: bool = Query(False, description="Enable AI analysis"),
-):
-    """Run the analysis pipeline (equivalent to 'cauldron boil').
+def _run_analysis_pipeline(
+    nvd: bool,
+    ai: bool,
+    progress_callback=None,
+) -> AnalyzeResponse:
+    """Run the full analysis pipeline. Shared between sync and async endpoints.
 
-    By default runs only local analysis (exploit DB, topology, attack paths).
-    Use ?nvd=true for NVD enrichment, ?ai=true for AI analysis.
+    progress_callback(phase_name, current, total, message) is called after each
+    phase and, for NVD enrichment, per service.
     """
-    _check_neo4j()
-
     from cauldron.graph.ingestion import classify_graph_hosts
     from cauldron.exploits.matcher import (
         ExploitDB, upgrade_confidence_from_scripts, mark_bruteforceable_services,
@@ -858,32 +859,42 @@ def run_analysis(
     from cauldron.graph.topology import build_segment_connectivity
     from cauldron.ai.attack_paths import get_path_summary
 
-    # Phase 1: Classification
+    def _bump(phase: str, msg: str = "", current: int = 0, total: int = 0):
+        if progress_callback:
+            try:
+                progress_callback(phase, current, total, msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    _bump("classify", "Classifying hosts")
     classification = classify_graph_hosts()
 
-    # Phase 2: Local exploit DB
+    _bump("exploits", "Matching exploit DB")
     exploit_db = ExploitDB()
     exploit_stats = exploit_db.match_from_graph()
 
-    # Phase 2.5: Script confidence
+    _bump("scripts", "Upgrading script confidence")
     script_stats = upgrade_confidence_from_scripts()
 
-    # Phase 2.7: Bruteforceable service detection
+    _bump("brute", "Detecting bruteforceable services")
     mark_bruteforceable_services()
 
-    # Phase 3: CVE enrichment (optional)
     cve_stats: dict = {"services_checked": 0, "services_with_cves": 0, "total_cves_found": 0}
     if nvd:
         from cauldron.ai.cve_enricher import enrich_services_from_graph
-        cve_stats = enrich_services_from_graph()
+        _bump("nvd", "Starting NVD enrichment")
 
-    # Phase 4: Topology
+        def _nvd_cb(current: int, total: int, message: str):
+            _bump("nvd", message, current, total)
+
+        cve_stats = enrich_services_from_graph(progress_callback=_nvd_cb)
+
+    _bump("topology", "Building topology")
     topo_stats = build_segment_connectivity()
 
-    # Phase 5: Path summary
+    _bump("paths", "Computing attack paths")
     summary = get_path_summary()
 
-    # Phase 6: AI (optional)
     ai_fp_count = 0
     ai_kept = 0
     ai_dismissed = 0
@@ -892,6 +903,7 @@ def run_analysis(
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
+            _bump("ai", "Running AI triage")
             ai_result = analyze_graph()
             ai_fp_count = ai_result.false_positives_found
             ai_kept = ai_result.vulns_kept
@@ -899,7 +911,6 @@ def run_analysis(
             ai_cves = ai_result.cves_found
             ai_targets = ai_result.targets_set
 
-    # Recalculate path summary after AI (FP may have changed)
     if ai and (ai_dismissed or ai_cves):
         summary = get_path_summary()
 
@@ -916,6 +927,128 @@ def run_analysis(
         ai_targets_set=ai_targets,
         ai_cves_found=ai_cves,
     )
+
+
+# ---------------------------------------------------------------------------
+# Background analysis jobs — avoid HTTP timeout on large networks
+# ---------------------------------------------------------------------------
+
+class AnalysisJob:
+    """Tracks progress of a long-running analysis run."""
+
+    def __init__(self, job_id: str, nvd: bool, ai: bool):
+        self.id = job_id
+        self.nvd = nvd
+        self.ai = ai
+        self.status = "running"  # running | done | failed
+        self.phase = "queued"
+        self.current = 0
+        self.total = 0
+        self.message = ""
+        self.started_at = time.time()
+        self.finished_at: float | None = None
+        self.result: AnalyzeResponse | None = None
+        self.error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "phase": self.phase,
+            "current": self.current,
+            "total": self.total,
+            "message": self.message,
+            "nvd": self.nvd,
+            "ai": self.ai,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "elapsed": (self.finished_at or time.time()) - self.started_at,
+            "result": self.result.model_dump() if self.result else None,
+            "error": self.error,
+        }
+
+
+_analysis_jobs: dict[str, AnalysisJob] = {}
+_analysis_jobs_lock = threading.Lock()
+
+
+def _reap_old_jobs(max_age_sec: int = 3600):
+    """Drop finished jobs older than max_age to avoid unbounded growth."""
+    now = time.time()
+    with _analysis_jobs_lock:
+        stale = [
+            jid for jid, job in _analysis_jobs.items()
+            if job.finished_at and (now - job.finished_at) > max_age_sec
+        ]
+        for jid in stale:
+            del _analysis_jobs[jid]
+
+
+def _run_analysis_job(job: AnalysisJob):
+    """Worker thread: run pipeline, update job state."""
+    def _progress(phase: str, current: int, total: int, message: str):
+        job.phase = phase
+        job.current = current
+        job.total = total
+        job.message = message
+
+    try:
+        job.result = _run_analysis_pipeline(job.nvd, job.ai, progress_callback=_progress)
+        job.status = "done"
+        job.phase = "done"
+        job.message = "Analysis complete"
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Analysis job %s failed", job.id)
+        job.status = "failed"
+        job.error = str(e) or e.__class__.__name__
+    finally:
+        job.finished_at = time.time()
+
+
+@app.post("/api/v1/analyze/start")
+def start_analysis(
+    nvd: bool = Query(False, description="Enable NVD CVE enrichment"),
+    ai: bool = Query(False, description="Enable AI analysis"),
+) -> dict:
+    """Kick off an analysis job in the background. Returns job_id for polling.
+
+    Use this for large networks where NVD enrichment can take 30+ minutes
+    (without API key, rate limit is 1 request per 6.5s).
+    """
+    _check_neo4j()
+    _reap_old_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    job = AnalysisJob(job_id, nvd=nvd, ai=ai)
+    with _analysis_jobs_lock:
+        _analysis_jobs[job_id] = job
+    t = threading.Thread(target=_run_analysis_job, args=(job,), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/v1/analyze/status/{job_id}")
+def get_analysis_status(job_id: str) -> dict:
+    """Poll progress of a background analysis job."""
+    with _analysis_jobs_lock:
+        job = _analysis_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return job.to_dict()
+
+
+@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
+def run_analysis(
+    nvd: bool = Query(False, description="Enable NVD CVE enrichment"),
+    ai: bool = Query(False, description="Enable AI analysis"),
+):
+    """Run the analysis pipeline synchronously (legacy endpoint).
+
+    Prefer /analyze/start + /analyze/status for large networks to avoid
+    HTTP client timeouts. This endpoint still works but may exceed
+    a 10-minute fetch timeout for 1000+ host networks without NVD cache.
+    """
+    _check_neo4j()
+    return _run_analysis_pipeline(nvd=nvd, ai=ai)
 
 
 @app.get("/api/v1/hosts/{ip}/services/{port}/default-creds")
