@@ -13,6 +13,7 @@ from cauldron.ai.cve_enricher import (
     CVEInfo,
     PRODUCT_CPE_MAP,
     _cpe22_to_23,
+    _cve_applies_to,
     _cve_matches_product,
     _extract_version,
     _get_cpe_for_service,
@@ -780,6 +781,135 @@ class TestCVEMatchesProduct:
     def test_no_configs_no_descriptions(self):
         cve_data = {}
         assert _cve_matches_product(cve_data, "anything") is False
+
+
+class TestCVEAppliesTo:
+    """Version-applicability filter — the mechanism that drops 1999 CVEs
+    pinned to ``apache:http_server:1.0.3`` from attaching to modern Apache."""
+
+    # Ancient CVE: pinned to a specific old version, no version range
+    ANCIENT_CVE = {
+        "configurations": [{
+            "nodes": [{
+                "cpeMatch": [
+                    {"criteria": "cpe:2.3:a:apache:http_server:1.0.3:*:*:*:*:*:*:*"}
+                ]
+            }]
+        }]
+    }
+
+    # Modern CVE with explicit range
+    RANGED_CVE = {
+        "configurations": [{
+            "nodes": [{
+                "cpeMatch": [{
+                    "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                    "versionStartIncluding": "2.4.49",
+                    "versionEndExcluding": "2.4.52",
+                }]
+            }]
+        }]
+    }
+
+    # CVE with fully unconstrained CPE (wildcard version, no range)
+    UNCONSTRAINED_CVE = {
+        "configurations": [{
+            "nodes": [{
+                "cpeMatch": [
+                    {"criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*"}
+                ]
+            }]
+        }]
+    }
+
+    NO_CONFIG_CVE = {"configurations": []}
+
+    # --- Versionless service (wildcard CPE query) ---
+
+    def test_versionless_drops_pinned_ancient_cve(self):
+        """Apache httpd with no version: CVE pinned to 1.0.3 must drop."""
+        assert _cve_applies_to(self.ANCIENT_CVE, "http_server", None) is False
+
+    def test_versionless_drops_range_bounded_cve(self):
+        """Versionless service can't confirm range membership — drop."""
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", None) is False
+
+    def test_versionless_keeps_unconstrained_cve(self):
+        """CVE with wildcard CPE applies to any version — keep."""
+        assert _cve_applies_to(self.UNCONSTRAINED_CVE, "http_server", None) is True
+
+    def test_no_config_passes_through(self):
+        """CVEs without CPE configurations aren't filtered here."""
+        assert _cve_applies_to(self.NO_CONFIG_CVE, "http_server", None) is True
+
+    # --- Versioned service ---
+
+    def test_versioned_in_range_keeps(self):
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "2.4.50") is True
+
+    def test_versioned_below_range_drops(self):
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "2.4.48") is False
+
+    def test_versioned_at_end_exclusive_drops(self):
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "2.4.52") is False
+
+    def test_versioned_pinned_same_major_minor_keeps(self):
+        """CVE pinned at 1.0.3; service reports 1.0.9 — same major.minor → keep."""
+        assert _cve_applies_to(self.ANCIENT_CVE, "http_server", "1.0.9") is True
+
+    def test_versioned_pinned_different_major_drops(self):
+        """Modern Apache 2.4.x versus 1999 CVE pinned at 1.0.3 — must drop."""
+        assert _cve_applies_to(self.ANCIENT_CVE, "http_server", "2.4.51") is False
+
+    def test_versioned_unconstrained_keeps(self):
+        assert _cve_applies_to(self.UNCONSTRAINED_CVE, "http_server", "2.4.51") is True
+
+    # --- Edge cases ---
+
+    def test_unparseable_version_treated_as_versionless(self):
+        """A version string nmap couldn't parse behaves like "no version" —
+        ranged CVEs drop (we can't prove applicability), unconstrained ones pass."""
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "unknown-build-xyz") is False
+        assert _cve_applies_to(self.UNCONSTRAINED_CVE, "http_server", "unknown-build-xyz") is True
+
+    def test_other_product_ignored(self):
+        """Product not referenced in CVE's CPE config — filter is neutral."""
+        assert _cve_applies_to(self.ANCIENT_CVE, "nginx", "1.24.0") is True
+
+    def test_na_marker_treated_as_unverifiable(self):
+        """NVD sometimes tags CVEs with CPE version = '-' (Not Applicable).
+        These are legacy / broken entries where we cannot confirm the CVE
+        actually affects the running version — drop to avoid phantom hits
+        like CVE-1999-1237 tagged at 'apache:http_server:-'."""
+        cve = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [
+                        {"criteria": "cpe:2.3:a:apache:http_server:-:*:*:*:*:*:*:*"}
+                    ]
+                }]
+            }]
+        }
+        assert _cve_applies_to(cve, "http_server", None) is False
+        assert _cve_applies_to(cve, "http_server", "2.4.51") is False
+
+    def test_multiple_cpe_any_match_keeps(self):
+        """If at least one CPE entry applies, the CVE is kept."""
+        cve = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [
+                        {"criteria": "cpe:2.3:a:apache:http_server:1.0.3:*:*:*:*:*:*:*"},
+                        {
+                            "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                            "versionStartIncluding": "2.4.0",
+                            "versionEndExcluding": "2.4.60",
+                        },
+                    ]
+                }]
+            }]
+        }
+        assert _cve_applies_to(cve, "http_server", "2.4.51") is True
 
 
 class TestExecuteNVDRetry:

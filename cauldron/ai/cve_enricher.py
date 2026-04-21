@@ -521,7 +521,24 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     # out for any vendor whose NVD history exceeds 100 entries.
     url = f"{NVD_API_BASE}?virtualMatchString={encoded_cpe}&resultsPerPage=2000"
 
-    cves = _execute_nvd_query(url, f"CPE:{cpe23}")
+    # Extract product and version from the CPE so _execute_nvd_query can
+    # validate each returned CVE's CPE configuration actually applies. For
+    # wildcard CPE queries this is what drops CVEs pinned to ancient
+    # versions (NVD otherwise happily returns them). The product is passed
+    # as ``version_applies_product`` rather than ``product_hint`` because
+    # NVD already constrained the product server-side via virtualMatchString
+    # — we only need the client-side version-range cross-check.
+    parts = cpe23.split(":")
+    cpe_product = parts[4] if len(parts) > 4 else None
+    cpe_version = parts[5] if len(parts) > 5 else None
+    applies_product = cpe_product.replace("_", " ") if cpe_product else None
+    version_hint = cpe_version if cpe_version and cpe_version not in ("*", "-") else None
+
+    cves = _execute_nvd_query(
+        url, f"CPE:{cpe23}",
+        version_hint=version_hint,
+        version_applies_product=applies_product,
+    )
 
     # None = 404 (CPE not in NVD) — signal caller to try keyword fallback
     if cves is None:
@@ -558,7 +575,11 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     if not versionless:
         url += "&keywordExactMatch"
 
-    cves = _execute_nvd_query(url, f"keyword:{keyword}", product_hint=product) or []
+    cves = _execute_nvd_query(
+        url, f"keyword:{keyword}",
+        product_hint=product,
+        version_hint=version if not versionless else None,
+    ) or []
 
     # Pentester filter: only keep CVEs with real engagement impact
     cves = [c for c in cves if _is_pentester_relevant(c)]
@@ -573,6 +594,8 @@ def _execute_nvd_query(
     url: str,
     context: str,
     product_hint: str | None = None,
+    version_hint: str | None = None,
+    version_applies_product: str | None = None,
     _retries: int = 0,
 ) -> list[CVEInfo] | None:
     """Execute NVD API request and parse results.
@@ -581,8 +604,19 @@ def _execute_nvd_query(
         url: NVD API URL to query.
         context: Human-readable context for logging.
         product_hint: If set, validate each CVE's CPE configurations
-            actually reference this product (used for keyword searches
-            to eliminate false positives).
+            actually reference this product via substring match (used by
+            the keyword-search fallback, where NVD itself does not
+            constrain the product).
+        version_hint: If set, cross-check the CVE's CPE configuration
+            against this version so CVEs pinned to unrelated versions
+            (e.g. CVE-2004-0492 tagged at ``apache:http_server:1.3.31``)
+            are not attached to modern installs. Critical for wildcard
+            CPE queries where NVD does not filter version server-side.
+        version_applies_product: Product name to drive the version
+            applicability filter independently of ``product_hint``. The
+            CPE-query path sets this without the substring filter because
+            NVD already constrained product server-side — we only need
+            to validate the version range.
         _retries: Internal retry counter (max 2 retries on 403).
 
     Returns:
@@ -607,7 +641,9 @@ def _execute_nvd_query(
                 e.code, context, _retries + 1, backoff,
             )
             time.sleep(backoff)
-            return _execute_nvd_query(url, context, product_hint, _retries + 1)
+            return _execute_nvd_query(
+                url, context, product_hint, version_hint, version_applies_product, _retries + 1,
+            )
         if e.code == 404:
             logger.info("NVD CPE not found (404) for %s — will try keyword fallback", context)
             return None
@@ -622,12 +658,17 @@ def _execute_nvd_query(
                 context, e, _retries + 1, backoff,
             )
             time.sleep(backoff)
-            return _execute_nvd_query(url, context, product_hint, _retries + 1)
+            return _execute_nvd_query(
+                url, context, product_hint, version_hint, version_applies_product, _retries + 1,
+            )
         logger.error("NVD API request failed for %s after 3 retries: %s", context, e)
         return []
 
     # Normalize product hint for matching
     product_lower = product_hint.lower().strip() if product_hint else None
+    applies_product = (
+        version_applies_product.lower().strip() if version_applies_product else product_lower
+    )
 
     cves = []
     for vuln_item in data.get("vulnerabilities", []):
@@ -642,11 +683,162 @@ def _execute_nvd_query(
         if product_lower and not _cve_matches_product(cve_data, product_lower):
             continue
 
+        # Validate that the CVE's CPE config is actually applicable to our
+        # service version. Without this check, NVD's wildcard virtualMatchString
+        # happily returns CVEs pinned to ancient versions (e.g. CVE-1999-0067
+        # tagged at apache:http_server:1.0.3 attaching to modern Apache 2.4).
+        if applies_product and not _cve_applies_to(cve_data, applies_product, version_hint):
+            continue
+
         cve = _parse_cve(cve_data)
         if cve:
             cves.append(cve)
 
     return cves
+
+
+def _cpe_matches_product(criteria: str, product_lower: str) -> bool:
+    """Check whether a CPE criteria string references the target product."""
+    c = criteria.lower()
+    if product_lower in c:
+        return True
+    normalized = product_lower.replace(" ", "_").replace("-", "_")
+    return normalized in c
+
+
+def _iter_matching_cpe_entries(cve_data: dict, product_lower: str):
+    """Yield cpeMatch dicts from the CVE that reference our target product."""
+    for config in cve_data.get("configurations", []):
+        for node in config.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+                criteria = match.get("criteria", "")
+                if _cpe_matches_product(criteria, product_lower):
+                    yield match
+
+
+def _cpe_entry_has_version_constraint(match: dict) -> bool:
+    """True if a cpeMatch entry pins versions in any way we cannot verify
+    against an unknown service version.
+
+    Covers:
+    - Explicit bounded ranges (versionStart/End*).
+    - Specific version baked into the criteria (``...:1.0.3:...``).
+    - NA marker ``-`` in the CPE version field. Per CPE 2.3 spec ``-``
+      means "not applicable" — NVD often uses it for broken entries that
+      predate version ranges (e.g. CVE-1999-1237 tagged at
+      ``apache:http_server:-``). Treat as constrained: we cannot confirm
+      the CVE applies to a modern install.
+
+    Returns False only for truly unconstrained ``*`` entries without range.
+    """
+    if any(match.get(k) for k in (
+        "versionStartIncluding", "versionStartExcluding",
+        "versionEndIncluding", "versionEndExcluding",
+    )):
+        return True
+    criteria = match.get("criteria", "")
+    parts = criteria.split(":")
+    if len(parts) < 6:
+        return False
+    cpe_ver = parts[5]
+    return cpe_ver != "*"
+
+
+def _cpe_entry_version_in_range(match: dict, version_str: str) -> bool:
+    """Check if the provided service version falls in the cpeMatch's range
+    (or equals the pinned specific version at major.minor level).
+
+    Returns True when the version is applicable OR when the entry has no
+    version constraint at all. Returns False when the entry pins versions
+    and our version is outside the applicable range.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:  # packaging is a transitive dep; defensive
+        return True
+
+    try:
+        ours = Version(_extract_version(version_str))
+    except InvalidVersion:
+        return True  # unparseable — don't over-filter
+
+    def _v(raw: str | None) -> "Version | None":
+        if not raw:
+            return None
+        try:
+            return Version(raw)
+        except InvalidVersion:
+            return None
+
+    start_inc = _v(match.get("versionStartIncluding"))
+    start_exc = _v(match.get("versionStartExcluding"))
+    end_inc = _v(match.get("versionEndIncluding"))
+    end_exc = _v(match.get("versionEndExcluding"))
+
+    if start_inc or start_exc or end_inc or end_exc:
+        if start_inc and ours < start_inc:
+            return False
+        if start_exc and ours <= start_exc:
+            return False
+        if end_inc and ours > end_inc:
+            return False
+        if end_exc and ours >= end_exc:
+            return False
+        return True
+
+    # No explicit range — check the version field embedded in the CPE string.
+    parts = match.get("criteria", "").split(":")
+    if len(parts) < 6:
+        return True
+    cpe_ver_raw = parts[5]
+    if cpe_ver_raw == "*":
+        return True  # wildcard CPE: unconstrained, applies to any version
+    if cpe_ver_raw in ("-", ""):
+        return False  # NA marker — NVD says "version not applicable"; cannot confirm
+    pinned = _v(cpe_ver_raw)
+    if not pinned:
+        return True
+    # Pinned to a specific version — require our major.minor to match so a
+    # 1999 CVE tagged at ``1.0.3`` never attaches to a modern 2.4 deploy.
+    return ours.major == pinned.major and ours.minor == pinned.minor
+
+
+def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> bool:
+    """Validate that a CVE's CPE configuration actually covers our service.
+
+    The NVD ``virtualMatchString`` endpoint is generous: it returns every CVE
+    whose CPE configuration mentions the vendor:product, regardless of the
+    version pinned in that configuration. When our service is versionless
+    (the caller queried with a wildcard) NVD cannot filter for us, so we
+    would otherwise pick up ancient CVEs pinned to versions from decades ago
+    (CVE-1999-0067 tagged at ``apache:http_server:1.0.3`` on modern Apache).
+
+    Logic:
+    - No cpeMatch entries for this product → fall back to loose check.
+    - Versionless service → require at least one unconstrained CPE entry
+      for this product. Any CPE pinned to a specific version or bounded
+      range drops the CVE because we cannot confirm applicability.
+    - Versioned service → require at least one CPE entry whose range (or
+      pinned specific version at major.minor) covers the service version.
+    """
+    configurations = cve_data.get("configurations", [])
+    if not configurations:
+        return True  # keep; description-based match handled by _cve_matches_product
+
+    matches = list(_iter_matching_cpe_entries(cve_data, product_lower))
+    if not matches:
+        return True  # different product entry; not our business to drop
+
+    versionless = not version or _extract_version(version) == "*"
+    if versionless:
+        # Keep only if at least one CPE entry is unconstrained.
+        return any(
+            not _cpe_entry_has_version_constraint(m) for m in matches
+        )
+
+    # Versioned: require the service version to fall inside at least one
+    # entry's range (or to match a pinned version at major.minor).
+    return any(_cpe_entry_version_in_range(m, version) for m in matches)
 
 
 def _cve_matches_product(cve_data: dict, product_lower: str) -> bool:
