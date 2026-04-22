@@ -523,6 +523,36 @@ class TestEnrichService:
         first_call = mock_cpe.call_args_list[0][0][0]
         assert "postgresql:postgresql:9.6.0" in first_call
 
+    @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
+    def test_wildcard_retry_threads_service_version(self, mock_cpe, tmp_path: Path):
+        """When a specific-version CPE returns empty and we relax to a
+        wildcard version, the original service version must be threaded
+        through to the follow-up query. Without this the applicability
+        filter falls into the "versionless" branch and drops every modern
+        vendor CVE pinned to a specific major.minor — the bug that hid
+        CVE-2024-37085 (ESXi KEV) on the dipocket scan.
+        """
+        cache = CVECache(tmp_path / "cache.json")
+        # First call (specific version) returns empty; second (relaxed)
+        # returns a stub CVE. We assert both the CPE strings and the
+        # version override argument the enricher passes on the retry.
+        mock_cpe.side_effect = [[], [CVEInfo(cve_id="CVE-2024-37085", cvss=6.8)]]
+
+        result = enrich_service(
+            "VMware ESXi SOAP API", "8.0.3", cache,
+            cpe_list=["cpe:/o:vmware:ESXi:8.0.3"],
+        )
+        assert len(result.cves) == 1
+        assert result.cves[0].cve_id == "CVE-2024-37085"
+        assert mock_cpe.call_count == 2
+        # First call: specific version, no override.
+        first_args, first_kwargs = mock_cpe.call_args_list[0]
+        assert "vmware:esxi:8.0.3" in first_args[0]
+        # Second call: wildcard CPE, original version threaded via kwarg.
+        second_args, second_kwargs = mock_cpe.call_args_list[1]
+        assert "vmware:esxi:*" in second_args[0]
+        assert second_kwargs.get("service_version_override") == "8.0.3"
+
 
 class TestParseCVEExtended:
     """Test CWE and published date extraction."""
@@ -1060,9 +1090,19 @@ class TestCVEAppliesTo:
         """Apache httpd with no version: CVE pinned to 1.0.3 must drop."""
         assert _cve_applies_to(self.ANCIENT_CVE, "http_server", None) is False
 
-    def test_versionless_drops_range_bounded_cve(self):
-        """Versionless service can't confirm range membership — drop."""
-        assert _cve_applies_to(self.RANGED_CVE, "http_server", None) is False
+    def test_versionless_keeps_range_bounded_cve(self):
+        """Versionless service: range-bounded CVEs are kept because they
+        came from NVD with an explicit applicability window — the modern
+        vendor-CVE pattern. Ancient phantom CVEs pin a bare version with
+        no range (see `test_versionless_drops_pinned_ancient_cve`).
+
+        Regression guard for the bug where CVE-2024-4040 (CrushFTP, range
+        10.0.0–10.7.1) and CVE-2024-37085 (ESXi) were being eaten by the
+        previous "unconstrained only" rule when the service had no known
+        version or the CPE was relaxed to a wildcard on retry. Recency
+        and severity are handled downstream by `_cve_is_gold`.
+        """
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", None) is True
 
     def test_versionless_keeps_unconstrained_cve(self):
         """CVE with wildcard CPE applies to any version — keep."""
@@ -1098,13 +1138,64 @@ class TestCVEAppliesTo:
 
     def test_unparseable_version_treated_as_versionless(self):
         """A version string nmap couldn't parse behaves like "no version" —
-        ranged CVEs drop (we can't prove applicability), unconstrained ones pass."""
-        assert _cve_applies_to(self.RANGED_CVE, "http_server", "unknown-build-xyz") is False
+        range-bounded and unconstrained CVEs both pass, because with no
+        anchor we cannot verify the range but the range is a real
+        applicability window we trust. Recency and severity are enforced
+        downstream by `_cve_is_gold`.
+        """
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "unknown-build-xyz") is True
         assert _cve_applies_to(self.UNCONSTRAINED_CVE, "http_server", "unknown-build-xyz") is True
 
     def test_other_product_ignored(self):
         """Product not referenced in CVE's CPE config — filter is neutral."""
         assert _cve_applies_to(self.ANCIENT_CVE, "nginx", "1.24.0") is True
+
+    def test_vendor_pinned_major_minor_kept_when_matches(self):
+        """VMware ESXi registers each patch release as a pinned CPE entry
+        (e.g. ``esxi:8.0:a:*``) with no explicit range. When the service is
+        ESXi 8.0.3 the wildcard-retry path threads that version back through
+        so the filter can do major.minor matching — otherwise flagship CVEs
+        like CVE-2024-37085 (CISA KEV) never attach to modern ESXi hosts.
+        """
+        esxi_pinned_cve = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [
+                        {"criteria": "cpe:2.3:o:vmware:esxi:8.0:-:*:*:*:*:*:*"},
+                        {"criteria": "cpe:2.3:o:vmware:esxi:8.0:a:*:*:*:*:*:*"},
+                        {"criteria": "cpe:2.3:o:vmware:esxi:7.0:*:*:*:*:*:*:*"},
+                    ]
+                }]
+            }]
+        }
+        # 8.0.3 matches the 8.0:a pinned entry at major.minor level.
+        assert _cve_applies_to(esxi_pinned_cve, "esxi", "8.0.3") is True
+        # 6.5 deploy — no 6.5 entry in this CVE, must drop.
+        assert _cve_applies_to(esxi_pinned_cve, "esxi", "6.5.0") is False
+
+    def test_range_bounded_cve_kept_for_unknown_version(self):
+        """CrushFTP services rarely expose a version — nmap reports
+        ``CrushFTP sftpd`` with no version field. The wildcard CPE query
+        returns range-bounded CVEs like CVE-2024-4040
+        (``versionStartIncluding=10.0.0 versionEndExcluding=10.7.1``).
+        Those must survive the applicability filter so flagship KEV CVEs
+        land on the service even without a version anchor.
+        """
+        crushftp_ranged_cve = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [{
+                        "criteria": "cpe:2.3:a:crushftp:crushftp:*:*:*:*:*:*:*:*",
+                        "versionStartIncluding": "10.0.0",
+                        "versionEndExcluding": "10.7.1",
+                    }]
+                }]
+            }]
+        }
+        assert _cve_applies_to(crushftp_ranged_cve, "crushftp", None) is True
+        # And when we DO know the version, range matching still works.
+        assert _cve_applies_to(crushftp_ranged_cve, "crushftp", "10.3.0") is True
+        assert _cve_applies_to(crushftp_ranged_cve, "crushftp", "10.7.1") is False
 
     def test_na_marker_treated_as_unverifiable(self):
         """NVD sometimes tags CVEs with CPE version = '-' (Not Applicable).

@@ -628,11 +628,25 @@ def _has_specific_version(cpe23: str) -> bool:
     return len(parts) >= 6 and parts[5] != "*"
 
 
-def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
+def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> list[CVEInfo] | None:
     """Query NVD API using CPE-based virtualMatchString.
 
     With specific version: full search, sorted by severity (highest first).
     Without version (wildcard): recent CVEs only, sorted by date (newest first).
+
+    Args:
+        cpe23: The CPE 2.3 string to query against NVD.
+        service_version_override: When the CPE carries a wildcard version
+            (``*``) but the caller still knows the service version from
+            another source, thread it here so the client-side CPE
+            applicability validator can do proper range matching instead
+            of falling back to the "must be completely unconstrained"
+            rule. Used by the wildcard-retry path: a specific-version
+            query (``esxi:8.0.3``) comes back empty because VMware
+            registers CVEs at major.minor, so we retry with
+            ``esxi:*`` — but we still want range validation to pick the
+            CVEs that apply to 8.0.3, not every CVE that ever touched
+            ESXi.
 
     Returns None if CPE is not recognized by NVD (404), signaling
     the caller to try keyword fallback.
@@ -660,7 +674,14 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     cpe_product = parts[4] if len(parts) > 4 else None
     cpe_version = parts[5] if len(parts) > 5 else None
     applies_product = cpe_product.replace("_", " ") if cpe_product else None
-    version_hint = cpe_version if cpe_version and cpe_version not in ("*", "-") else None
+    if cpe_version and cpe_version not in ("*", "-"):
+        version_hint = cpe_version
+    else:
+        # CPE version is wildcard — caller may still know the service
+        # version (wildcard-retry path). Use it so we keep range/major-minor
+        # matching instead of dropping to the "unconstrained only" rule.
+        extracted = _extract_version(service_version_override) if service_version_override else "*"
+        version_hint = extracted if extracted and extracted != "*" else None
 
     cves = _execute_nvd_query(
         url, f"CPE:{cpe23}",
@@ -966,10 +987,24 @@ def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> 
 
     versionless = not version or _extract_version(version) == "*"
     if versionless:
-        # Keep only if at least one CPE entry is unconstrained.
-        return any(
-            not _cpe_entry_has_version_constraint(m) for m in matches
-        )
+        # Keep the CVE if at least one CPE entry is either:
+        #   (a) truly unconstrained (version=``*`` with no range), OR
+        #   (b) an explicit version range (versionStart/End*).
+        #
+        # Entries pinned to a bare specific version (``apache:1.0.3``) with
+        # no range are the phantom-CVE pattern we want to drop — they cannot
+        # be verified against an unknown service version and almost always
+        # represent 1990s CVEs that NVD still indexes under the product.
+        # Modern vendor CVEs (ESXi, CrushFTP, Apache 2.4) carry proper
+        # ranges; those we keep and let the gold filter enforce recency.
+        def _applicable(m: dict) -> bool:
+            if not _cpe_entry_has_version_constraint(m):
+                return True  # unconstrained — always applicable
+            return any(m.get(k) for k in (
+                "versionStartIncluding", "versionStartExcluding",
+                "versionEndIncluding", "versionEndExcluding",
+            ))
+        return any(_applicable(m) for m in matches)
 
     # Versioned: require the service version to fall inside at least one
     # entry's range (or to match a pinned version at major.minor).
@@ -1167,7 +1202,11 @@ def enrich_service(
             relaxed = _relax_cpe_version(cpe23)
             if relaxed and relaxed != cpe23:
                 logger.info("CPE %s returned 0 CVEs, retrying with %s", cpe23, relaxed)
-                cves = _query_nvd_cpe(relaxed) or []
+                # Thread the original service version so the applicability
+                # filter can still do range/major.minor matching — without
+                # this the relaxed CPE falls into the unconstrained-only
+                # rule and drops every modern vendor CVE.
+                cves = _query_nvd_cpe(relaxed, service_version_override=version) or []
         else:
             cves = cpe_result
     elif version:
