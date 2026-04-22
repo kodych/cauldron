@@ -1,7 +1,23 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { Upload, FileText, Play, Check, AlertCircle, Brain, Trash2, Download } from 'lucide-react';
 import { api } from '../api/client';
 import type { ImportResponse, AnalyzeResponse, AnalysisJobStatus } from '../types';
+
+// Map backend phase codes ("nvd", "ai", "classify"...) to pentester-readable
+// labels. Shown in the progress bar during analysis — raw "nvd" and "ai"
+// mean nothing to someone who didn't read our API docs.
+const PHASE_LABELS: Record<string, string> = {
+  queued:    'Queued',
+  classify:  'Classifying hosts',
+  exploits:  'Matching exploits',
+  scripts:   'Verifying NSE scripts',
+  brute:     'Detecting brute-forceable',
+  nvd:       'Enriching CVEs (NVD)',
+  topology:  'Building topology',
+  paths:     'Computing attack paths',
+  ai:        'AI triage',
+  done:      'Complete',
+};
 
 interface Props {
   onImported?: () => void;
@@ -63,8 +79,21 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
     }
   }, [file, source, onImported]);
 
-  // Elapsed time ticker during analysis
+  // Elapsed time ticker during analysis. The `finally` block in
+  // `handleAnalyze` already clears it on completion/error, but if the
+  // component unmounts mid-run (tab switch won't, but a parent remount
+  // can) the interval would keep firing into detached state. Mount-wide
+  // cleanup below kills it unconditionally on unmount.
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, []);
 
   const handleAnalyze = useCallback(async () => {
     setAnalyzing(true);
@@ -279,8 +308,8 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
             {analyzing && analyzeProgress && (
               <div className="mt-2 space-y-1">
                 <div className="flex items-center gap-2 text-xs">
-                  <span className="uppercase tracking-wider text-orange-400 font-semibold w-16 shrink-0">
-                    {analyzeProgress.phase}
+                  <span className="text-orange-400 font-semibold shrink-0">
+                    {PHASE_LABELS[analyzeProgress.phase] ?? analyzeProgress.phase}
                   </span>
                   <span className="text-gray-400 flex-1 truncate">
                     {analyzeProgress.message}

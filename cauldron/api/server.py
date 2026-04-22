@@ -201,6 +201,11 @@ class GraphEdge(BaseModel):
 class GraphResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+    # Total number of hosts in the database. When total_hosts > host count in
+    # `nodes`, the response was truncated by the `limit` query parameter and
+    # the frontend should surface a "showing N of M" banner so the operator
+    # knows they are not seeing everything.
+    total_hosts: int = 0
 
 
 class TopologySegment(BaseModel):
@@ -670,11 +675,25 @@ def get_graph(
     seen_nodes: set[str] = set()
 
     with get_session() as session:
-        # Hosts (limited)
+        # Total host count — the frontend uses it to detect truncation and
+        # show a "showing N of M" banner when the result was capped by limit.
+        total_hosts = session.run("MATCH (h:Host) RETURN count(h) AS n").single()["n"]
+
+        # Hosts (limited) — ordered so the "most interesting" rows come first
+        # on truncation: anything with a CVE, then anything with an identified
+        # role, then alphabetically. On a dataset bigger than ``limit``, the
+        # operator sees every actionable host; the ``unknown`` + no-CVE
+        # background hosts are what falls off the tail.
         result = session.run(
             """
             MATCH (h:Host)
-            WITH h ORDER BY h.ip LIMIT $limit
+            OPTIONAL MATCH (h)-[:HAS_SERVICE]->(:Service)-[:HAS_VULN]->(v:Vulnerability)
+            WITH h, count(DISTINCT v) AS vuln_count
+            WITH h, vuln_count,
+                 CASE WHEN vuln_count > 0 THEN 0 ELSE 1 END AS vuln_tier,
+                 CASE WHEN h.role IS NULL OR h.role = 'unknown' THEN 1 ELSE 0 END AS role_tier
+            ORDER BY vuln_tier, role_tier, h.ip
+            LIMIT $limit
             OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.os_name AS os_name, h.owned AS owned, h.target AS target,
@@ -772,7 +791,7 @@ def get_graph(
             if src_id in seen_nodes and dst_id in seen_nodes:
                 edges.append(GraphEdge(source=src_id, target=dst_id, type="CAN_REACH"))
 
-    return GraphResponse(nodes=nodes, edges=edges)
+    return GraphResponse(nodes=nodes, edges=edges, total_hosts=total_hosts)
 
 
 @app.get("/api/v1/topology", response_model=TopologyResponse)

@@ -43,13 +43,23 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; ip: string; owned: boolean; target: boolean;
   } | null>(null);
-  const { data, loading, error, refetch } = useApi<GraphResponse>(() => api.getGraph(1000), []);
+  // Hard cap on host nodes we render at once. 1500 covers our realistic demo
+  // scans (largest ~1500 hosts) while staying inside Sigma's comfortable zone
+  // on mid-range laptops. Beyond the cap the backend returns the most
+  // interesting rows first (hosts with CVEs, then hosts with identified
+  // roles), so the tail that falls off is background `unknown`-role noise.
+  // When truncation happens we surface a banner so the operator knows the
+  // canvas is not the full picture.
+  const GRAPH_HOST_CAP = 1500;
+  const { data, loading, error, refetch } = useApi<GraphResponse>(
+    () => api.getGraph(GRAPH_HOST_CAP), [],
+  );
   const { data: pathsData } = useApi<PathsResponse>(
     () => api.getAttackPaths({ top: 50, include_check: true }),
     [refreshKey],
   );
   const { data: hostsData, refetch: refetchHosts } = useApi<HostListResponse>(
-    () => api.getHosts({ limit: 1000 }),
+    () => api.getHosts({ limit: GRAPH_HOST_CAP }),
     [refreshKey],
   );
 
@@ -676,9 +686,27 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     );
   }
 
+  // Rendered host count (data.nodes includes segments + scan-sources, strip
+  // to just the host type to compare against total_hosts).
+  const renderedHostCount = data.nodes.filter((n) => n.type === 'host').length;
+  const truncated = data.total_hosts > 0 && renderedHostCount < data.total_hosts;
+
   return (
     <div className="relative w-full h-full">
       <div ref={containerRef} className="sigma-container" />
+      {/* Truncation banner — only visible when graph was capped. Uses amber
+          accent (matches the DB/brute-vuln family) so it reads as a warning
+          without screaming red. */}
+      {truncated && (
+        <div
+          className="absolute top-3 left-3 max-w-sm rounded-lg border border-amber-700/50 bg-amber-950/70 px-3 py-1.5 text-xs text-amber-200 backdrop-blur"
+          title={`Showing the top ${renderedHostCount} hosts (by vuln count, then role). ${data.total_hosts - renderedHostCount} hosts hidden — the tail is typically 'unknown' role with no CVEs.`}
+        >
+          Showing <span className="font-semibold">{renderedHostCount}</span> of{' '}
+          <span className="font-semibold">{data.total_hosts}</span> hosts
+          <span className="ml-1 text-amber-400/70">(untriaged tail hidden)</span>
+        </div>
+      )}
       {/* Controls bar */}
       <div className="absolute top-3 right-3 flex items-center gap-2">
 

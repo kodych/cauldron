@@ -126,6 +126,10 @@ export interface GraphEdge {
 export interface GraphResponse {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  // Total hosts in the database. When larger than the host-nodes count in
+  // `nodes`, the server truncated the response to fit the `limit` query
+  // parameter and the canvas should surface a "showing N of M" banner.
+  total_hosts: number;
 }
 
 export interface TopologySegment {
