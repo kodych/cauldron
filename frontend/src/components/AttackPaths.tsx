@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { Crosshair, ChevronDown, ChevronUp, AlertTriangle, Target, Unlock } from 'lucide-react';
+import { Crosshair, ChevronDown, ChevronUp, AlertTriangle, Target, Unlock, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors';
@@ -19,7 +19,7 @@ type PathFilter =
 
 const PATH_FILTERS: { value: PathFilter; label: string; tooltip: string }[] = [
   { value: 'all', label: 'All', tooltip: 'Every discovered attack path' },
-  { value: 'kev', label: '🔥 KEV', tooltip: 'Paths to a host with a CISA-listed actively-exploited CVE' },
+  { value: 'kev', label: 'KEV', tooltip: 'Paths to a host with a CISA-listed actively-exploited CVE' },
   { value: 'exploit', label: 'Exploit', tooltip: 'Paths whose target carries a CVE with a public PoC' },
   { value: 'confirmed_likely', label: 'Confirmed+Likely', tooltip: 'Confidence ≥ likely on at least one vuln' },
   { value: 'confirmed', label: 'Confirmed', tooltip: 'Confidence = confirmed on at least one vuln' },
@@ -123,6 +123,7 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
               }`}
               title={`${f.tooltip} — ${count} paths`}
             >
+              {f.value === 'kev' && <Flame size={10} className="inline -mt-px mr-0.5 text-orange-400" />}
               {f.label} <span className="opacity-70">{count}</span>
             </button>
           );
@@ -300,7 +301,7 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
                               strong
                               title="CISA Known Exploited Vulnerability — actively exploited in the wild"
                             >
-                              🔥 KEV
+                              <Flame size={10} /> KEV
                             </Badge>
                           </span>
                         )}

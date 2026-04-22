@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Clipboard, Check, Terminal, Filter, Hash, Bug, ChevronDown, ChevronUp } from 'lucide-react';
+import { Clipboard, Check, Terminal, Filter, Hash, Bug, ChevronDown, ChevronUp, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getCvssColor } from '../utils/colors';
@@ -311,7 +311,9 @@ function VulnCollectRow({ vuln }: { vuln: VulnListItem }) {
         <span className="text-xs text-gray-300 flex-1 truncate">{vuln.cve_id}</span>
         {vuln.in_cisa_kev && (
           <span className="shrink-0">
-            <Badge tone="orange" strong title="CISA Known Exploited Vulnerability">🔥</Badge>
+            <Badge tone="orange" strong title="CISA Known Exploited Vulnerability">
+              <Flame size={10} />
+            </Badge>
           </span>
         )}
         {vuln.has_exploit && !vuln.in_cisa_kev && (

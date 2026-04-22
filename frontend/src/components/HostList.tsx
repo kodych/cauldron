@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { Search, ChevronDown, ChevronUp, X } from 'lucide-react';
+import { Search, ChevronDown, ChevronUp, X, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor, getConfidenceColor } from '../utils/colors';
@@ -150,7 +150,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               strong
               title="At least one CISA Known Exploited Vulnerability on this host"
             >
-              🔥 KEV
+              <Flame size={10} /> KEV
             </Badge>
           ) : vulnCount > 0 && activeVulns.some((v) => v.has_exploit) ? (
             <Badge tone="red">EXPLOIT</Badge>
@@ -212,7 +212,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                     {v.in_cisa_kev && (
                       <span className="shrink-0">
                         <Badge tone="orange" strong title="CISA Known Exploited Vulnerability">
-                          🔥 KEV
+                          <Flame size={10} /> KEV
                         </Badge>
                       </span>
                     )}

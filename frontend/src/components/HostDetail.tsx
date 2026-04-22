@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -376,7 +376,7 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
               strong
               title={vuln.cisa_kev_added ? `In CISA KEV since ${vuln.cisa_kev_added.slice(0, 10)} — actively exploited in the wild` : 'CISA Known Exploited Vulnerability — actively exploited in the wild'}
             >
-              🔥 KEV
+              <Flame size={10} /> KEV
             </Badge>
           </span>
         )}
