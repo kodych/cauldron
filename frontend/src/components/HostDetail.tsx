@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
@@ -22,35 +22,45 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
   const { data, loading, error, refetch } = useApi<HostOut>(() => api.getHost(ip), [ip]);
   const [hostNotesOpen, setHostNotesOpen] = useState(false);
   const [hostNotesText, setHostNotesText] = useState('');
-  const [hostNotesDirty, setHostNotesDirty] = useState(false);
+  // Auto-save state machine: 'saving' while debounce/request pending,
+  // 'saved' for ~1.5s after success (so the operator sees a confirmation
+  // and doesn't wonder whether their note landed), 'error' on API failure
+  // so silent network glitches stop eating notes. 'idle' hides the hint.
+  const [hostNotesStatus, setHostNotesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [ipCopied, setIpCopied] = useState(false);
   const [toggleBusy, setToggleBusy] = useState(false);
   const hostNotesSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hostNotesClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Reset notes panel state when switching to a different host
   useEffect(() => {
     setHostNotesOpen(false);
     setHostNotesText('');
-    setHostNotesDirty(false);
+    setHostNotesStatus('idle');
   }, [ip]);
 
   const handleToggleHostNotes = useCallback(() => {
     if (!hostNotesOpen && data) {
       setHostNotesText(data.notes || '');
-      setHostNotesDirty(false);
+      setHostNotesStatus('idle');
     }
     setHostNotesOpen((v) => !v);
   }, [hostNotesOpen, data]);
 
   const handleHostNotesChange = useCallback((value: string) => {
     setHostNotesText(value);
-    setHostNotesDirty(true);
+    setHostNotesStatus('saving');
     if (hostNotesSaveRef.current) clearTimeout(hostNotesSaveRef.current);
+    if (hostNotesClearRef.current) clearTimeout(hostNotesClearRef.current);
     hostNotesSaveRef.current = setTimeout(async () => {
       try {
         await api.updateHostNotes(ip, value || null);
-        setHostNotesDirty(false);
-      } catch (e) { console.error('Failed to save host notes:', e); }
+        setHostNotesStatus('saved');
+        hostNotesClearRef.current = setTimeout(() => setHostNotesStatus('idle'), 1500);
+      } catch (e) {
+        console.error('Failed to save host notes:', e);
+        setHostNotesStatus('error');
+      }
     }, 500);
   }, [ip]);
 
@@ -201,8 +211,18 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
                 className="mt-1 w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
                 rows={3}
               />
-              {hostNotesDirty && (
+              {hostNotesStatus === 'saving' && (
                 <p className="text-xs text-gray-500 mt-0.5 italic">Saving…</p>
+              )}
+              {hostNotesStatus === 'saved' && (
+                <p className="text-xs text-green-500 mt-0.5 flex items-center gap-1">
+                  <Check size={11} /> Saved
+                </p>
+              )}
+              {hostNotesStatus === 'error' && (
+                <p className="text-xs text-red-400 mt-0.5 flex items-center gap-1">
+                  <AlertCircle size={11} /> Not saved — edit to retry
+                </p>
               )}
             </>
           )}
@@ -498,22 +518,32 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
 
   const [notesPort, setNotesPort] = useState<number | null>(null);
   const [notesText, setNotesText] = useState('');
+  const [notesStatus, setNotesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const savedClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleToggleNotes = useCallback((port: number, currentNotes: string | null) => {
     if (notesPort === port) { setNotesPort(null); return; }
     setNotesPort(port);
     setNotesText(currentNotes || '');
+    setNotesStatus('idle');
   }, [notesPort]);
 
   const handleNotesChange = useCallback((value: string) => {
     setNotesText(value);
+    setNotesStatus('saving');
     // Auto-save after 500ms of inactivity
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    if (savedClearRef.current) clearTimeout(savedClearRef.current);
     saveTimerRef.current = setTimeout(async () => {
       try {
         await api.updateServiceNotes(hostIp, notesPort!, value || null);
-      } catch (e) { console.error('Failed to save notes:', e); }
+        setNotesStatus('saved');
+        savedClearRef.current = setTimeout(() => setNotesStatus('idle'), 1500);
+      } catch (e) {
+        console.error('Failed to save notes:', e);
+        setNotesStatus('error');
+      }
     }, 500);
   }, [hostIp, notesPort]);
 
@@ -631,6 +661,19 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                     className="w-full rounded bg-gray-800 border border-blue-900/30 px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-blue-500 resize-y min-h-[60px]"
                     rows={3}
                   />
+                  {notesStatus === 'saving' && (
+                    <p className="text-xs text-gray-500 mt-0.5 italic">Saving…</p>
+                  )}
+                  {notesStatus === 'saved' && (
+                    <p className="text-xs text-green-500 mt-0.5 flex items-center gap-1">
+                      <Check size={11} /> Saved
+                    </p>
+                  )}
+                  {notesStatus === 'error' && (
+                    <p className="text-xs text-red-400 mt-0.5 flex items-center gap-1">
+                      <AlertCircle size={11} /> Not saved — edit to retry
+                    </p>
+                  )}
                 </div>
               )}
             </div>
