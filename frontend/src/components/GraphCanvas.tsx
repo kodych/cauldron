@@ -1,7 +1,7 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MultiGraph } from 'graphology';
 import Sigma from 'sigma';
-import { Crosshair, Network, SlidersHorizontal } from 'lucide-react';
+import { Crosshair, Network, SlidersHorizontal, Lock, Unlock, Target } from 'lucide-react';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
@@ -832,7 +832,11 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               onDataChanged?.();
             }}
           >
-            <span>{contextMenu.owned ? '🔓' : '🔒'}</span>
+            {contextMenu.owned ? (
+              <Unlock size={13} className="text-green-400 shrink-0" />
+            ) : (
+              <Lock size={13} className="text-gray-500 shrink-0" />
+            )}
             <span className={contextMenu.owned ? 'text-green-400' : 'text-gray-400'}>
               {contextMenu.owned ? 'Unmark Owned' : 'Mark as Owned'}
             </span>
@@ -846,7 +850,10 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               onDataChanged?.();
             }}
           >
-            <span>🎯</span>
+            <Target
+              size={13}
+              className={`${contextMenu.target ? 'text-red-400' : 'text-gray-500'} shrink-0`}
+            />
             <span className={contextMenu.target ? 'text-red-400' : 'text-gray-400'}>
               {contextMenu.target ? 'Remove Target' : 'Set as Target'}
             </span>
