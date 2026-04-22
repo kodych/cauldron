@@ -7,14 +7,23 @@ import { formatCvss } from '../utils/format';
 import type { PathsResponse, AttackPathOut } from '../types';
 import { ExploitCommands } from './ExploitCommands';
 
-type PathFilter = 'all' | 'confirmed' | 'confirmed_likely' | 'exploit' | 'target';
+type PathFilter =
+  | 'all'
+  | 'kev'
+  | 'exploit'
+  | 'confirmed_likely'
+  | 'confirmed'
+  | 'high_value'
+  | 'flagged';
 
-const PATH_FILTERS: { value: PathFilter; label: string }[] = [
-  { value: 'all', label: 'All' },
-  { value: 'exploit', label: 'Exploit' },
-  { value: 'confirmed_likely', label: 'Confirmed+Likely' },
-  { value: 'confirmed', label: 'Confirmed' },
-  { value: 'target', label: 'Targets' },
+const PATH_FILTERS: { value: PathFilter; label: string; tooltip: string }[] = [
+  { value: 'all', label: 'All', tooltip: 'Every discovered attack path' },
+  { value: 'kev', label: '🔥 KEV', tooltip: 'Paths to a host with a CISA-listed actively-exploited CVE' },
+  { value: 'exploit', label: 'Exploit', tooltip: 'Paths whose target carries a CVE with a public PoC' },
+  { value: 'confirmed_likely', label: 'Confirmed+Likely', tooltip: 'Confidence ≥ likely on at least one vuln' },
+  { value: 'confirmed', label: 'Confirmed', tooltip: 'Confidence = confirmed on at least one vuln' },
+  { value: 'high_value', label: 'High-Value', tooltip: 'Target role is domain controller, database, or mail server' },
+  { value: 'flagged', label: 'Flagged', tooltip: 'Hosts you marked as Target via right-click or HostDetail' },
 ];
 
 interface AttackPathsProps {
@@ -34,6 +43,8 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
 
   const matchesFilter = useCallback((p: AttackPathOut, f: PathFilter) => {
     switch (f) {
+      case 'kev':
+        return p.nodes.some((n) => n.vulns?.some((v) => v.in_cisa_kev));
       case 'confirmed':
         return p.nodes.some((n) => n.vulns?.some((v) => v.confidence === 'confirmed'));
       case 'confirmed_likely':
@@ -41,12 +52,12 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
           v.confidence === 'confirmed' || v.confidence === 'likely'));
       case 'exploit':
         return p.has_exploits;
-      case 'target':
-        // User-flagged targets + high-value roles
+      case 'high_value':
         return p.nodes.some((n) =>
-          n.target === true ||
-          (n.role && ['domain_controller', 'database', 'mail_server'].includes(n.role))
+          n.role && ['domain_controller', 'database', 'mail_server'].includes(n.role)
         );
+      case 'flagged':
+        return p.nodes.some((n) => n.target === true);
       default:
         return true;
     }
@@ -58,13 +69,19 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
   );
 
   const filterCounts = useMemo(() => {
-    if (!data) return { all: 0, confirmed: 0, confirmed_likely: 0, exploit: 0, target: 0 } as Record<PathFilter, number>;
+    const empty: Record<PathFilter, number> = {
+      all: 0, kev: 0, exploit: 0, confirmed_likely: 0,
+      confirmed: 0, high_value: 0, flagged: 0,
+    };
+    if (!data) return empty;
     return {
       all: data.paths.length,
-      confirmed: data.paths.filter((p) => matchesFilter(p, 'confirmed')).length,
-      confirmed_likely: data.paths.filter((p) => matchesFilter(p, 'confirmed_likely')).length,
+      kev: data.paths.filter((p) => matchesFilter(p, 'kev')).length,
       exploit: data.paths.filter((p) => matchesFilter(p, 'exploit')).length,
-      target: data.paths.filter((p) => matchesFilter(p, 'target')).length,
+      confirmed_likely: data.paths.filter((p) => matchesFilter(p, 'confirmed_likely')).length,
+      confirmed: data.paths.filter((p) => matchesFilter(p, 'confirmed')).length,
+      high_value: data.paths.filter((p) => matchesFilter(p, 'high_value')).length,
+      flagged: data.paths.filter((p) => matchesFilter(p, 'flagged')).length,
     };
   }, [data, matchesFilter]);
 
@@ -103,7 +120,7 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
                   ? 'bg-indigo-600 text-white'
                   : 'bg-gray-800 text-gray-500 hover:text-gray-300'
               }`}
-              title={`${count} paths`}
+              title={`${f.tooltip} — ${count} paths`}
             >
               {f.label} <span className="opacity-70">{count}</span>
             </button>
