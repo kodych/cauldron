@@ -518,17 +518,32 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
   const [credsPort, setCredsPort] = useState<number | null>(null);
   const [creds, setCreds] = useState<Array<{ username: string; password: string }>>([]);
   const [credsLoading, setCredsLoading] = useState(false);
+  // Track fetch failure separately from empty-creds so a backend hiccup
+  // looks different from a service that genuinely has no default-creds
+  // entries in the DB (most services with no well-known defaults).
+  const [credsError, setCredsError] = useState(false);
 
-  const handleShowCreds = useCallback(async (port: number) => {
-    if (credsPort === port) { setCredsPort(null); return; }
-    setCredsPort(port);
+  const loadCreds = useCallback(async (port: number) => {
     setCredsLoading(true);
+    setCredsError(false);
     try {
       const res = await api.getDefaultCreds(hostIp, port);
       setCreds(res.creds);
-    } catch { setCreds([]); }
-    finally { setCredsLoading(false); }
-  }, [hostIp, credsPort]);
+    } catch (e) {
+      console.error('Failed to load default creds:', e);
+      setCreds([]);
+      setCredsError(true);
+    } finally {
+      setCredsLoading(false);
+    }
+  }, [hostIp]);
+
+  const handleShowCreds = useCallback(async (port: number) => {
+    // Toggle: clicking the same port again closes the panel.
+    if (credsPort === port) { setCredsPort(null); return; }
+    setCredsPort(port);
+    await loadCreds(port);
+  }, [credsPort, loadCreds]);
 
   const [notesPort, setNotesPort] = useState<number | null>(null);
   const [notesText, setNotesText] = useState('');
@@ -642,6 +657,17 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                 <div className="ml-16 mb-1 rounded bg-yellow-950/20 border border-yellow-800/30 px-2 py-1">
                   {credsLoading ? (
                     <span className="text-xs text-gray-500">Loading...</span>
+                  ) : credsError ? (
+                    <div className="flex items-center gap-2 text-xs text-red-400">
+                      <AlertCircle size={11} />
+                      <span>Failed to load credentials.</span>
+                      <button
+                        onClick={() => loadCreds(s.port)}
+                        className="rounded bg-red-900/30 px-1.5 py-0.5 text-red-300 hover:bg-red-900/50"
+                      >
+                        Retry
+                      </button>
+                    </div>
                   ) : creds.length > 0 ? (
                     <div className="space-y-0.5">
                       <span className="text-xs text-yellow-400/70 font-medium">Default credentials:</span>
