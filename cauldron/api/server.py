@@ -1310,7 +1310,7 @@ def list_vulns():
 @app.get("/api/v1/report")
 def get_report(
     fmt: str = Query("md", description="Format: md, json, html"),
-    top: int = Query(20, description="Number of top findings"),
+    top: int = Query(0, ge=0, description="Cap top findings/paths (0 = unlimited)"),
     notes: bool = Query(False, description="Include pentester notes in report"),
 ):
     """Generate and download scan report."""

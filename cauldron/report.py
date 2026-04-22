@@ -7,11 +7,81 @@ Designed for AI-compatible format — pentester adds notes and feeds to LLM for 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
 from cauldron.graph.connection import get_session
 from cauldron.graph.ingestion import get_graph_stats, get_host_role_distribution
 from cauldron.ai.attack_paths import discover_attack_paths, get_path_summary
+
+
+# ---------------------------------------------------------------------------
+# Compact helpers
+# ---------------------------------------------------------------------------
+
+def _compress_ip_list(ips: list[str]) -> str:
+    """Compact IP list into readable ranges, keeping every address.
+
+    Example:
+        ["172.31.161.1", "172.31.161.2", "172.31.161.3", "172.31.162.4"]
+        → "172.31.161.1-3, 172.31.162.4"
+
+    This lets a report show 42 affected hosts in one line when they sit in
+    dense subnets without dropping any IP. Non-IPv4 strings are passed
+    through unchanged (sorted at the end).
+    """
+    if not ips:
+        return ""
+    groups: dict[str, list[int]] = {}
+    extras: list[str] = []
+    for ip in ips:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            extras.append(ip)
+            continue
+        try:
+            last = int(parts[3])
+        except ValueError:
+            extras.append(ip)
+            continue
+        prefix = ".".join(parts[:3])
+        groups.setdefault(prefix, []).append(last)
+
+    def _prefix_key(p: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(x) for x in p.split("."))
+        except ValueError:
+            return (0,)
+
+    tokens: list[str] = []
+    for prefix in sorted(groups.keys(), key=_prefix_key):
+        octets = sorted(set(groups[prefix]))
+        i = 0
+        while i < len(octets):
+            j = i
+            while j + 1 < len(octets) and octets[j + 1] == octets[j] + 1:
+                j += 1
+            if j > i:
+                tokens.append(f"{prefix}.{octets[i]}-{octets[j]}")
+            else:
+                tokens.append(f"{prefix}.{octets[i]}")
+            i = j + 1
+    tokens.extend(sorted(extras))
+    return ", ".join(tokens)
+
+
+def _cve_priority_tuple(cve_dict: dict) -> tuple:
+    """Sort key mirroring enricher's priority: KEV → has_exploit → CVSS desc.
+
+    Works on both Cypher-row dicts and parsed finding dicts — reads keys
+    defensively so the same helper serves findings, path vulns, and any
+    other CVE-shaped dict the report touches.
+    """
+    return (
+        0 if cve_dict.get("in_cisa_kev") else 1,
+        0 if cve_dict.get("has_exploit") else 1,
+        -(cve_dict.get("cvss") or 0.0),
+    )
 
 
 def _query_scan_sources() -> list[dict]:
@@ -45,7 +115,11 @@ def _query_hosts_with_vulns() -> list[dict]:
 
 
 def _query_findings_grouped() -> list[dict]:
-    """Get findings grouped by CVE — one CVE with list of affected hosts."""
+    """Get findings grouped by CVE — one CVE with list of affected hosts.
+
+    Sort mirrors the enricher priority: CISA KEV first (actively exploited
+    in the wild), then CVEs with a public exploit, then CVSS descending.
+    """
     with get_session() as s:
         rows = list(s.run("""
             MATCH (h:Host)-[:HAS_SERVICE]->(svc:Service)-[r:HAS_VULN]->(v:Vulnerability)
@@ -55,8 +129,10 @@ def _query_findings_grouped() -> list[dict]:
                    v.confidence AS confidence, v.source AS source,
                    v.description AS description, v.exploit_url AS exploit_url,
                    v.exploit_module AS exploit_module,
+                   v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
                    size(hosts) AS host_count, hosts
             ORDER BY
+                CASE WHEN coalesce(v.in_cisa_kev, false) THEN 0 ELSE 1 END,
                 CASE WHEN v.has_exploit = true THEN 0 ELSE 1 END,
                 COALESCE(v.cvss, 0) DESC
         """))
@@ -148,8 +224,13 @@ def _query_notes() -> dict:
 # Collect all data
 # ---------------------------------------------------------------------------
 
-def _collect_report_data(top: int = 20, include_notes: bool = False) -> dict:
-    """Collect all data needed for report generation."""
+def _collect_report_data(top: int = 0, include_notes: bool = False) -> dict:
+    """Collect all data needed for report generation.
+
+    ``top`` caps the number of findings and attack paths included. 0 (or any
+    non-positive value) means no cap — reports to clients / team must carry
+    the complete picture, including every affected host.
+    """
     stats = get_graph_stats()
     roles = get_host_role_distribution()
     sources = _query_scan_sources()
@@ -163,13 +244,16 @@ def _collect_report_data(top: int = 20, include_notes: bool = False) -> dict:
     paths = discover_attack_paths()
     notes = _query_notes() if include_notes else {"host_notes": [], "service_notes": []}
 
+    findings_out = findings if top <= 0 else findings[:top]
+    paths_out = paths if top <= 0 else paths[:top]
+
     return {
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
         "stats": stats,
         "roles": roles,
         "scan_sources": sources,
         "hosts": hosts,
-        "findings": findings[:top],
+        "findings": findings_out,
         "vuln_stats": vuln_stats,
         "checked_vulns": checked,
         "bruteforceable": brute,
@@ -186,20 +270,33 @@ def _collect_report_data(top: int = 20, include_notes: bool = False) -> dict:
                 "has_exploits": p.has_exploits,
                 "score": round(p.score, 1),
                 "methods": p.attack_methods,
+                # in_cisa_kev aggregate for the whole path (any node carries
+                # a KEV-listed CVE) — lets the report surface a quick 🔥
+                # column without re-iterating path nodes.
+                "in_cisa_kev": any(
+                    getattr(v, "in_cisa_kev", False)
+                    for n in p.nodes for v in n.vulns
+                ),
                 "nodes": [
                     {
                         "ip": n.ip,
                         "role": n.role,
                         "vulns": [
-                            {"cve_id": v.cve_id, "cvss": v.cvss, "has_exploit": v.has_exploit,
-                             "confidence": v.confidence, "title": v.title}
+                            {
+                                "cve_id": v.cve_id,
+                                "cvss": v.cvss,
+                                "has_exploit": v.has_exploit,
+                                "confidence": v.confidence,
+                                "title": v.title,
+                                "in_cisa_kev": getattr(v, "in_cisa_kev", False),
+                            }
                             for v in n.vulns
                         ],
                     }
                     for n in p.nodes
                 ],
             }
-            for p in paths[:top]
+            for p in paths_out
         ],
     }
 
@@ -208,8 +305,8 @@ def _collect_report_data(top: int = 20, include_notes: bool = False) -> dict:
 # JSON format
 # ---------------------------------------------------------------------------
 
-def generate_json(top: int = 20, include_notes: bool = False) -> str:
-    """Generate JSON report."""
+def generate_json(top: int = 0, include_notes: bool = False) -> str:
+    """Generate JSON report. ``top=0`` (default) means no truncation."""
     data = _collect_report_data(top=top, include_notes=include_notes)
     return json.dumps(data, indent=2, default=str, ensure_ascii=False)
 
@@ -225,8 +322,14 @@ def _fmt_cvss(cvss) -> str:
     return "-"
 
 
-def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
-    """Generate Markdown report — AI-compatible, structured, no recommendations."""
+def generate_markdown(top: int = 0, include_notes: bool = False) -> str:
+    """Generate Markdown report — AI-compatible, structured, no recommendations.
+
+    ``top=0`` (default) means no truncation: every CVE, every affected host,
+    every attack path is included. Compactness comes from formatting (CIDR
+    compression of IP lists, removal of uninformative metadata, port-tuple
+    collapsing) rather than from dropping data.
+    """
     data = _collect_report_data(top=top, include_notes=include_notes)
     lines: list[str] = []
 
@@ -237,7 +340,7 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
     w("# Cauldron Scan Report")
     w()
     w(f"**Generated:** {data['generated_at']}")
-    w(f"**Tool:** Cauldron v0.1.0 — Network Attack Path Discovery")
+    w("**Tool:** Cauldron v0.1.0 — Network Attack Path Discovery")
     w()
 
     # --- 1. Executive Summary ---
@@ -261,11 +364,11 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
 
     if ot["owned"]:
         owned_str = ", ".join("`{ip}` [{role}]".format(**h) for h in ot["owned"])
-        w(f"**Owned hosts:** {owned_str}")
+        w(f"**Owned hosts ({len(ot['owned'])}):** {owned_str}")
         w()
     if ot["targets"]:
         target_str = ", ".join("`{ip}` [{role}]".format(**h) for h in ot["targets"])
-        w(f"**Targets:** {target_str}")
+        w(f"**Targets ({len(ot['targets'])}):** {target_str}")
         w()
 
     if data["scan_sources"]:
@@ -289,55 +392,86 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
         w("No vulnerabilities found.")
         w()
     else:
-        w(f"{len(findings)} unique vulnerabilities, sorted by exploitability:")
+        w(f"{len(findings)} unique vulnerabilities, sorted by exploitability "
+          "(CISA KEV → public exploit → CVSS):")
         w()
         for i, f_ in enumerate(findings, 1):
             cve = f_["cve_id"]
             cvss = _fmt_cvss(f_["cvss"])
-            exploit_tag = " **EXPLOIT**" if f_["has_exploit"] else ""
-            host_count = f_["host_count"]
-            hosts_list = f_["hosts"]
+            # Badge chain: KEV then EXPLOIT — matches frontend UI so the MD
+            # reads the same way the operator sees it in the sidebar.
+            badges = []
+            if f_.get("in_cisa_kev"):
+                badges.append("**🔥 KEV**")
+            if f_.get("has_exploit"):
+                badges.append("**EXPLOIT**")
+            badge_str = (" · " + " · ".join(badges)) if badges else ""
 
-            w(f"### {i}. {cve} (CVSS: {cvss}){exploit_tag}")
-            if f_["description"]:
-                desc = f_["description"]
-                dot = desc.find(". ")
-                if dot > 0 and dot < 200:
-                    desc = desc[:dot + 1]
+            w(f"### {i}. {cve} — CVSS {cvss}{badge_str}")
+            if f_.get("description"):
+                # Preserve full NVD description — information density matters.
+                # Strip newlines so the blockquote renders on one paragraph.
+                desc = f_["description"].replace("\n", " ").strip()
                 w(f"> {desc}")
             w()
 
-            # Metadata line
-            meta = []
-            if f_["confidence"]:
-                meta.append(f"Confidence: {f_['confidence']}")
-            if f_["source"]:
-                meta.append(f"Source: {f_['source']}")
-            if f_["exploit_module"]:
-                meta.append(f"Module: `{f_['exploit_module']}`")
-            if meta:
-                w(f"_{' | '.join(meta)}_")
+            # Optional one-line metadata: only render non-default values so the
+            # report is not spammed with `Confidence: check | Source: nvd` on
+            # every single CVE. "check + nvd" is the default path; skip.
+            meta_parts: list[str] = []
+            if f_.get("in_cisa_kev") and f_.get("cisa_kev_added"):
+                date = f_["cisa_kev_added"][:10]
+                meta_parts.append(f"CISA KEV since {date}")
+            if f_.get("confidence") and f_["confidence"] != "check":
+                meta_parts.append(f"Confidence: {f_['confidence']}")
+            if f_.get("source") and f_["source"] != "nvd":
+                meta_parts.append(f"Source: {f_['source']}")
+            if f_.get("exploit_module"):
+                meta_parts.append(f"Module: `{f_['exploit_module']}`")
+            if meta_parts:
+                # Plain paragraph — markdown italic (`_..._`) mangles any
+                # metadata containing underscores (exploit_db, cve_2020_1472,
+                # get_user_spns) on renderers that parse italics greedily.
+                w(" · ".join(meta_parts))
 
-            if f_["exploit_url"]:
-                w(f"Exploit: {f_['exploit_url']}")
+            if f_.get("exploit_url"):
+                # Wrap in <> so MD renderers treat it as an autolink and the
+                # italic parser never grabs stray underscores in the URL.
+                w(f"Exploit: <{f_['exploit_url']}>")
             w()
 
-            # Affected hosts
-            w(f"**Affected hosts ({host_count}):**")
-            w()
-            # Group by port
-            port_groups: dict[int, list[str]] = {}
-            for h in hosts_list:
-                port = h.get("port", 0)
-                ip = h.get("ip", "?")
-                if port not in port_groups:
-                    port_groups[port] = []
-                if ip not in port_groups[port]:
-                    port_groups[port].append(ip)
+            # Affected hosts: aggregate ports, CIDR-compress IPs, one line per
+            # distinct port tuple. When the same IP set shows up on multiple
+            # ports (Samba 139+445) we merge the lines into a single entry.
+            port_ip_map: dict[int, list[str]] = {}
+            for h in f_.get("hosts", []):
+                port = h.get("port") or 0
+                ip = h.get("ip")
+                if not ip:
+                    continue
+                lst = port_ip_map.setdefault(port, [])
+                if ip not in lst:
+                    lst.append(ip)
 
-            for port in sorted(port_groups.keys()):
-                ips = port_groups[port]
-                w(f"- Port {port}: {', '.join(f'`{ip}`' for ip in ips)}")
+            # Merge ports that share identical IP sets
+            ip_set_to_ports: dict[str, list[int]] = {}
+            for port, ips in port_ip_map.items():
+                key = ",".join(sorted(ips))
+                ip_set_to_ports.setdefault(key, []).append(port)
+
+            w(f"**Affected hosts ({f_['host_count']}):**")
+            w()
+            # Stable order: tuples with more ports first, then lowest port id.
+            ordered = sorted(
+                ip_set_to_ports.items(),
+                key=lambda kv: (-len(kv[1]), sorted(kv[1])[0] if kv[1] else 0),
+            )
+            for ip_key, ports in ordered:
+                ips = ip_key.split(",") if ip_key else []
+                port_label = ", ".join(str(p) for p in sorted(ports))
+                compressed = _compress_ip_list(ips)
+                count = len(ips)
+                w(f"- **Ports {port_label}** ({count}): `{compressed}`")
             w()
 
     # --- 3. Attack Paths ---
@@ -350,79 +484,100 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
     else:
         w(f"{len(ap)} attack paths, ranked by score:")
         w()
-        w("| # | Source | Target | Role | Score | Methods | Key Vulns |")
-        w("|---|--------|--------|------|-------|---------|-----------|")
+        w("| # | Target | Role | Flags | Score | Methods | Vulns |")
+        w("|---|--------|------|-------|-------|---------|-------|")
         for i, path in enumerate(ap, 1):
-            source = path["nodes"][0]["ip"] if path["nodes"] else "?"
             target = path["target"]
             role = path["target_role"]
             score = path["score"]
             methods = ", ".join(path["methods"])
-            # Top vuln from target node
+            # Dedup CVEs across a target's vuln list — same CVE on port 139
+            # and 445 would otherwise appear twice. Keep first-seen order so
+            # the user still sees the highest-priority CVE first.
             target_vulns = path["nodes"][-1]["vulns"] if path["nodes"] else []
-            key_vulns = ", ".join(v["cve_id"] for v in target_vulns[:2])
-            if len(target_vulns) > 2:
-                key_vulns += f" +{len(target_vulns) - 2}"
-            exp = " 🔥" if path["has_exploits"] else ""
-            w(f"| {i} | `{source}` | `{target}` | {role} | {score}{exp} | {methods} | {key_vulns} |")
+            seen: set[str] = set()
+            unique_cves: list[str] = []
+            for v in target_vulns:
+                cid = v.get("cve_id")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    unique_cves.append(cid)
+            vulns_str = ", ".join(unique_cves) if unique_cves else "-"
+            flags: list[str] = []
+            if path.get("in_cisa_kev"):
+                flags.append("🔥 KEV")
+            if path.get("has_exploits"):
+                flags.append("EXPLOIT")
+            flag_str = " · ".join(flags) if flags else "-"
+            w(f"| {i} | `{target}` | {role} | {flag_str} | {score} | {methods} | {vulns_str} |")
         w()
 
     # --- 4. Host Inventory ---
     w("## 4. Host Inventory")
     w()
 
-    # Split: hosts with findings vs clean hosts
     vuln_hosts = [h for h in data["hosts"] if h["vuln_count"] > 0]
     clean_hosts = [h for h in data["hosts"] if h["vuln_count"] == 0]
 
     if vuln_hosts:
         w(f"### Vulnerable Hosts ({len(vuln_hosts)})")
         w()
-        header = "| IP | Hostname | Role | Services | Vulns | Max CVSS | Exploits |"
-        sep = "|----|----------|------|----------|-------|----------|----------|"
-        if data["include_notes"]:
-            header = "| IP | Hostname | Role | Services | Vulns | Max CVSS | Exploits | Notes |"
-            sep = "|----|----------|------|----------|-------|----------|----------|-------|"
-        w(header)
-        w(sep)
+        # Only include the Hostname column when at least one host actually has
+        # one. On most network scans nmap returns no PTR, so the column is
+        # just 80 rows of `-` taking visual real estate.
+        show_hostname = any(h.get("hostname") for h in vuln_hosts)
+        show_notes = bool(data["include_notes"]) and bool(data["notes"]["host_notes"])
+
+        cols = ["IP", "Flags"]
+        if show_hostname:
+            cols.append("Hostname")
+        cols.extend(["Role", "Services", "Vulns", "Max CVSS", "Exploits"])
+        if show_notes:
+            cols.append("Notes")
+
+        w("| " + " | ".join(cols) + " |")
+        w("|" + "|".join(["---"] * len(cols)) + "|")
+
+        notes_by_ip: dict[str, str] = {}
+        if show_notes:
+            for hn in data["notes"]["host_notes"]:
+                if hn.get("notes"):
+                    notes_by_ip[hn["ip"]] = (
+                        hn["notes"].replace("\n", " ").replace("|", "/")[:80]
+                    )
+
         for h in vuln_hosts:
             ip = h["ip"]
-            hostname = h["hostname"] or "-"
             role = h["role"] or "-"
             cvss = _fmt_cvss(h["max_cvss"])
             exp = str(h["exploit_count"]) if h["exploit_count"] else "-"
-            tags = ""
+            flag_parts: list[str] = []
             if h.get("owned"):
-                tags += " 🔓"
+                flag_parts.append("🔓")
             if h.get("target"):
-                tags += " 🎯"
-            row = f"| {ip}{tags} | {hostname} | {role} | {h['svc_count']} | {h['vuln_count']} | {cvss} | {exp} |"
-            if data["include_notes"]:
-                # Find notes inline
-                note = "-"
-                for hn in data["notes"]["host_notes"]:
-                    if hn["ip"] == ip:
-                        note = hn["notes"].replace("\n", " ").replace("|", "/")[:60]
-                        break
-                row += f" {note} |"
-            w(row)
+                flag_parts.append("🎯")
+            flag_cell = " ".join(flag_parts) if flag_parts else "-"
+            row_cells = [ip, flag_cell]
+            if show_hostname:
+                row_cells.append(h.get("hostname") or "-")
+            row_cells.extend([role, str(h["svc_count"]), str(h["vuln_count"]), cvss, exp])
+            if show_notes:
+                row_cells.append(notes_by_ip.get(ip, "-"))
+            w("| " + " | ".join(row_cells) + " |")
         w()
 
     if clean_hosts:
         w(f"### Clean Hosts ({len(clean_hosts)})")
         w()
-        # Compact: just role groups with IP lists
         role_groups: dict[str, list[str]] = {}
         for h in clean_hosts:
             role = h["role"] or "unknown"
-            if role not in role_groups:
-                role_groups[role] = []
-            role_groups[role].append(h["ip"])
+            role_groups.setdefault(role, []).append(h["ip"])
 
-        for role in sorted(role_groups.keys()):
+        # Full IP list per role, CIDR-compressed for density.
+        for role in sorted(role_groups.keys(), key=lambda r: -len(role_groups[r])):
             ips = role_groups[role]
-            w(f"- **{role}** ({len(ips)}): {', '.join(f'`{ip}`' for ip in ips[:10])}"
-              + (f" +{len(ips) - 10} more" if len(ips) > 10 else ""))
+            w(f"- **{role}** ({len(ips)}): `{_compress_ip_list(ips)}`")
         w()
 
     # Role distribution
@@ -440,19 +595,41 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
         w("## 5. Bruteforceable Services")
         w()
         total_brute = sum(b["host_count"] for b in brute)
-        w(f"{total_brute} services across {len(brute)} port types:")
+        w(f"{total_brute} services across {len(brute)} port types. Full IP "
+          "lists ready to pipe into crackmapexec / hydra / netexec.")
+        w()
+        # Summary line per port with CIDR-compressed inline preview.
+        for b in brute:
+            port = b["port"]
+            name = b["name"] or f"port {port}"
+            count = b["host_count"]
+            ips = list(b["hosts"])
+            compressed = _compress_ip_list(ips)
+            w(f"- **:{port} {name}** ({count} hosts): `{compressed}`")
+        w()
+        # Copy-ready raw blocks: plain IP[:port] newline per line so the
+        # operator can select the block and pipe to anything.
+        w("#### Copy-ready target lists")
         w()
         for b in brute:
             port = b["port"]
             name = b["name"] or f"port {port}"
-            hosts = b["hosts"]
             count = b["host_count"]
-            # Show max 10 IPs, then +N more
-            ips_display = ", ".join(f"`{ip}`" for ip in hosts[:10])
-            if count > 10:
-                ips_display += f" +{count - 10} more"
-            w(f"- **:{port} {name}** ({count} hosts): {ips_display}")
-        w()
+            sorted_ips = sorted(
+                b["hosts"],
+                key=lambda ip: (
+                    tuple(int(x) if x.isdigit() else 0 for x in ip.split("."))
+                ),
+            )
+            w(f"<details><summary>{name} :{port} ({count})</summary>")
+            w()
+            w("```")
+            for ip in sorted_ips:
+                w(f"{ip}:{port}")
+            w("```")
+            w()
+            w("</details>")
+            w()
 
     # --- 6. Verification Status ---
     checked = data["checked_vulns"]
@@ -531,7 +708,7 @@ def generate_markdown(top: int = 20, include_notes: bool = False) -> str:
 # HTML format
 # ---------------------------------------------------------------------------
 
-def generate_html(top: int = 20, include_notes: bool = False) -> str:
+def generate_html(top: int = 0, include_notes: bool = False) -> str:
     """Generate self-contained interactive HTML report.
 
     Features: sortable tables, keyword search/highlight, collapsible sections,
@@ -540,7 +717,12 @@ def generate_html(top: int = 20, include_notes: bool = False) -> str:
     md_content = generate_markdown(top=top, include_notes=include_notes)
 
     css = """
-body { font-family: -apple-system, 'Segoe UI', sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px; background: #0f1117; color: #e2e8f0; line-height: 1.6; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; max-width: min(1400px, 95%); margin: 0 auto; padding: 20px; background: #0f1117; color: #e2e8f0; line-height: 1.6; }
+a { color: #60a5fa; text-decoration: none; } a:hover { text-decoration: underline; }
+details { margin: 8px 0; background: #151822; border: 1px solid #1e1b4b; border-radius: 4px; padding: 6px 10px; }
+details summary { cursor: pointer; color: #a5b4fc; font-weight: 500; user-select: none; }
+details pre { background: #0a0c13; padding: 10px; border-radius: 3px; overflow-x: auto; font-size: 12px; margin: 8px 0; color: #86efac; }
+pre { background: #0a0c13; padding: 10px; border-radius: 3px; overflow-x: auto; font-size: 12px; color: #86efac; }
 h1 { color: #818cf8; border-bottom: 2px solid #3730a3; padding-bottom: 8px; }
 h2 { color: #a5b4fc; margin-top: 40px; border-bottom: 1px solid #1e1b4b; padding-bottom: 4px; cursor: pointer; }
 h2:hover { color: #c7d2fe; }
@@ -673,10 +855,35 @@ document.addEventListener('click', function(e) {
     in_table = False
     in_list = False
     in_section = False
+    in_code = False
     section_num = 0
+
+    # Raw-HTML lines we pass through verbatim (copy-ready bruteforce blocks
+    # use <details>/<summary> directly in the source markdown).
+    raw_html_starts = ("<details>", "</details>", "<summary>")
 
     for line in md_content.split("\n"):
         stripped = line.strip()
+
+        # Fenced code block — preserve everything literally inside.
+        if stripped.startswith("```"):
+            if in_code:
+                html_lines.append("</pre>")
+                in_code = False
+            else:
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                html_lines.append("<pre>")
+                in_code = True
+            continue
+
+        if in_code:
+            # Escape HTML but keep raw text — this block carries ip:port lines
+            # that the operator copies verbatim into hydra/crackmapexec.
+            escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            html_lines.append(escaped)
+            continue
 
         # H2 = new collapsible section
         if stripped.startswith("## "):
@@ -693,6 +900,14 @@ document.addEventListener('click', function(e) {
             html_lines.append(f'<h2 id="{anchor}">{_md_inline(stripped[3:])}</h2>')
             html_lines.append('<div class="section-content">')
             in_section = True
+            continue
+
+        # Raw HTML passthrough (e.g., <details>, </details>, <summary>)
+        if stripped.startswith(raw_html_starts):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(line)
             continue
 
         # Table rows
@@ -737,6 +952,8 @@ document.addEventListener('click', function(e) {
         # Headers
         if stripped.startswith("# "):
             html_lines.append(f"<h1>{_md_inline(stripped[2:])}</h1>")
+        elif stripped.startswith("#### "):
+            html_lines.append(f"<h4>{_md_inline(stripped[5:])}</h4>")
         elif stripped.startswith("### "):
             html_lines.append(f"<h3>{_md_inline(stripped[4:])}</h3>")
         elif stripped.startswith("---"):
@@ -746,6 +963,8 @@ document.addEventListener('click', function(e) {
         else:
             html_lines.append(f"<p>{_md_inline(stripped)}</p>")
 
+    if in_code:
+        html_lines.append("</pre>")
     if in_table:
         html_lines.append("</tbody></table>")
     if in_list:
@@ -758,10 +977,25 @@ document.addEventListener('click', function(e) {
     return "\n".join(html_lines)
 
 
+_AUTOLINK_RE = re.compile(r'&lt;(https?://[^\s&]+)&gt;')
+# Italic: only match `_word_` where the underscore sits at a word boundary. This
+# avoids mangling CVE descriptions, CPE paths, function names, and URL paths
+# that legitimately contain internal underscores (e.g., `krb5_pac_parse`).
+_ITALIC_RE = re.compile(r'(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])')
+_CODE_RE = re.compile(r'`([^`\n]+?)`')
+_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+
+
 def _md_inline(text: str) -> str:
-    """Convert inline Markdown formatting to HTML."""
-    import re
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
-    text = re.sub(r'_(.+?)_', r'<em>\1</em>', text)
-    text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+    """Convert inline Markdown formatting to HTML.
+
+    Escapes raw `<`/`>` first, then re-introduces tags we emit deliberately
+    (autolinks, `<strong>`, `<em>`, `<code>`). This keeps URLs and CPE strings
+    with underscores from being eaten by the italic parser.
+    """
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    text = _BOLD_RE.sub(r'<strong>\1</strong>', text)
+    text = _AUTOLINK_RE.sub(r'<a href="\1">\1</a>', text)
+    text = _CODE_RE.sub(r'<code>\1</code>', text)
+    text = _ITALIC_RE.sub(r'<em>\1</em>', text)
     return text

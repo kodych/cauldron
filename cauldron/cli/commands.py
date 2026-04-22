@@ -736,7 +736,7 @@ def serve(host: str, port: int, reload: bool):
 @click.option("--format", "fmt", type=click.Choice(["md", "json", "html"]), default="md",
               help="Report format (default: markdown)")
 @click.option("-o", "--output", default=None, type=click.Path(), help="Output file (default: stdout)")
-@click.option("--top", default=20, help="Number of top findings to include")
+@click.option("--top", default=0, help="Cap top findings/paths (0 = unlimited, include everything)")
 @click.option("--notes", is_flag=True, default=False, help="Include pentester notes in report")
 def pour(fmt: str, output: str | None, top: int, notes: bool):
     """Export scan report from the cauldron."""
