@@ -1,7 +1,8 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MultiGraph } from 'graphology';
 import Sigma from 'sigma';
-import { Crosshair, Network, SlidersHorizontal, Lock, Unlock, Target } from 'lucide-react';
+import { Crosshair, Network, SlidersHorizontal, Lock, Unlock, Target, Check, Shield, X as XIcon } from 'lucide-react';
+import { Badge } from './Badge';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
@@ -582,17 +583,11 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
         className="absolute z-50 pointer-events-none rounded bg-gray-900 border border-gray-700 px-3 py-2 shadow-xl max-w-xs"
         style={{ left: tooltipPos.x + 12, top: tooltipPos.y - 10 }}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <p className="text-xs font-mono text-gray-100 font-semibold">{ip}</p>
-          {isNew && (
-            <span className="text-xs text-green-400 font-semibold">NEW</span>
-          )}
-          {isStale && (
-            <span className="text-xs text-gray-500 font-semibold">GONE</span>
-          )}
-          {isScanSource && (
-            <span className="text-xs text-green-400 font-semibold">PIVOT</span>
-          )}
+          {isNew && <Badge tone="green">NEW</Badge>}
+          {isStale && <Badge tone="gray">GONE</Badge>}
+          {isScanSource && <Badge tone="green">PIVOT</Badge>}
         </div>
         <p className="text-xs text-gray-400 mt-0.5">{role}</p>
         {vulnCount > 0 ? (
@@ -604,9 +599,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               <span className="text-xs font-mono" style={{ color: maxCvss > 0 ? getCvssColor(maxCvss) : '#6b7280' }}>
                 CVSS: {formatCvss(maxCvss)}
               </span>
-              {hasExploit && (
-                <span className="text-xs text-red-400 font-semibold">EXPLOIT</span>
-              )}
+              {hasExploit && <Badge tone="red">EXPLOIT</Badge>}
             </div>
             {topVulns.map((v) => (
               <div key={v.cve_id} className="flex items-center gap-1.5 text-xs">
@@ -623,16 +616,16 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
                   </span>
                 )}
                 {v.checked_status === 'exploited' && (
-                  <span className="text-green-400 shrink-0">&#10003;</span>
+                  <Check size={11} className="text-green-400 shrink-0" />
                 )}
                 {v.checked_status === 'false_positive' && (
-                  <span className="text-gray-500 shrink-0">FP</span>
+                  <XIcon size={11} className="text-gray-500 shrink-0" />
                 )}
                 {v.checked_status === 'mitigated' && (
-                  <span className="text-blue-400 shrink-0">M</span>
+                  <Shield size={11} className="text-blue-400 shrink-0" />
                 )}
                 {v.has_exploit && (
-                  <span className="text-red-400 font-semibold shrink-0">EXP</span>
+                  <span className="text-red-400 font-semibold shrink-0 text-xs">EXP</span>
                 )}
               </div>
             ))}

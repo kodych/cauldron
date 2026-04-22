@@ -6,6 +6,7 @@ import { getConfidenceColor, getCvssColor, getRoleColor } from '../utils/colors'
 import { formatCvss } from '../utils/format';
 import type { PathsResponse, AttackPathOut } from '../types';
 import { ExploitCommands } from './ExploitCommands';
+import { Badge } from './Badge';
 
 type PathFilter =
   | 'all'
@@ -293,16 +294,19 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
                           {v.confidence}
                         </span>
                         {v.in_cisa_kev && (
-                          <span
-                            className="ml-1 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold text-xs"
-                            title="CISA Known Exploited Vulnerability — actively exploited in the wild"
-                          >
-                            🔥 KEV
+                          <span className="ml-1">
+                            <Badge
+                              tone="orange"
+                              strong
+                              title="CISA Known Exploited Vulnerability — actively exploited in the wild"
+                            >
+                              🔥 KEV
+                            </Badge>
                           </span>
                         )}
-                        {v.has_exploit && (
-                          <span className="ml-1 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold text-xs">
-                            EXPLOIT
+                        {v.has_exploit && !v.in_cisa_kev && (
+                          <span className="ml-1">
+                            <Badge tone="red">EXPLOIT</Badge>
                           </span>
                         )}
                       </div>

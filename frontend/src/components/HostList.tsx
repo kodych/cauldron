@@ -4,6 +4,7 @@ import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor, getConfidenceColor } from '../utils/colors';
 import type { HostListResponse, HostOut } from '../types';
+import { Badge } from './Badge';
 
 interface Props {
   onSelectHost: (ip: string | null) => void;
@@ -136,48 +137,28 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               {vulnCount}V
             </span>
           )}
-          {host.is_new && (
-            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-xs text-green-400 font-semibold">
-              NEW
-            </span>
-          )}
-          {host.is_stale && (
-            <span className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-gray-500 font-semibold">
-              GONE
-            </span>
-          )}
+          {host.is_new && <Badge tone="green">NEW</Badge>}
+          {host.is_stale && <Badge tone="gray">GONE</Badge>}
           {!host.is_new && !host.is_stale && host.has_changes && (
-            <span className="rounded bg-yellow-900/30 px-1.5 py-0.5 text-xs text-yellow-400 font-semibold">
-              CHANGED
-            </span>
+            <Badge tone="yellow">CHANGED</Badge>
           )}
-          {vulnCount > 0 && activeVulns.some((v) => v.in_cisa_kev) && (
-            <span
-              className="rounded bg-orange-900/40 px-1.5 py-0.5 text-xs text-orange-300 font-bold"
+          {/* When KEV is present it implies a real exploit exists; the
+              separate EXPLOIT badge would be redundant. Collapse to one. */}
+          {vulnCount > 0 && activeVulns.some((v) => v.in_cisa_kev) ? (
+            <Badge
+              tone="orange"
+              strong
               title="At least one CISA Known Exploited Vulnerability on this host"
             >
               🔥 KEV
-            </span>
-          )}
-          {vulnCount > 0 && activeVulns.some((v) => v.has_exploit) ? (
-            <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
-              EXPLOIT
-            </span>
+            </Badge>
+          ) : vulnCount > 0 && activeVulns.some((v) => v.has_exploit) ? (
+            <Badge tone="red">EXPLOIT</Badge>
           ) : vulnCount > 0 ? (
-            <span className="rounded bg-purple-900/30 px-1.5 py-0.5 text-xs text-purple-400">
-              VULN
-            </span>
+            <Badge tone="purple">VULN</Badge>
           ) : null}
-          {host.owned && (
-            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-xs text-green-400 font-semibold">
-              OWNED
-            </span>
-          )}
-          {host.target && (
-            <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
-              TARGET
-            </span>
-          )}
+          {host.owned && <Badge tone="green">OWNED</Badge>}
+          {host.target && <Badge tone="red">TARGET</Badge>}
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -229,16 +210,15 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                       {v.confidence || 'check'}
                     </span>
                     {v.in_cisa_kev && (
-                      <span
-                        className="shrink-0 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold"
-                        title="CISA Known Exploited Vulnerability"
-                      >
-                        🔥 KEV
+                      <span className="shrink-0">
+                        <Badge tone="orange" strong title="CISA Known Exploited Vulnerability">
+                          🔥 KEV
+                        </Badge>
                       </span>
                     )}
-                    {v.has_exploit && (
-                      <span className="shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
-                        EXPLOIT
+                    {v.has_exploit && !v.in_cisa_kev && (
+                      <span className="shrink-0">
+                        <Badge tone="red">EXPLOIT</Badge>
                       </span>
                     )}
                     {v.source && (

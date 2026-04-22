@@ -4,6 +4,7 @@ import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
+import { Badge } from './Badge';
 import { ExploitCommands } from './ExploitCommands';
 
 interface Props {
@@ -159,14 +160,10 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
           <span className="rounded bg-gray-800 px-1.5 py-0.5" style={{ color: getRoleColor(data.role) }}>
             {data.role}
           </span>
-          {data.is_new && (
-            <span className="rounded bg-green-900/30 px-1.5 py-0.5 text-green-400 font-semibold">NEW</span>
-          )}
-          {data.is_stale && (
-            <span className="rounded bg-gray-700 px-1.5 py-0.5 text-gray-500 font-semibold">GONE</span>
-          )}
+          {data.is_new && <Badge tone="green">NEW</Badge>}
+          {data.is_stale && <Badge tone="gray">GONE</Badge>}
           {!data.is_new && !data.is_stale && data.has_changes && (
-            <span className="rounded bg-yellow-900/30 px-1.5 py-0.5 text-yellow-400 font-semibold">CHANGED</span>
+            <Badge tone="yellow">CHANGED</Badge>
           )}
           {data.os_name && (
             <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
@@ -373,16 +370,19 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           {vuln.confidence}
         </span>
         {vuln.in_cisa_kev && (
-          <span
-            className="text-xs shrink-0 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold"
-            title={vuln.cisa_kev_added ? `In CISA KEV since ${vuln.cisa_kev_added.slice(0, 10)} — actively exploited in the wild` : 'CISA Known Exploited Vulnerability — actively exploited in the wild'}
-          >
-            🔥 KEV
+          <span className="shrink-0">
+            <Badge
+              tone="orange"
+              strong
+              title={vuln.cisa_kev_added ? `In CISA KEV since ${vuln.cisa_kev_added.slice(0, 10)} — actively exploited in the wild` : 'CISA Known Exploited Vulnerability — actively exploited in the wild'}
+            >
+              🔥 KEV
+            </Badge>
           </span>
         )}
-        {vuln.has_exploit && (
-          <span className="text-xs shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
-            EXPLOIT
+        {vuln.has_exploit && !vuln.in_cisa_kev && (
+          <span className="shrink-0">
+            <Badge tone="red">EXPLOIT</Badge>
           </span>
         )}
         {vuln.source && (
@@ -600,12 +600,8 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                 <span className={`text-gray-400 truncate ${s.is_stale ? 'line-through' : ''}`}>
                   {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
                 </span>
-                {s.is_new && (
-                  <span className="shrink-0 rounded px-1 py-0 bg-green-900/30 text-green-400 font-semibold">NEW</span>
-                )}
-                {s.is_stale && (
-                  <span className="shrink-0 rounded px-1 py-0 bg-gray-700 text-gray-500">GONE</span>
-                )}
+                {s.is_new && <span className="shrink-0"><Badge tone="green">NEW</Badge></span>}
+                {s.is_stale && <span className="shrink-0"><Badge tone="gray">GONE</Badge></span>}
                 {vCount > 0 && (
                   <span
                     className="shrink-0 rounded px-1 py-0 text-xs"

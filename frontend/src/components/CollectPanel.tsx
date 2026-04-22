@@ -4,6 +4,7 @@ import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getCvssColor } from '../utils/colors';
 import type { CollectResponse, VulnListItem } from '../types';
+import { Badge } from './Badge';
 
 const QUICK_FILTERS = [
   { name: 'smb', label: 'SMB', desc: 'Port 445' },
@@ -309,15 +310,12 @@ function VulnCollectRow({ vuln }: { vuln: VulnListItem }) {
         </span>
         <span className="text-xs text-gray-300 flex-1 truncate">{vuln.cve_id}</span>
         {vuln.in_cisa_kev && (
-          <span
-            className="shrink-0 rounded px-1 py-0 text-xs bg-orange-900/40 text-orange-300 font-bold"
-            title="CISA Known Exploited Vulnerability"
-          >
-            🔥
+          <span className="shrink-0">
+            <Badge tone="orange" strong title="CISA Known Exploited Vulnerability">🔥</Badge>
           </span>
         )}
-        {vuln.has_exploit && (
-          <span className="shrink-0 rounded px-1 py-0 text-xs bg-red-900/30 text-red-400 font-semibold">EXP</span>
+        {vuln.has_exploit && !vuln.in_cisa_kev && (
+          <span className="shrink-0"><Badge tone="red">EXP</Badge></span>
         )}
         <span className="text-xs text-gray-500">{vuln.host_count}h</span>
         {expanded ? <ChevronUp size={11} className="text-gray-600" /> : <ChevronDown size={11} className="text-gray-600" />}
