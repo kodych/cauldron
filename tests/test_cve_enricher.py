@@ -18,6 +18,8 @@ from cauldron.ai.cve_enricher import (
     _cve_is_gold,
     _cve_is_local_only,
     _cve_matches_product,
+    _cve_priority_key,
+    _cve_requires_admin,
     _extract_version,
     _get_cpe_for_service,
     _is_pentester_relevant,
@@ -892,6 +894,123 @@ class TestCVEIsGold:
                         vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:H")
         assert _cve_is_dos_only(cve) is False
         assert _cve_is_gold(cve, versionless=False) is True
+
+    # --- PR:H "requires admin already" filter ---
+
+    def test_pr_high_dropped_in_versioned(self):
+        """CVE that needs admin to exploit is post-exploitation noise."""
+        cve = self._cve(cvss=9.8, has_exploit=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_requires_admin(cve) is True
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_pr_low_kept(self):
+        """Low-priv (PR:L) requirement kept — auth-user post-spray pivot."""
+        cve = self._cve(cvss=8.0, has_exploit=False,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_requires_admin(cve) is False
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    def test_pr_none_kept(self):
+        """No privileges required (PR:N) — entry-point CVE, keep."""
+        cve = self._cve(cvss=7.5, has_exploit=False,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_requires_admin(cve) is False
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    # --- CISA KEV override behaviour ---
+
+    def test_kev_overrides_threshold_versioned(self):
+        """KEV-listed CVE is kept regardless of CVSS or has_exploit threshold."""
+        cve = CVEInfo(
+            cve_id="CVE-2024-9999",
+            cvss=4.5,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+            has_exploit=False,
+            in_cisa_kev=True,
+        )
+        assert _cve_is_gold(cve, versionless=False) is True
+
+    def test_kev_overrides_recency_versionless(self):
+        """KEV-listed CVE bypasses the versionless recency cutoff."""
+        cve = CVEInfo(
+            cve_id="CVE-2014-9999",
+            cvss=8.5,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            published="2014-01-01T00:00:00.000",
+            in_cisa_kev=True,
+        )
+        assert _cve_is_gold(cve, versionless=True) is True
+
+    def test_kev_does_not_override_local(self):
+        """Even KEV doesn't help on a network scan if vector is local-only."""
+        cve = CVEInfo(
+            cve_id="CVE-2024-9999",
+            cvss=9.8,
+            cvss_vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            in_cisa_kev=True,
+        )
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_kev_does_not_override_dos_only(self):
+        """KEV-listed pure-DoS CVE (e.g. CVE-2023-44487 HTTP/2 Rapid Reset)
+        is real attack-in-the-wild but not pentest gold on a netscan."""
+        cve = CVEInfo(
+            cve_id="CVE-2023-44487",
+            cvss=7.5,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            in_cisa_kev=True,
+        )
+        assert _cve_is_gold(cve, versionless=False) is False
+
+    # --- Priority sort: KEV first, then exploit, then CVSS ---
+
+    def test_priority_sort_kev_beats_exploit(self):
+        kev = CVEInfo(cve_id="K", cvss=5.0, in_cisa_kev=True)
+        exp = CVEInfo(cve_id="E", cvss=9.8, has_exploit=True)
+        ordered = sorted([exp, kev], key=_cve_priority_key)
+        assert ordered[0].cve_id == "K"
+
+    def test_priority_sort_exploit_beats_higher_cvss(self):
+        no_exp_high = CVEInfo(cve_id="N", cvss=9.8)
+        exp_low = CVEInfo(cve_id="E", cvss=7.0, has_exploit=True)
+        ordered = sorted([no_exp_high, exp_low], key=_cve_priority_key)
+        assert ordered[0].cve_id == "E"
+
+    def test_priority_sort_cvss_breaks_tie(self):
+        a = CVEInfo(cve_id="A", cvss=7.5, has_exploit=True)
+        b = CVEInfo(cve_id="B", cvss=9.0, has_exploit=True)
+        ordered = sorted([a, b], key=_cve_priority_key)
+        assert ordered[0].cve_id == "B"
+
+
+class TestKEVParsing:
+    """Verify cisaExploitAdd is parsed off the NVD response into CVEInfo."""
+
+    def test_cisa_exploit_add_parsed(self):
+        cve_data = {
+            "id": "CVE-2024-9999",
+            "descriptions": [{"lang": "en", "value": "Test"}],
+            "metrics": {},
+            "references": [],
+            "cisaExploitAdd": "2024-09-15",
+        }
+        cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.in_cisa_kev is True
+        assert cve.cisa_kev_added == "2024-09-15"
+
+    def test_no_kev_field_parses_false(self):
+        cve_data = {
+            "id": "CVE-2024-0001",
+            "descriptions": [{"lang": "en", "value": "Test"}],
+            "metrics": {},
+            "references": [],
+        }
+        cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.in_cisa_kev is False
+        assert cve.cisa_kev_added is None
 
 
 class TestCVEAppliesTo:

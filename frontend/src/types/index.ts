@@ -36,6 +36,8 @@ export interface VulnOut {
   ai_fp_reason: string | null;
   port: number | null;
   source: string | null; // exploit_db, nvd, ai
+  in_cisa_kev: boolean;
+  cisa_kev_added: string | null;
 }
 
 export interface HostOut {
@@ -69,6 +71,7 @@ export interface VulnInfoOut {
   enables_pivot: boolean | null;
   method: string;
   port: number | null;
+  in_cisa_kev: boolean;
 }
 
 export interface PathNodeOut {
@@ -144,6 +147,8 @@ export interface VulnListItem {
   confidence: string | null;
   source: string | null;
   description: string;
+  in_cisa_kev: boolean;
+  cisa_kev_added: string | null;
   host_count: number;
   targets: Array<{ ip: string; port: number }>;
   ips: string[];

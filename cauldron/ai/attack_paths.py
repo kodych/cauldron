@@ -47,6 +47,7 @@ class VulnInfo:
     enables_pivot: bool | None = None  # True = RCE/shell, False = relay/misconfig
     method: str = ""  # exploit | relay | credential | cve
     port: int | None = None
+    in_cisa_kev: bool = False  # listed in CISA Known Exploited Vulns catalog
 
 
 @dataclass
@@ -199,7 +200,7 @@ def _find_direct_paths(
                  cve: v.cve_id, cvss: v.cvss,
                  has_exploit: v.has_exploit, desc: v.description,
                  confidence: v.confidence, enables_pivot: v.enables_pivot,
-                 port: s.port
+                 port: s.port, in_cisa_kev: v.in_cisa_kev
              }}) AS vulns,
              max(v.cvss) AS max_cvss,
              max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -338,7 +339,7 @@ def _find_pivot_paths(
                      cve: v.cve_id, cvss: v.cvss,
                      has_exploit: v.has_exploit, desc: v.description,
                      confidence: v.confidence, enables_pivot: v.enables_pivot,
-                     port: s.port
+                     port: s.port, in_cisa_kev: v.in_cisa_kev
                  }}) AS vulns,
                  max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -434,7 +435,7 @@ def _find_lateral_paths(
                      cve: v.cve_id, cvss: v.cvss,
                      has_exploit: v.has_exploit, desc: v.description,
                      confidence: v.confidence, enables_pivot: v.enables_pivot,
-                     port: s.port
+                     port: s.port, in_cisa_kev: v.in_cisa_kev
                  }}) AS vulns,
                  max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit
@@ -503,10 +504,18 @@ def _parse_vulns(raw_vulns: list[dict]) -> list[VulnInfo]:
             enables_pivot=v.get("enables_pivot"),
             method=method,
             port=v.get("port"),
+            in_cisa_kev=bool(v.get("in_cisa_kev")),
         ))
-    # Sort by confidence (confirmed first), then exploitable, then CVSS
+    # Pentester-priority sort: CISA KEV first (active in-the-wild),
+    # then confidence (confirmed -> likely -> check), then has_exploit,
+    # then CVSS desc.
     conf_order = {"confirmed": 0, "likely": 1, "check": 2}
-    vulns.sort(key=lambda v: (conf_order.get(v.confidence, 2), -int(v.has_exploit), -v.cvss))
+    vulns.sort(key=lambda v: (
+        0 if v.in_cisa_kev else 1,
+        conf_order.get(v.confidence, 2),
+        -int(v.has_exploit),
+        -v.cvss,
+    ))
     return vulns
 
 
@@ -563,7 +572,7 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                        has_exploit: v.has_exploit, desc: v.description,
                        confidence: v.confidence,
                        enables_pivot: v.enables_pivot,
-                       port: s.port}) AS vulns
+                       port: s.port, in_cisa_kev: v.in_cisa_kev}) AS vulns
         """,
         ip=ip,
     )

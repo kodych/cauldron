@@ -151,6 +151,14 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
               CHANGED
             </span>
           )}
+          {vulnCount > 0 && activeVulns.some((v) => v.in_cisa_kev) && (
+            <span
+              className="rounded bg-orange-900/40 px-1.5 py-0.5 text-xs text-orange-300 font-bold"
+              title="At least one CISA Known Exploited Vulnerability on this host"
+            >
+              🔥 KEV
+            </span>
+          )}
           {vulnCount > 0 && activeVulns.some((v) => v.has_exploit) ? (
             <span className="rounded bg-red-900/30 px-1.5 py-0.5 text-xs text-red-400 font-semibold">
               EXPLOIT
@@ -220,6 +228,14 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                     >
                       {v.confidence || 'check'}
                     </span>
+                    {v.in_cisa_kev && (
+                      <span
+                        className="shrink-0 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold"
+                        title="CISA Known Exploited Vulnerability"
+                      >
+                        🔥 KEV
+                      </span>
+                    )}
                     {v.has_exploit && (
                       <span className="shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
                         EXPLOIT

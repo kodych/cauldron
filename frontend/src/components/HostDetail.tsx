@@ -338,6 +338,14 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
         >
           {vuln.confidence}
         </span>
+        {vuln.in_cisa_kev && (
+          <span
+            className="text-xs shrink-0 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold"
+            title={vuln.cisa_kev_added ? `In CISA KEV since ${vuln.cisa_kev_added.slice(0, 10)} — actively exploited in the wild` : 'CISA Known Exploited Vulnerability — actively exploited in the wild'}
+          >
+            🔥 KEV
+          </span>
+        )}
         {vuln.has_exploit && (
           <span className="text-xs shrink-0 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold">
             EXPLOIT

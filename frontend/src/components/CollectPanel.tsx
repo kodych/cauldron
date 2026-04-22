@@ -308,6 +308,14 @@ function VulnCollectRow({ vuln }: { vuln: VulnListItem }) {
           {vuln.cvss?.toFixed(1) || 'N/A'}
         </span>
         <span className="text-xs text-gray-300 flex-1 truncate">{vuln.cve_id}</span>
+        {vuln.in_cisa_kev && (
+          <span
+            className="shrink-0 rounded px-1 py-0 text-xs bg-orange-900/40 text-orange-300 font-bold"
+            title="CISA Known Exploited Vulnerability"
+          >
+            🔥
+          </span>
+        )}
         {vuln.has_exploit && (
           <span className="shrink-0 rounded px-1 py-0 text-xs bg-red-900/30 text-red-400 font-semibold">EXP</span>
         )}

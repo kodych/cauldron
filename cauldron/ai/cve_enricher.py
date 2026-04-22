@@ -129,6 +129,11 @@ class CVEInfo:
     epss: float | None = None
     cwe_ids: list[str] = field(default_factory=list)
     published: str | None = None  # ISO date string from NVD
+    # CISA Known Exploited Vulnerabilities catalog — True when CISA lists
+    # the CVE as actively exploited in the wild (stronger signal than
+    # has_exploit, which only means a PoC exists somewhere).
+    in_cisa_kev: bool = False
+    cisa_kev_added: str | None = None  # ISO date CISA added it
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -513,6 +518,18 @@ def _cve_is_local_only(cve: CVEInfo) -> bool:
     return "AV:L" in tokens or "AV:P" in tokens
 
 
+def _cve_requires_admin(cve: CVEInfo) -> bool:
+    """True if the CVE requires high-privileged access (admin/root) to exploit.
+
+    On a pentest these are post-exploitation CVEs: if we already have admin we
+    have a shell and don't need the CVE; if we don't have admin the CVE can't
+    help us get one. Drop as noise. Low-privilege requirements (PR:L, PR:N)
+    are retained — those are legitimate entry points after password spray or
+    null-session enumeration.
+    """
+    return "PR:H" in _cvss_tokens(cve)
+
+
 def _cve_is_dos_only(cve: CVEInfo) -> bool:
     """True if the CVE only impacts availability (pure DoS) — no confidentiality
     or integrity loss. Useless for red-team gold hunting.
@@ -531,6 +548,24 @@ def _cve_published_year(cve: CVEInfo) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _cve_priority_key(cve: CVEInfo):
+    """Sort key for pentester-useful CVE ordering.
+
+    Priority tiers (descending — lower tuple value sorts first):
+      1. CISA-KEV listed  — actively exploited in the wild
+      2. has_exploit=True — public PoC / module exists
+      3. By CVSS, highest first
+
+    A CVE with a Metasploit module and CVSS 7.4 beats a theoretical
+    CVSS 9.8 CVE with no PoC on every engagement that matters.
+    """
+    return (
+        0 if cve.in_cisa_kev else 1,
+        0 if cve.has_exploit else 1,
+        -(cve.cvss or 0.0),
+    )
+
+
 def _cve_is_gold(cve: CVEInfo, versionless: bool) -> bool:
     """Decide whether a CVE clears the "gold-only" bar for a pentester.
 
@@ -545,11 +580,26 @@ def _cve_is_gold(cve: CVEInfo, versionless: bool) -> bool:
       - AV:L / AV:P — local or physical attack vector.
       - Pure availability impact (DoS only).
     """
-    # Cross-cutting: local/physical vectors are dead weight on a netscan.
+    # Hard rejects apply to every CVE regardless of CVSS, recency or KEV
+    # status: local/physical vectors and pure DoS have no pentest gold for
+    # a network engagement. CVE-2023-44487 (HTTP/2 Rapid Reset) is in CISA
+    # KEV but is pure DoS — listing it under "gold" would mislead.
     if _cve_is_local_only(cve):
         return False
-    # Pure DoS has no pentest gold in it.
     if _cve_is_dos_only(cve):
+        return False
+
+    # CISA-KEV is the strongest signal short of those hard rejects: the US
+    # government has confirmed this CVE is being used in real attacks right
+    # now. Override CVSS/recency/PR:H thresholds — but not the hard rejects
+    # above. KEV beats heuristics, not vector reality.
+    if cve.in_cisa_kev:
+        return True
+
+    # CVEs that need admin rights to exploit are post-exploitation — a
+    # pentester with admin already has a shell, a pentester without admin
+    # cannot reach this precondition from the outside.
+    if _cve_requires_admin(cve):
         return False
 
     cvss = cve.cvss or 0.0
@@ -629,10 +679,11 @@ def _query_nvd_cpe(cpe23: str) -> list[CVEInfo] | None:
     cves = [c for c in cves if _is_pentester_relevant(c)]
     cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version)]
 
-    # Sort by severity desc. For specific-version queries we cap tight (20);
-    # for wildcard queries we keep a wider window (50) so a newly published
-    # flagship CVE isn't crowded out by a vendor's older high-severity CVEs.
-    cves.sort(key=lambda c: c.cvss or 0, reverse=True)
+    # Pentester-priority sort: CISA KEV (active in-the-wild exploitation)
+    # first, then CVEs with a public exploit, then CVSS descending within
+    # each tier. A low-CVSS CVE with a Metasploit module is more useful
+    # than a high-CVSS theoretical one.
+    cves.sort(key=_cve_priority_key)
     return cves[:20 if has_version else 50]
 
 
@@ -668,8 +719,8 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     cves = [c for c in cves if _is_pentester_relevant(c)]
     cves = [c for c in cves if _cve_is_gold(c, versionless=versionless)]
 
-    # Sort by severity
-    cves.sort(key=lambda c: c.cvss or 0, reverse=True)
+    # Same pentester-priority sort as the CPE path.
+    cves.sort(key=_cve_priority_key)
 
     return cves[:20 if versionless else 10]
 
@@ -1017,6 +1068,13 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
     # Publication date
     published = cve_data.get("published")
 
+    # CISA Known Exploited Vulnerabilities — NVD exposes cisaExploitAdd when
+    # the CVE is in the federal catalog of actively-exploited vulnerabilities.
+    # This is a much stronger signal than has_exploit (PoC existence) because
+    # it means confirmed in-the-wild exploitation by ransomware groups / APTs.
+    cisa_kev_added = cve_data.get("cisaExploitAdd")
+    in_cisa_kev = bool(cisa_kev_added)
+
     return CVEInfo(
         cve_id=cve_id,
         cvss=cvss,
@@ -1027,6 +1085,8 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         exploit_url=exploit_url,
         cwe_ids=cwe_ids,
         published=published,
+        in_cisa_kev=in_cisa_kev,
+        cisa_kev_added=cisa_kev_added,
     )
 
 
@@ -1254,12 +1314,16 @@ def _upsert_vulnerability(
             v.has_exploit = $has_exploit,
             v.exploit_url = $exploit_url,
             v.epss = $epss,
+            v.in_cisa_kev = $in_cisa_kev,
+            v.cisa_kev_added = $cisa_kev_added,
             v.source = 'nvd',
             v.confidence = 'check'
         ON MATCH SET
             v.cvss = COALESCE($cvss, v.cvss),
             v.severity = COALESCE($severity, v.severity),
-            v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END
+            v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
+            v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
+            v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added)
         """,
         cve_id=cve.cve_id,
         cvss=cve.cvss,
@@ -1269,6 +1333,8 @@ def _upsert_vulnerability(
         has_exploit=cve.has_exploit,
         exploit_url=cve.exploit_url,
         epss=cve.epss,
+        in_cisa_kev=cve.in_cisa_kev,
+        cisa_kev_added=cve.cisa_kev_added,
     )
 
     # Link to matching services by product+version

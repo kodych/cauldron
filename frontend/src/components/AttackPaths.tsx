@@ -275,6 +275,14 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
                         >
                           {v.confidence}
                         </span>
+                        {v.in_cisa_kev && (
+                          <span
+                            className="ml-1 rounded px-1 py-0 bg-orange-900/40 text-orange-300 font-bold text-xs"
+                            title="CISA Known Exploited Vulnerability — actively exploited in the wild"
+                          >
+                            🔥 KEV
+                          </span>
+                        )}
                         {v.has_exploit && (
                           <span className="ml-1 rounded px-1 py-0 bg-red-900/30 text-red-400 font-semibold text-xs">
                             EXPLOIT

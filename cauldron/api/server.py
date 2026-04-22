@@ -76,6 +76,8 @@ class VulnOut(BaseModel):
     ai_fp_reason: str | None = None
     port: int | None = None
     source: str | None = None  # exploit_db, nvd, ai
+    in_cisa_kev: bool = False  # listed in CISA Known Exploited Vulns catalog
+    cisa_kev_added: str | None = None
 
 
 class HostOut(BaseModel):
@@ -109,6 +111,7 @@ class VulnInfoOut(BaseModel):
     enables_pivot: bool | None = None
     method: str = ""
     port: int | None = None
+    in_cisa_kev: bool = False  # listed in CISA Known Exploited Vulns catalog
 
 
 class PathNodeOut(BaseModel):
@@ -238,6 +241,8 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         ai_fp_reason=v.get("ai_fp_reason"),
         port=v.get("port"),
         source=v.get("source"),
+        in_cisa_kev=bool(v.get("in_cisa_kev")),
+        cisa_kev_added=v.get("cisa_kev_added"),
     )
 
 
@@ -419,7 +424,8 @@ def list_hosts(
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
-                       port: s.port, source: v.source
+                       port: s.port, source: v.source,
+                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
                    }}) AS vulns
             """,
             **params,
@@ -503,7 +509,8 @@ def get_host(ip: str):
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: v.confidence, description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
-                       port: s.port, source: v.source
+                       port: s.port, source: v.source,
+                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
                    }) AS vulns
             """,
             ip=ip,
@@ -598,7 +605,7 @@ def get_attack_paths(
                     cve_id=v.cve_id, cvss=v.cvss, has_exploit=v.has_exploit,
                     title=v.title, confidence=v.confidence,
                     enables_pivot=v.enables_pivot, method=v.method,
-                    port=v.port,
+                    port=v.port, in_cisa_kev=v.in_cisa_kev,
                 ) for v in n.vulns],
             )
             for n in p.nodes
@@ -1270,9 +1277,10 @@ def list_vulns():
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    v.confidence AS confidence, v.source AS source,
                    v.description AS description,
+                   v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
                    count(DISTINCT h.ip) AS host_count,
                    collect(DISTINCT {ip: h.ip, port: s.port}) AS targets
-            ORDER BY v.has_exploit DESC, v.cvss DESC
+            ORDER BY coalesce(v.in_cisa_kev, false) DESC, v.has_exploit DESC, v.cvss DESC
         """))
 
     vulns = []
@@ -1288,6 +1296,8 @@ def list_vulns():
             "confidence": r["confidence"],
             "source": r["source"],
             "description": (r["description"] or "")[:200],
+            "in_cisa_kev": bool(r.get("in_cisa_kev")),
+            "cisa_kev_added": r.get("cisa_kev_added"),
             "host_count": r["host_count"],
             "targets": targets,
             "ips": sorted(set(t["ip"] for t in targets)),
