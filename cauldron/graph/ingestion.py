@@ -203,6 +203,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service, timestamp:
             svc.version = $version,
             svc.extra_info = $extra_info,
             svc.banner = $banner,
+            svc.servicefp = $servicefp,
             svc.cpe = $cpe
         ON MATCH SET
             svc.last_seen = $ts,
@@ -211,6 +212,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service, timestamp:
             svc.product = COALESCE($product, svc.product),
             svc.version = COALESCE($version, svc.version),
             svc.extra_info = COALESCE($extra_info, svc.extra_info),
+            svc.servicefp = COALESCE($servicefp, svc.servicefp),
             svc.cpe = COALESCE($cpe, svc.cpe)
         MERGE (h)-[:HAS_SERVICE]->(svc)
         """,
@@ -224,6 +226,7 @@ def _upsert_service(session: Session, host_ip: str, service: Service, timestamp:
         version=service.version,
         extra_info=service.extra_info,
         banner=service.banner,
+        servicefp=service.servicefp,
         cpe=cpe_str,
     )
 

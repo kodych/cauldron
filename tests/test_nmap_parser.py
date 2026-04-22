@@ -267,6 +267,42 @@ def test_parse_invalid_xml_raises():
         assert "nmaprun" in str(e)
 
 
+def test_parse_captures_servicefp():
+    """nmap emits the raw probe response in `servicefp` when its built-in
+    signatures fail to identify the product. We need that string intact so a
+    later analysis pass can extract product hints from it (JSESSIONID,
+    Server: headers, characteristic HTML) without re-scanning.
+    """
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.1" addrtype="ipv4"/>
+            <ports>
+                <port protocol="tcp" portid="8080">
+                    <state state="open"/>
+                    <service name="http-proxy"
+                             servicefp="SF-Port8080-TCP:V=7.92%r(GetRequest,127,&quot;HTTP/1.1 401\\nSet-Cookie: JSESSIONID=ABC&quot;)"/>
+                </port>
+                <port protocol="tcp" portid="22">
+                    <state state="open"/>
+                    <service name="ssh" product="OpenSSH" version="8.9"/>
+                </port>
+            </ports>
+        </host>
+    </nmaprun>
+    """
+    result = parse_nmap_xml(xml)
+    host = result.hosts_up[0]
+    http_proxy = next(s for s in host.services if s.port == 8080)
+    assert http_proxy.servicefp is not None
+    assert "JSESSIONID" in http_proxy.servicefp
+    # Services nmap identified confidently carry no servicefp — that's
+    # expected nmap behaviour and we should not fabricate one.
+    ssh = next(s for s in host.services if s.port == 22)
+    assert ssh.servicefp is None
+
+
 def test_parse_from_file(tmp_path: Path):
     """Test parsing from an actual file path."""
     xml_content = """<?xml version="1.0"?>

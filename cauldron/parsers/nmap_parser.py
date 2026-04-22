@@ -163,6 +163,11 @@ def _parse_port(elem: ET.Element) -> Service | None:
         service.product = svc_elem.get("product")
         service.version = svc_elem.get("version")
         service.extra_info = svc_elem.get("extrainfo")
+        # Preserve the raw service fingerprint — nmap emits it only when its
+        # signatures couldn't identify the product, so it carries the richest
+        # hints we'll get without re-probing (cookies, Server: headers,
+        # characteristic HTML error pages).
+        service.servicefp = svc_elem.get("servicefp")
 
         # Build banner from tunnel/servicefp if available
         tunnel = svc_elem.get("tunnel")

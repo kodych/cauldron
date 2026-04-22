@@ -296,6 +296,34 @@ class TestRealNmapFile:
             assert 445 in ports  # SMB
             assert 636 in ports  # LDAPS
 
+    def test_servicefp_persisted(self):
+        """Raw servicefp from nmap must round-trip to Neo4j so a later
+        analysis pass can read it without re-scanning.
+        """
+        fp = 'SF-Port8080-TCP:V=7.92%r(GetRequest,"Set-Cookie: JSESSIONID=X")'
+        host = Host(
+            ip="10.0.99.1",
+            state="up",
+            services=[
+                Service(port=8080, protocol="tcp", state="open",
+                        name="http-proxy", servicefp=fp),
+                # No servicefp on this one — confirms absence is also preserved.
+                Service(port=22, protocol="tcp", state="open",
+                        name="ssh", product="OpenSSH", version="8.9"),
+            ],
+        )
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            result = session.run(
+                "MATCH (s:Service {host_ip: '10.0.99.1'}) "
+                "RETURN s.port AS port, s.servicefp AS servicefp "
+                "ORDER BY port"
+            )
+            rows = {r["port"]: r["servicefp"] for r in result}
+            assert rows[8080] == fp
+            assert rows[22] is None
+
 
 class TestScanDiff:
     """Test scan diff — new/stale detection via timestamps.
