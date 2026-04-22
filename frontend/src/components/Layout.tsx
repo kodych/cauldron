@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Network, BarChart3, Shield, Crosshair, ChevronLeft, ChevronRight,
+  Network, BarChart3, Crosshair, ChevronLeft, ChevronRight,
   Target, Upload,
 } from 'lucide-react';
 import { StatsPanel } from './StatsPanel';
@@ -162,7 +162,17 @@ export function Layout() {
         <div className="flex items-center justify-between border-b border-gray-800 px-3 py-3">
           {!collapsed && (
             <div className="flex items-center gap-2">
-              <Shield size={20} className="text-indigo-400" />
+              {/* Pixel-art logo via rectangle-per-pixel SVG — scales to any
+                  size with crisp edges, works at 1x and HiDPI alike without
+                  the browser-downscale blur a fixed-size PNG would give. */}
+              <img
+                src="/brand/cauldron.svg"
+                alt="Cauldron"
+                width={22}
+                height={22}
+                className="shrink-0"
+                style={{ imageRendering: 'pixelated' }}
+              />
               <span className="text-sm font-semibold text-gray-100">Cauldron</span>
             </div>
           )}

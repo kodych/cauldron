@@ -308,6 +308,19 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
             {analyzing && analyzeProgress && (
               <div className="mt-2 space-y-1">
                 <div className="flex items-center gap-2 text-xs">
+                  {/* Live cauldron frame-by-frame animation — literal
+                      "boil" metaphor while the backend is brewing. WebP
+                      preserves alpha so it composites cleanly on the
+                      panel background; image-rendering:pixelated keeps
+                      the pixel art crisp at this small display size. */}
+                  <img
+                    src="/brand/cauldron-anim-32.webp"
+                    alt=""
+                    width={20}
+                    height={20}
+                    className="shrink-0"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
                   <span className="text-orange-400 font-semibold shrink-0">
                     {PHASE_LABELS[analyzeProgress.phase] ?? analyzeProgress.phase}
                   </span>
