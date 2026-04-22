@@ -39,6 +39,20 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
     setHostNotesStatus('idle');
   }, [ip]);
 
+  // Esc closes the detail panel. This matches the modal-dismissal
+  // convention users expect from Gmail/Slack/GitHub — auto-save has
+  // already persisted typed notes via its 500ms debounce so closing
+  // doesn't lose work, and it makes "glance at next host" a single key
+  // away instead of a mouse round-trip to the Back button. Only active
+  // while HostDetail is mounted; the listener unwires on unmount.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onBack();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onBack]);
+
   const handleToggleHostNotes = useCallback(() => {
     if (!hostNotesOpen && data) {
       setHostNotesText(data.notes || '');
