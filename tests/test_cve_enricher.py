@@ -819,95 +819,84 @@ class TestCVEMatchesProduct:
 
 
 class TestCVEIsGold:
-    """Gold-only filter — enforces the three-rule enricher strategy
-    (versioned top-critical | versioned+exploit | versionless assume-latest)."""
+    """Actionable-gold filter — single strict rule: keep only CVEs with a
+    public exploit. Version applicability is enforced upstream by
+    ``_cve_applies_to``; when no version is known, we assume the service
+    runs the latest release and keep the CVEs an operator could actually
+    run against it. CISA KEV overrides the has_exploit gate (actively
+    exploited in the wild beats every heuristic) but not the hard rejects
+    (local/physical vector, pure DoS, admin-required). This is deliberately
+    stricter than a CVSS-based rule — "theoretical critical" CVEs without
+    any PoC were the dominant noise pattern on real client scans, with
+    dozens of Apache/Samba 9.x CVEs bulk-attaching to every host.
+    """
 
     def _cve(
         self,
         cvss: float = 7.5,
         has_exploit: bool = False,
         vector: str = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        published: str = "2024-01-01T00:00:00.000",
+        in_cisa_kev: bool = False,
     ) -> CVEInfo:
         return CVEInfo(
             cve_id="CVE-TEST-0001",
             cvss=cvss,
             cvss_vector=vector,
             has_exploit=has_exploit,
-            published=published,
+            in_cisa_kev=in_cisa_kev,
         )
 
-    # --- Cross-cutting rejects ---
+    # --- Hard rejects ---
 
-    def test_local_vector_dropped_in_versioned(self):
+    def test_local_vector_dropped_even_with_exploit(self):
         cve = self._cve(cvss=9.8, has_exploit=True,
                         vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-        assert _cve_is_gold(cve, versionless=False) is False
-
-    def test_local_vector_dropped_in_versionless(self):
-        cve = self._cve(cvss=9.8, has_exploit=True,
-                        vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-        assert _cve_is_gold(cve, versionless=True) is False
+        assert _cve_is_gold(cve) is False
 
     def test_physical_vector_dropped(self):
-        cve = self._cve(cvss=9.0, vector="CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-        assert _cve_is_gold(cve, versionless=False) is False
+        cve = self._cve(cvss=9.0, has_exploit=True,
+                        vector="CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_is_gold(cve) is False
 
     def test_dos_only_dropped(self):
         cve = self._cve(cvss=9.8, has_exploit=True,
                         vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
-        assert _cve_is_gold(cve, versionless=False) is False
+        assert _cve_is_gold(cve) is False
 
-    # --- Versioned rules (have nmap version) ---
+    def test_admin_required_dropped(self):
+        """PR:H means the attacker already has an admin shell — post-ex, not a way in."""
+        cve = self._cve(cvss=9.8, has_exploit=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_requires_admin(cve) is True
+        assert _cve_is_gold(cve) is False
 
-    def test_versioned_exploit_low_cvss_kept(self):
-        """Rule 2: has_exploit always wins (except local/DoS already rejected)."""
+    # --- Core rule: has_exploit required ---
+
+    def test_has_exploit_kept_even_at_low_cvss(self):
+        """Exploit code exists → pentester can run it → keep regardless of CVSS."""
         cve = self._cve(cvss=5.0, has_exploit=True)
-        assert _cve_is_gold(cve, versionless=False) is True
+        assert _cve_is_gold(cve) is True
 
-    def test_versioned_no_exploit_cvss_7_kept(self):
-        """Rule 1: CVSS >= 7 (top critical) kept."""
-        cve = self._cve(cvss=7.0, has_exploit=False)
-        assert _cve_is_gold(cve, versionless=False) is True
+    def test_no_exploit_high_cvss_dropped(self):
+        """CVSS 9.8 without any PoC is theoretical noise — drop.
 
-    def test_versioned_no_exploit_cvss_6_dropped(self):
-        cve = self._cve(cvss=6.9, has_exploit=False)
-        assert _cve_is_gold(cve, versionless=False) is False
+        Regression guard for the bulk-attach pattern: Apache 2.4 NVD
+        dumps fifteen CVSS 9.x CVEs per host with no public exploit,
+        turning every web server into a Christmas tree of unusable
+        findings.
+        """
+        cve = self._cve(cvss=9.8, has_exploit=False)
+        assert _cve_is_gold(cve) is False
 
-    def test_versioned_old_cve_kept_if_relevant(self):
-        """Versioned path trusts NVD — no recency cut. Old critical stays."""
-        cve = self._cve(cvss=9.0, has_exploit=True, published="2014-01-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=False) is True
+    def test_no_exploit_cvss_7_dropped(self):
+        cve = self._cve(cvss=7.5, has_exploit=False)
+        assert _cve_is_gold(cve) is False
 
-    # --- Versionless rules (no version, wildcard CPE) ---
-
-    def test_versionless_recent_exploit_kept(self):
-        cve = self._cve(cvss=8.0, has_exploit=True, published="2024-06-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=True) is True
-
-    def test_versionless_recent_critical_kept(self):
-        cve = self._cve(cvss=9.8, has_exploit=False, published="2024-06-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=True) is True
-
-    def test_versionless_recent_cvss_8_no_exploit_dropped(self):
-        """Versionless path is stricter — without exploit need CVSS>=9."""
-        cve = self._cve(cvss=8.5, has_exploit=False, published="2024-06-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=True) is False
-
-    def test_versionless_exploit_low_cvss_dropped(self):
-        """Versionless: has_exploit alone isn't enough; need CVSS>=7 too."""
-        cve = self._cve(cvss=5.0, has_exploit=True, published="2024-06-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=True) is False
-
-    def test_versionless_old_exploit_dropped(self):
-        """Versionless path cuts old CVEs — even critical + exploit."""
-        cve = self._cve(cvss=9.8, has_exploit=True, published="2012-01-01T00:00:00.000")
-        assert _cve_is_gold(cve, versionless=True) is False
-
-    def test_versionless_missing_publish_date_treated_as_recent(self):
-        """Don't over-filter on absent publication date."""
-        cve = self._cve(cvss=9.8, has_exploit=True, published=None)
-        assert _cve_is_gold(cve, versionless=True) is True
+    def test_old_cve_kept_if_has_exploit(self):
+        """No recency gate — an ancient CVE with a working Metasploit
+        module is still usable on a legacy host."""
+        cve = self._cve(cvss=9.0, has_exploit=True)
+        assert _cve_is_gold(cve) is True
 
     # --- Vector-parser edge cases ---
 
@@ -916,82 +905,101 @@ class TestCVEIsGold:
         cve = self._cve(cvss=9.8, has_exploit=True, vector=None)
         assert _cve_is_local_only(cve) is False
         assert _cve_is_dos_only(cve) is False
-        assert _cve_is_gold(cve, versionless=False) is True
+        assert _cve_is_gold(cve) is True
 
     def test_dos_with_integrity_loss_kept(self):
-        """Mixed impact (I:L + A:H) is NOT pure DoS — keep."""
+        """Mixed impact (I:L + A:H) is NOT pure DoS — keep if has_exploit."""
         cve = self._cve(cvss=8.2, has_exploit=True,
                         vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:H")
         assert _cve_is_dos_only(cve) is False
-        assert _cve_is_gold(cve, versionless=False) is True
+        assert _cve_is_gold(cve) is True
 
-    # --- PR:H "requires admin already" filter ---
-
-    def test_pr_high_dropped_in_versioned(self):
-        """CVE that needs admin to exploit is post-exploitation noise."""
-        cve = self._cve(cvss=9.8, has_exploit=True,
-                        vector="CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
-        assert _cve_requires_admin(cve) is True
-        assert _cve_is_gold(cve, versionless=False) is False
-
-    def test_pr_low_kept(self):
-        """Low-priv (PR:L) requirement kept — auth-user post-spray pivot."""
-        cve = self._cve(cvss=8.0, has_exploit=False,
+    def test_pr_low_kept_if_has_exploit(self):
+        """Low-priv (PR:L) requirement is still exploitable post-initial-access."""
+        cve = self._cve(cvss=8.0, has_exploit=True,
                         vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H")
         assert _cve_requires_admin(cve) is False
-        assert _cve_is_gold(cve, versionless=False) is True
+        assert _cve_is_gold(cve) is True
 
-    def test_pr_none_kept(self):
-        """No privileges required (PR:N) — entry-point CVE, keep."""
+    def test_pr_none_without_exploit_dropped(self):
+        """Even unauth CVEs need a PoC to count as gold under the new rule."""
         cve = self._cve(cvss=7.5, has_exploit=False,
                         vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-        assert _cve_requires_admin(cve) is False
-        assert _cve_is_gold(cve, versionless=False) is True
+        assert _cve_is_gold(cve) is False
 
-    # --- CISA KEV override behaviour ---
+    # --- CISA KEV override ---
 
-    def test_kev_overrides_threshold_versioned(self):
-        """KEV-listed CVE is kept regardless of CVSS or has_exploit threshold."""
-        cve = CVEInfo(
-            cve_id="CVE-2024-9999",
-            cvss=4.5,
-            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-            has_exploit=False,
-            in_cisa_kev=True,
-        )
-        assert _cve_is_gold(cve, versionless=False) is True
-
-    def test_kev_overrides_recency_versionless(self):
-        """KEV-listed CVE bypasses the versionless recency cutoff."""
-        cve = CVEInfo(
-            cve_id="CVE-2014-9999",
-            cvss=8.5,
-            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-            published="2014-01-01T00:00:00.000",
-            in_cisa_kev=True,
-        )
-        assert _cve_is_gold(cve, versionless=True) is True
+    def test_kev_overrides_missing_exploit(self):
+        """KEV-listed CVE kept even without NVD-tagged exploit — CISA itself
+        is confirming active in-the-wild exploitation."""
+        cve = self._cve(cvss=4.5, has_exploit=False, in_cisa_kev=True)
+        assert _cve_is_gold(cve) is True
 
     def test_kev_does_not_override_local(self):
         """Even KEV doesn't help on a network scan if vector is local-only."""
-        cve = CVEInfo(
-            cve_id="CVE-2024-9999",
-            cvss=9.8,
-            cvss_vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-            in_cisa_kev=True,
-        )
-        assert _cve_is_gold(cve, versionless=False) is False
+        cve = self._cve(cvss=9.8, has_exploit=True, in_cisa_kev=True,
+                        vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        assert _cve_is_gold(cve) is False
 
     def test_kev_does_not_override_dos_only(self):
-        """KEV-listed pure-DoS CVE (e.g. CVE-2023-44487 HTTP/2 Rapid Reset)
-        is real attack-in-the-wild but not pentest gold on a netscan."""
-        cve = CVEInfo(
-            cve_id="CVE-2023-44487",
-            cvss=7.5,
-            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
-            in_cisa_kev=True,
+        """CVE-2023-44487 (HTTP/2 Rapid Reset) — KEV but pure DoS.
+        Attack-in-the-wild yes, pentest gold on a netscan no."""
+        cve = self._cve(cvss=7.5, has_exploit=True, in_cisa_kev=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
+        assert _cve_is_gold(cve) is False
+
+    # --- Versionless "assume latest" recency cut ---
+
+    def _cve_with_year(self, year: int, **kwargs) -> CVEInfo:
+        return CVEInfo(
+            cve_id=f"CVE-{year}-0001",
+            cvss=kwargs.get("cvss", 9.8),
+            cvss_vector=kwargs.get(
+                "vector", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            has_exploit=kwargs.get("has_exploit", True),
+            in_cisa_kev=kwargs.get("in_cisa_kev", False),
+            published=f"{year}-01-01T00:00:00.000",
         )
-        assert _cve_is_gold(cve, versionless=False) is False
+
+    def test_versionless_drops_ancient_has_exploit_cve(self):
+        """With no version anchor, we assume the service runs the latest
+        release. An exploit-db entry from 2003 targets Apache 1.3 — it has
+        a PoC on file but does not apply to a modern install. This is the
+        regression the Apache 37-host scan surfaced: relaxing the version
+        filter exposed CVE-2003-0132, CVE-2004-0809, CVE-2005-2088, etc.
+        """
+        ancient = self._cve_with_year(2005, has_exploit=True)
+        assert _cve_is_gold(ancient, versionless=True) is False
+
+    def test_versionless_keeps_recent_has_exploit(self):
+        recent = self._cve_with_year(2024, has_exploit=True)
+        assert _cve_is_gold(recent, versionless=True) is True
+
+    def test_versionless_kev_overrides_recency(self):
+        """KEV beats the recency cut — actively exploited in the wild is
+        a stronger signal than an old publication date (SambaCry 2017)."""
+        ancient_kev = self._cve_with_year(
+            2017, has_exploit=True, in_cisa_kev=True)
+        assert _cve_is_gold(ancient_kev, versionless=True) is True
+
+    def test_versioned_does_not_apply_recency(self):
+        """When we have a service version, range matching upstream already
+        proved applicability — no need for a recency proxy. An old CVE
+        with an exploit on a legacy host (OpenSSH 6.x) is real gold."""
+        old = self._cve_with_year(2014, has_exploit=True)
+        assert _cve_is_gold(old, versionless=False) is True
+        assert _cve_is_gold(old) is True  # default is versioned
+
+    def test_versionless_missing_publish_date_treated_as_recent(self):
+        """Defensive — don't over-filter on absent publication date."""
+        cve = CVEInfo(
+            cve_id="CVE-X-0001",
+            cvss=9.8,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            has_exploit=True,
+            published=None,
+        )
+        assert _cve_is_gold(cve, versionless=True) is True
 
     # --- Priority sort: KEV first, then exploit, then CVSS ---
 

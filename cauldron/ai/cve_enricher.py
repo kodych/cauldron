@@ -540,14 +540,6 @@ def _cve_is_dos_only(cve: CVEInfo) -> bool:
     return "C:N" in tokens and "I:N" in tokens and ("A:H" in tokens or "A:L" in tokens)
 
 
-def _cve_published_year(cve: CVEInfo) -> int | None:
-    """Parse publication year from the ISO timestamp NVD returns."""
-    if not cve.published:
-        return None
-    m = re.match(r"(\d{4})", cve.published)
-    return int(m.group(1)) if m else None
-
-
 def _cve_priority_key(cve: CVEInfo):
     """Sort key for pentester-useful CVE ordering.
 
@@ -566,57 +558,64 @@ def _cve_priority_key(cve: CVEInfo):
     )
 
 
-def _cve_is_gold(cve: CVEInfo, versionless: bool) -> bool:
-    """Decide whether a CVE clears the "gold-only" bar for a pentester.
+def _cve_published_year(cve: CVEInfo) -> int | None:
+    """Parse publication year from the ISO timestamp NVD returns."""
+    if not cve.published:
+        return None
+    m = re.match(r"(\d{4})", cve.published)
+    return int(m.group(1)) if m else None
 
-    Mirrors the enricher strategy:
-      1. Version + public exploit  → always keep, unless local/physical.
-      2. Version, no exploit       → keep only if CVSS >= 7.0 (top critical).
-      3. No version (assume latest) → stricter: recent CVE AND (has_exploit
-         OR CVSS >= 9.0). Stops old high-CVSS CVEs from bulk-attaching to
-         modern deployments just because NVD listed them under the product.
 
-    Cross-cutting rejects applied in both modes:
-      - AV:L / AV:P — local or physical attack vector.
-      - Pure availability impact (DoS only).
+# Versionless "assume latest" recency horizon. NVD indexes exploit-db entries
+# from the early 2000s that still carry has_exploit=True but exploit Apache 1.3
+# or OpenSSH 3.x — not applicable to a current install. Five years is the
+# cutoff that drops that class while keeping CVEs like CVE-2017-7494 (still
+# relevant on legacy Samba in enterprise environments) when they are KEV.
+_VERSIONLESS_RECENCY_YEARS = 5
+
+
+def _cve_is_gold(cve: CVEInfo, versionless: bool = False) -> bool:
+    """Decide whether a CVE clears the "actionable gold" bar for a pentester.
+
+    Single gate: a CVE must have a public exploit to count as gold. When we
+    have a service version, ``_cve_applies_to`` upstream has already
+    confirmed the CVE's version range covers it. When we do not, we assume
+    the service runs the latest release — so we additionally drop exploits
+    that target ancient releases only (``versionless`` path, recency cut).
+
+    "Theoretical critical" CVEs (CVSS 9.x with no PoC) were the dominant
+    noise pattern on real client scans: dozens of Apache/Samba CVEs
+    bulk-attached to every host with no actionable follow-up. Requiring
+    has_exploit cuts that entire class while preserving every CISA-KEV
+    entry via the override below.
+
+    Order (first matching wins):
+      1. Hard rejects — AV:L/AV:P and pure-DoS drop even for KEV.
+         CVE-2023-44487 (HTTP/2 Rapid Reset) is in CISA KEV but pure DoS.
+      2. CISA-KEV soft override — actively exploited in the wild beats the
+         has_exploit gate AND the versionless recency cut.
+      3. Admin-required reject — PR:H CVEs are post-exploitation, not a way in.
+      4. Versionless recency reject — for "assume latest" queries, drop
+         exploits registered against releases too old to still be running.
+      5. Actionable-exploit gate — has_exploit.
     """
-    # Hard rejects apply to every CVE regardless of CVSS, recency or KEV
-    # status: local/physical vectors and pure DoS have no pentest gold for
-    # a network engagement. CVE-2023-44487 (HTTP/2 Rapid Reset) is in CISA
-    # KEV but is pure DoS — listing it under "gold" would mislead.
     if _cve_is_local_only(cve):
         return False
     if _cve_is_dos_only(cve):
         return False
 
-    # CISA-KEV is the strongest signal short of those hard rejects: the US
-    # government has confirmed this CVE is being used in real attacks right
-    # now. Override CVSS/recency/PR:H thresholds — but not the hard rejects
-    # above. KEV beats heuristics, not vector reality.
     if cve.in_cisa_kev:
         return True
 
-    # CVEs that need admin rights to exploit are post-exploitation — a
-    # pentester with admin already has a shell, a pentester without admin
-    # cannot reach this precondition from the outside.
     if _cve_requires_admin(cve):
         return False
 
-    cvss = cve.cvss or 0.0
-
     if versionless:
         year = _cve_published_year(cve)
-        current_year = datetime.now(timezone.utc).year
-        if year is not None and year < current_year - 5:
+        if year is not None and year < datetime.now(timezone.utc).year - _VERSIONLESS_RECENCY_YEARS:
             return False
-        if cve.has_exploit and cvss >= 7.0:
-            return True
-        return cvss >= 9.0
 
-    # Versioned path
-    if cve.has_exploit:
-        return True
-    return cvss >= 7.0
+    return cve.has_exploit
 
 
 # --- NVD API queries ---
@@ -694,9 +693,9 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
         return None
 
     # Coarse pentester filter first (CWE + pattern), then the gold filter
-    # enforces the three-rule enricher strategy: versioned services demand
-    # has_exploit OR CVSS>=7; versionless services demand recency AND (exploit
-    # AND CVSS>=7) OR CVSS>=9. Local/DoS-only CVEs drop in both paths.
+    # requires an actionable public exploit (KEV overrides). Hard rejects
+    # (local/DoS/admin-required) apply in both paths; the versionless path
+    # also cuts CVEs published too long ago to plausibly affect "latest".
     cves = [c for c in cves if _is_pentester_relevant(c)]
     cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version)]
 
@@ -736,7 +735,9 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     ) or []
 
     # Same two-stage filter as the CPE path — coarse CWE+pattern relevance,
-    # then the strict gold-only bar tuned for versioned vs versionless.
+    # then the strict actionable-exploit gate with KEV soft override. The
+    # versionless flag tracks whether we had a real version to anchor the
+    # CVE against, same semantics as the CPE path.
     cves = [c for c in cves if _is_pentester_relevant(c)]
     cves = [c for c in cves if _cve_is_gold(c, versionless=versionless)]
 
