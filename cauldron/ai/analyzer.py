@@ -485,7 +485,7 @@ If unsure, KEEP. Missing a real vuln is worse than keeping noise.
 Respond with ONLY JSON:
 [{{"id": "host-N", "suggest_target": true, "vulns": [
   {{"cve_id": "CVE-YYYY-NNNNN", "port": 443, "verdict": "keep"}},
-  {{"cve_id": "CAULDRON-041", "port": 5432, "verdict": "keep"}},
+  {{"cve_id": "CAULDRON-042", "port": 6379, "verdict": "keep"}},
   {{"cve_id": "CVE-YYYY-NNNNN", "port": 22, "verdict": "dismiss", "reason": "Local privesc, host not owned"}}
 ]}}]
 

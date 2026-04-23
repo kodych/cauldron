@@ -208,7 +208,7 @@ class TestAttackPaths:
             session.run("""
                 MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
                 CREATE (s)-[:HAS_VULN]->(:Vulnerability {
-                    cve_id: 'CAULDRON-040', cvss: 5.0,
+                    cve_id: 'CAULDRON-042', cvss: 5.0,
                     confidence: 'check', has_exploit: false
                 })
             """)
