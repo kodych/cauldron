@@ -14,6 +14,7 @@ from neo4j import Session
 
 from cauldron.graph.connection import get_session, init_schema
 from cauldron.graph.models import Host, ScanResult, Service
+from cauldron.graph.topology import _ip_to_segment
 
 
 def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
@@ -61,7 +62,7 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
             stats["relationships_created"] += 1
 
             # Determine network segment and link
-            segment = _get_segment_cidr(host.ip)
+            segment = _ip_to_segment(host.ip)
             if segment:
                 _upsert_segment(session, segment)
                 _link_host_to_segment(session, host.ip, segment)
@@ -288,7 +289,6 @@ def _upsert_host_script(session: Session, host_ip: str, script) -> None:
 def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: int) -> None:
     """Create ROUTE_THROUGH relationship from traceroute data."""
     # Validate hop IP before creating Host node
-    import ipaddress
     try:
         ipaddress.ip_address(hop_ip)
     except (ValueError, TypeError):
@@ -313,21 +313,6 @@ def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: i
         hop_ip=hop_ip,
         ttl=ttl,
     )
-
-
-def _get_segment_cidr(ip: str) -> str | None:
-    """Determine the network segment for an IP address.
-
-    Uses configurable prefix length (default from settings.segment_prefix_len).
-    """
-    from cauldron.config import settings
-
-    try:
-        addr = ipaddress.ip_address(ip)
-        network = ipaddress.ip_network(f"{addr}/{settings.segment_prefix_len}", strict=False)
-        return str(network)
-    except ValueError:
-        return None
 
 
 def get_graph_stats() -> dict:
