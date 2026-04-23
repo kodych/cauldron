@@ -1,8 +1,15 @@
 """Rule-based host role classification.
 
-Classifies hosts by analyzing open port patterns and service banners.
-Designed for real-world pentest data: handles multi-role hosts, partial scans,
-and high-port ephemeral services.
+Classifies hosts from three evidence sources:
+
+1. Port patterns — what services are listening. Probabilistic (SMB alone
+   could be DC or file server; DC-triad ports are near-certain).
+2. Service banners — what product+version each service advertises. Higher
+   precision than ports (``Microsoft Exchange Server`` leaves no ambiguity).
+3. Hostname labels — admin intent. When naming conventions are followed
+   (``dc01``, ``mail-prod``, ``sqlsrv01``, ``vcenter``) the label is the
+   strongest single signal; it survives filtered-port scans and partial
+   service detection where the other two fail.
 
 Rule-based engine runs first (fast, no API cost). AI classification
 handles edge cases and is optional.
@@ -10,6 +17,7 @@ handles edge cases and is optional.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from cauldron.graph.models import Host, HostRole, Service
@@ -211,6 +219,81 @@ PRODUCT_KEYWORDS: dict[str, HostRole] = {
     "configuration manager": HostRole.MANAGEMENT,
 }
 
+# Hostname label tokens that hint at a role. Admins name hosts by function
+# (``dc01``, ``mail-prod``, ``sqlsrv01``, ``vcenter``); when the naming
+# convention is followed, the label is near-ground-truth about role even
+# when the port scan is partial/filtered. Token match is strict (exact set
+# intersection after stripping digits/separators) so ``nsg01`` does not
+# collide with ``ns``, and ``database-proxy`` does not match ``db``.
+HOSTNAME_TOKENS: dict[HostRole, set[str]] = {
+    HostRole.DOMAIN_CONTROLLER: {
+        "dc", "pdc", "addc", "adds", "domctrl", "domcontroller",
+    },
+    HostRole.MAIL_SERVER: {
+        "mail", "mailserver", "smtp", "mx",
+        "exchange", "exch", "exchsrv",
+        "imap", "pop", "pop3",
+    },
+    HostRole.DATABASE: {
+        "db", "dbsrv", "database",
+        "sql", "sqlsrv", "mssql", "mssqlserver", "sqlserver",
+        "mysql", "mariadb",
+        "postgres", "postgresql", "pgsql", "psql",
+        "oracle", "ora",
+        "mongo", "mongodb", "redis",
+    },
+    HostRole.WEB_SERVER: {
+        "www", "web", "webs", "webserver", "webapp",
+        "nginx", "apache", "tomcat", "httpd", "iis",
+    },
+    HostRole.FILE_SERVER: {
+        "fs", "fileserver", "nas", "share", "fileshare", "files",
+    },
+    HostRole.HYPERVISOR: {
+        "esx", "esxi", "vcenter", "vcsa",
+        "proxmox", "pve",
+        "hyperv", "vmware", "vmhost",
+    },
+    HostRole.PRINTER: {
+        "print", "printer", "prn", "jetdirect",
+    },
+    HostRole.NETWORK_EQUIPMENT: {
+        "router", "rtr", "switch", "sw", "gateway", "gw",
+    },
+    HostRole.SIEM: {
+        "siem", "splunk",
+        "elk", "elastic", "kibana", "logstash",
+        "graylog", "wazuh", "ossec", "syslog",
+    },
+    HostRole.CI_CD: {
+        "jenkins", "gitlab", "gitea", "teamcity", "bamboo", "cicd",
+    },
+    HostRole.VPN_GATEWAY: {
+        "vpn", "openvpn", "wireguard", "wg", "ipsec",
+    },
+    HostRole.MONITORING: {
+        "monitor", "monitoring",
+        "zabbix", "nagios", "icinga",
+        "prometheus", "grafana",
+    },
+    HostRole.BACKUP: {
+        "backup", "bkp", "veeam", "bacula", "acronis", "commvault",
+    },
+    HostRole.MANAGEMENT: {
+        "sccm", "wsus", "mecm", "mgmt",
+    },
+    HostRole.DNS_SERVER: {
+        "dns", "ns", "bind", "named", "resolver",
+    },
+    HostRole.PROXY: {
+        "proxy", "squid",
+    },
+    HostRole.VOIP: {
+        "voip", "sip", "pbx", "asterisk", "freeswitch",
+    },
+}
+
+
 # Roles that take priority when there's a conflict.
 # Higher number = higher priority.
 ROLE_PRIORITY: dict[HostRole, int] = {
@@ -246,11 +329,13 @@ def classify_host(host: Host) -> ClassificationResult:
     4. Remaining matches become secondary roles
     """
     open_ports = host.open_ports
-    if not open_ports:
+    hostname_tokens = _hostname_tokens(host.hostname)
+
+    if not open_ports and not hostname_tokens:
         return ClassificationResult(
             role=HostRole.UNKNOWN,
             confidence=0.0,
-            reasons=["No open ports detected"],
+            reasons=["No open ports or recognizable hostname"],
             secondary_roles=[],
         )
 
@@ -287,7 +372,24 @@ def classify_host(host: Host) -> ClassificationResult:
                         reasons[role] = []
                     reasons[role].append(f"product '{keyword}' on port {service.port}")
 
-    # Phase 3: Suppress low-confidence roles that conflict with high-confidence ones
+    # Phase 3: Hostname role-hint matching. A label like ``dc01`` or
+    # ``mail-prod`` is admin intent — near-ground-truth about role. The
+    # 0.70 floor matches a minimal port-pattern rule, so a filtered-port
+    # host with a descriptive name still classifies instead of falling
+    # into ``unknown``. When ports already give a strong signal (>0.70),
+    # they keep winning — hostname never overrides port evidence.
+    if hostname_tokens:
+        for role, tokens in HOSTNAME_TOKENS.items():
+            if tokens & hostname_tokens:
+                baseline = 0.70
+                current = scores.get(role, 0.0)
+                if baseline > current:
+                    scores[role] = baseline
+                    reasons.setdefault(role, []).append(
+                        f"hostname '{host.hostname}'",
+                    )
+
+    # Phase 4: Suppress low-confidence roles that conflict with high-confidence ones
     # e.g., DC always has SMB (445) — don't also classify as file_server
     if HostRole.DOMAIN_CONTROLLER in scores and scores[HostRole.DOMAIN_CONTROLLER] >= 0.80:
         # DC has DNS, SMB, web (for ADCS etc.) — suppress these
@@ -341,7 +443,7 @@ def classify_host(host: Host) -> ClassificationResult:
             secondary_roles=[],
         )
 
-    # Phase 4: Pick primary role (highest score, then priority)
+    # Phase 5: Pick primary role (highest score, then priority)
     sorted_roles = sorted(
         scores.items(),
         key=lambda x: (x[1], ROLE_PRIORITY.get(x[0], 0)),
@@ -378,3 +480,22 @@ def _service_text(service: Service) -> str:
     if service.extra_info:
         parts.append(service.extra_info.lower())
     return " ".join(parts)
+
+
+def _hostname_tokens(hostname: str | None) -> set[str]:
+    """Extract lowercase alphabetic tokens from the hostname's first label.
+
+    Strips the FQDN suffix (``dc01.corp.local`` → ``dc01``), then splits on
+    anything that is not a letter so digits and separators do not pollute
+    the token set. ``CORP-DC01-PROD.example.com`` → ``{'corp', 'dc', 'prod'}``.
+
+    Token matching against HOSTNAME_TOKENS is exact set intersection — this
+    is the whole point of tokenising rather than substring-checking: ``nsg01``
+    yields ``{'nsg'}`` which does not collide with the DNS token ``ns``, and
+    ``database-proxy`` yields ``{'database', 'proxy'}`` which does not match
+    the DATABASE token ``db`` (the role set lists ``database`` explicitly).
+    """
+    if not hostname:
+        return set()
+    label = hostname.split(".", 1)[0].lower()
+    return set(re.findall(r"[a-z]+", label))

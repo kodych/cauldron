@@ -10,19 +10,21 @@ def _host(
     ports: list[int],
     products: dict[int, str] | None = None,
     protocol: str = "tcp",
+    hostname: str | None = None,
 ) -> Host:
     """Create a test host with given open ports and optional products.
 
     Protocol defaults to TCP to match the vast majority of role rules. Pass
     ``protocol='udp'`` to exercise UDP-native service classifications (VPNs,
-    SNMP, DNS-only, SIP).
+    SNMP, DNS-only, SIP). Pass ``hostname`` to exercise admin-intent role
+    hints from the DNS label.
     """
     services = []
     products = products or {}
     for port in ports:
         svc = Service(port=port, protocol=protocol, state="open", name=None, product=products.get(port))
         services.append(svc)
-    return Host(ip="10.0.0.1", state="up", services=services)
+    return Host(ip="10.0.0.1", hostname=hostname, state="up", services=services)
 
 
 class TestDomainController:
@@ -433,3 +435,99 @@ class TestBackupImproved:
         result = classify_host(host)
         assert result.role == HostRole.BACKUP
         assert HostRole.FILE_SERVER not in result.secondary_roles
+
+
+class TestHostnameSignals:
+    """Hostname is admin intent — the strongest single signal of role.
+
+    Earlier the classifier only looked at open ports + banners, so a host
+    named ``dc01.corp.local`` whose Kerberos/LDAP ports were filtered fell
+    into ``unknown`` with nothing to go on. Hostname token matching gives
+    that class of host a 0.70 floor (equivalent to a minimal port match).
+    """
+
+    def test_filtered_dc_classifies_from_hostname(self):
+        host = _host([], hostname="dc01.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.DOMAIN_CONTROLLER
+        assert result.confidence >= 0.70
+
+    def test_mail_hostname_alone(self):
+        host = _host([], hostname="mail-prod.example.com")
+        result = classify_host(host)
+        assert result.role == HostRole.MAIL_SERVER
+
+    def test_database_hostname_alone(self):
+        host = _host([], hostname="sqlsrv01.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.DATABASE
+
+    def test_vcenter_hostname_alone(self):
+        host = _host([], hostname="vcenter.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.HYPERVISOR
+
+    def test_wireguard_hostname_alone(self):
+        host = _host([], hostname="wg01.example.com")
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+
+    def test_ns_matches_dns(self):
+        host = _host([], hostname="ns01.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.DNS_SERVER
+
+    def test_nsg_does_not_match_dns(self):
+        """Azure NSG (``nsg01``) must not collide with DNS token ``ns``.
+
+        Tokenisation yields {'nsg'}, not {'ns', 'g'} — exact set
+        intersection keeps this boundary crisp without regex gymnastics.
+        """
+        host = _host([], hostname="nsg01.example.local")
+        result = classify_host(host)
+        assert result.role == HostRole.UNKNOWN
+
+    def test_hostname_does_not_override_strong_port_evidence(self):
+        """Host named ``dc01`` but actually serving nginx web stack.
+
+        Strong port+banner match (web_server ~0.85 after banner boost)
+        beats the hostname baseline of 0.70 — a mis-named host still gets
+        the role its ports prove, not the role its name claims.
+        """
+        host = _host(
+            [80, 443],
+            products={80: "nginx", 443: "nginx"},
+            hostname="dc01.example.local",
+        )
+        result = classify_host(host)
+        assert result.role == HostRole.WEB_SERVER
+
+    def test_hostname_lifts_partial_port_match(self):
+        """Database on a non-standard port + ``sql01`` hostname.
+
+        Port match alone is weak (MySQL on 3306 gives 0.85; without it,
+        we have nothing). Hostname tips the classification.
+        """
+        host = _host([], hostname="sql01-prod.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.DATABASE
+
+    def test_hostname_with_matching_ports_confirms(self):
+        """Ports + hostname align — port evidence keeps winning, hostname
+        does not downgrade it."""
+        host = _host([88, 389, 636, 3268], hostname="dc01.corp.local")
+        result = classify_host(host)
+        assert result.role == HostRole.DOMAIN_CONTROLLER
+        assert result.confidence >= 0.90  # ports give 0.95, hostname is a no-op here
+
+    def test_no_ports_no_hostname_is_unknown(self):
+        host = _host([], hostname=None)
+        result = classify_host(host)
+        assert result.role == HostRole.UNKNOWN
+        assert result.confidence == 0.0
+
+    def test_unrecognized_hostname_falls_through(self):
+        """Hostname with no role-hint tokens → same as no hostname."""
+        host = _host([], hostname="appserver42.internal")
+        result = classify_host(host)
+        assert result.role == HostRole.UNKNOWN
