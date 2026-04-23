@@ -23,8 +23,8 @@ def _compress_ip_list(ips: list[str]) -> str:
     """Compact IP list into readable ranges, keeping every address.
 
     Example:
-        ["172.31.161.1", "172.31.161.2", "172.31.161.3", "172.31.162.4"]
-        → "172.31.161.1-3, 172.31.162.4"
+        ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.1.4"]
+        → "10.0.0.1-3, 10.0.1.4"
 
     This lets a report show 42 affected hosts in one line when they sit in
     dense subnets without dropping any IP. Non-IPv4 strings are passed

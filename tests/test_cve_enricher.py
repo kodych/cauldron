@@ -529,8 +529,9 @@ class TestEnrichService:
         wildcard version, the original service version must be threaded
         through to the follow-up query. Without this the applicability
         filter falls into the "versionless" branch and drops every modern
-        vendor CVE pinned to a specific major.minor — the bug that hid
-        CVE-2024-37085 (ESXi KEV) on the dipocket scan.
+        vendor CVE pinned to a specific major.minor — the bug class that
+        hides CVE-2024-37085 (ESXi KEV) on real enterprise scans where
+        the deployed patch level never matches the vendor's major.minor.
         """
         cache = CVECache(tmp_path / "cache.json")
         # First call (specific version) returns empty; second (relaxed)

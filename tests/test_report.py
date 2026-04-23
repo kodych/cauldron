@@ -39,8 +39,8 @@ def test_compress_ip_list_mixed_ranges_and_singles():
 
 
 def test_compress_ip_list_multiple_subnets():
-    ips = ["172.31.161.1", "172.31.161.2", "172.31.161.3", "172.31.162.4"]
-    assert _compress_ip_list(ips) == "172.31.161.1-3, 172.31.162.4"
+    ips = ["10.10.20.1", "10.10.20.2", "10.10.20.3", "10.10.21.4"]
+    assert _compress_ip_list(ips) == "10.10.20.1-3, 10.10.21.4"
 
 
 def test_compress_ip_list_deduplicates():
