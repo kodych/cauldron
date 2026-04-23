@@ -245,12 +245,12 @@ def classify_host(host: Host) -> ClassificationResult:
     3. Pick highest-scoring role as primary
     4. Remaining matches become secondary roles
     """
-    open_ports = host.open_tcp_ports
+    open_ports = host.open_ports
     if not open_ports:
         return ClassificationResult(
             role=HostRole.UNKNOWN,
             confidence=0.0,
-            reasons=["No open TCP ports detected"],
+            reasons=["No open ports detected"],
             secondary_roles=[],
         )
 

@@ -103,14 +103,16 @@ class Host:
     role_confidence: float = 0.0
 
     @property
-    def open_ports(self) -> list[int]:
-        """List of open port numbers."""
-        return [s.port for s in self.services if s.state == "open"]
+    def open_ports(self) -> set[int]:
+        """Set of open port numbers across every protocol.
 
-    @property
-    def open_tcp_ports(self) -> set[int]:
-        """Set of open TCP port numbers."""
-        return {s.port for s in self.services if s.state == "open" and s.protocol == "tcp"}
+        Protocol-agnostic by design: role classification treats a port number
+        as the same signal whether it arrived over TCP or UDP. A host that
+        exposes only UDP/161 is still a router, UDP/500+4500 is still a VPN
+        gateway, UDP/51820 is still WireGuard. Filtering to TCP-only here
+        would lose every UDP-native service class in one line of code.
+        """
+        return {s.port for s in self.services if s.state == "open"}
 
 
 @dataclass

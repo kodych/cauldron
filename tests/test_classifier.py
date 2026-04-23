@@ -6,12 +6,21 @@ from cauldron.ai.classifier import classify_host, classify_hosts
 from cauldron.graph.models import Host, HostRole, Service
 
 
-def _host(ports: list[int], products: dict[int, str] | None = None) -> Host:
-    """Create a test host with given open TCP ports and optional products."""
+def _host(
+    ports: list[int],
+    products: dict[int, str] | None = None,
+    protocol: str = "tcp",
+) -> Host:
+    """Create a test host with given open ports and optional products.
+
+    Protocol defaults to TCP to match the vast majority of role rules. Pass
+    ``protocol='udp'`` to exercise UDP-native service classifications (VPNs,
+    SNMP, DNS-only, SIP).
+    """
     services = []
     products = products or {}
     for port in ports:
-        svc = Service(port=port, protocol="tcp", state="open", name=None, product=products.get(port))
+        svc = Service(port=port, protocol=protocol, state="open", name=None, product=products.get(port))
         services.append(svc)
     return Host(ip="10.0.0.1", state="up", services=services)
 
@@ -317,6 +326,45 @@ class TestEdgeCases:
         assert hosts[0].role == HostRole.DOMAIN_CONTROLLER
         assert hosts[1].role == HostRole.WEB_SERVER
         assert hosts[2].role == HostRole.DATABASE
+
+
+class TestUdpOnlyHosts:
+    """Regression: hosts exposing only UDP services must still classify.
+
+    The earlier classifier filtered down to TCP ports before matching, so
+    every UDP-native service class (WireGuard, OpenVPN, IPSec, pure-UDP DNS,
+    SNMP-only network gear, SIP VoIP) silently fell into ``unknown``.
+    """
+
+    def test_wireguard_udp_only(self):
+        host = _host([51820], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+
+    def test_ipsec_udp_only(self):
+        host = _host([500, 4500], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+
+    def test_openvpn_udp_only(self):
+        host = _host([1194], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.VPN_GATEWAY
+
+    def test_snmp_udp_only(self):
+        host = _host([161], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.NETWORK_EQUIPMENT
+
+    def test_sip_udp_only(self):
+        host = _host([5060], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.VOIP
+
+    def test_dns_udp_only(self):
+        host = _host([53], protocol="udp")
+        result = classify_host(host)
+        assert result.role == HostRole.DNS_SERVER
 
     def test_windows_server_generic(self):
         """Generic Windows server with just RPC + SMB + RDP."""

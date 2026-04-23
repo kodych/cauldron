@@ -48,7 +48,7 @@ def test_parse_minimal_xml():
     assert host.ip == "10.0.0.1"
     assert host.hostname == "server1.local"
     assert len(host.services) == 3
-    assert host.open_ports == [22, 80, 443]
+    assert host.open_ports == {22, 80, 443}
 
     ssh = host.services[0]
     assert ssh.port == 22
