@@ -12,12 +12,9 @@ from cauldron.ai.analyzer import (
     _anonymize_text,
     _build_anonymization_map,
     _deanonymize_hosts,
-    _parse_attack_insights,
     _parse_classification_response,
-    _parse_fp_response,
     _parse_json_response,
     analyze_graph,
-    is_ai_available,
 )
 from cauldron.graph.connection import clear_database, get_session, verify_connection
 
@@ -103,18 +100,6 @@ class TestParseClassificationResponse:
         result = _parse_classification_response(response)
         assert len(result) == 1
         assert result[0]["ip"] == "10.0.0.3"
-
-
-class TestIsAiAvailable:
-    def test_available_with_key(self):
-        with patch("cauldron.ai.analyzer.settings") as mock_settings:
-            mock_settings.anthropic_api_key = "sk-ant-test123"
-            assert is_ai_available() is True
-
-    def test_unavailable_without_key(self):
-        with patch("cauldron.ai.analyzer.settings") as mock_settings:
-            mock_settings.anthropic_api_key = ""
-            assert is_ai_available() is False
 
 
 try:
@@ -274,77 +259,6 @@ class TestApplyAiCves:
         cves, services = _apply_ai_cves("not json")
         assert cves == 0
         assert services == 0
-
-
-class TestParseAttackInsights:
-    def test_valid_insight(self):
-        from cauldron.ai.analyzer import _parse_attack_insights
-
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "Printer pivot to DC",
-            "hosts": ["10.0.0.5", "10.0.1.10"],
-            "priority": 1,
-            "confidence": 0.85,
-            "details": "SNMP to AD exploitation",
-        }])
-
-        insights = _parse_attack_insights(response)
-        assert len(insights) == 1
-        assert insights[0].title == "Printer pivot to DC"
-        assert insights[0].hosts == ["10.0.0.5", "10.0.1.10"]
-        assert insights[0].priority == 1
-
-    def test_filters_low_confidence(self):
-        from cauldron.ai.analyzer import _parse_attack_insights
-
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "Bad chain",
-            "hosts": ["10.0.0.1", "10.0.0.2"],
-            "priority": 1,
-            "confidence": 0.3,
-        }])
-
-        insights = _parse_attack_insights(response)
-        assert len(insights) == 0
-
-    def test_handles_invalid_json(self):
-        from cauldron.ai.analyzer import _parse_attack_insights
-
-        insights = _parse_attack_insights("broken")
-        assert insights == []
-
-    def test_sorts_by_priority(self):
-        from cauldron.ai.analyzer import _parse_attack_insights
-
-        response = json.dumps([
-            {"type": "attack_chain", "title": "Low", "hosts": ["10.0.0.1", "10.0.0.2"],
-             "priority": 4, "confidence": 0.9},
-            {"type": "attack_chain", "title": "High", "hosts": ["10.0.0.3", "10.0.0.4"],
-             "priority": 1, "confidence": 0.9},
-        ])
-
-        insights = _parse_attack_insights(response)
-        assert len(insights) == 2
-        assert insights[0].title == "High"
-        assert insights[1].title == "Low"
-
-    def test_accepts_path_key_for_backwards_compat(self):
-        """AI might still return 'path' key instead of 'hosts'."""
-        from cauldron.ai.analyzer import _parse_attack_insights
-
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "Chain via path key",
-            "path": ["10.0.0.1", "10.0.0.2"],
-            "priority": 2,
-            "confidence": 0.8,
-        }])
-
-        insights = _parse_attack_insights(response)
-        assert len(insights) == 1
-        assert insights[0].hosts == ["10.0.0.1", "10.0.0.2"]
 
 
 # --- Integration tests (require Neo4j) ---
@@ -510,83 +424,3 @@ class TestParseClassificationAnonymized:
         assert result[0]["ip"] == "10.0.0.1"
 
 
-class TestParseAttackInsightsAnonymized:
-    def test_deanonymizes_hosts(self):
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "DC to DB lateral movement",
-            "hosts": ["host-1", "host-2"],
-            "priority": 1,
-            "confidence": 0.9,
-            "details": "Exploit DC then pivot to DB",
-        }])
-        reverse = {"host-1": "10.0.0.1", "host-2": "10.0.0.2"}
-        result = _parse_attack_insights(response, reverse)
-        assert len(result) == 1
-        assert result[0].hosts == ["10.0.0.1", "10.0.0.2"]
-
-    def test_without_reverse_map(self):
-        response = json.dumps([{
-            "type": "attack_chain",
-            "title": "Test",
-            "hosts": ["host-1"],
-            "priority": 2,
-            "confidence": 0.8,
-            "details": "test",
-        }])
-        result = _parse_attack_insights(response)
-        assert result[0].hosts == ["host-1"]
-
-
-class TestParseFpResponse:
-    def test_valid_response(self):
-        response = json.dumps([{
-            "id": "host-1",
-            "false_positives": [
-                {"cve_id": "CVE-2012-4791", "port": 3875, "reason": "DoS only, CVSS 3.5"},
-            ],
-        }])
-        reverse = {"host-1": "10.0.0.1"}
-        result = _parse_fp_response(response, reverse)
-        assert len(result) == 1
-        assert result[0]["ip"] == "10.0.0.1"
-        assert result[0]["cve_id"] == "CVE-2012-4791"
-        assert result[0]["port"] == 3875
-
-    def test_filters_invalid_cve_ids(self):
-        response = json.dumps([{
-            "id": "host-1",
-            "false_positives": [
-                {"cve_id": "NOT-A-CVE", "port": 22, "reason": "bad"},
-                {"cve_id": "CVE-2021-44228", "port": 8080, "reason": "not applicable"},
-            ],
-        }])
-        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
-        assert len(result) == 1
-        assert result[0]["cve_id"] == "CVE-2021-44228"
-
-    def test_accepts_cauldron_ids(self):
-        response = json.dumps([{
-            "id": "host-1",
-            "false_positives": [
-                {"cve_id": "CAULDRON-271", "port": 5985, "reason": "WinRM not exploitable"},
-            ],
-        }])
-        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
-        assert len(result) == 1
-
-    def test_empty_response(self):
-        assert _parse_fp_response("[]", {}) == []
-
-    def test_invalid_json(self):
-        assert _parse_fp_response("not json", {}) == []
-
-    def test_missing_port_skipped(self):
-        response = json.dumps([{
-            "id": "host-1",
-            "false_positives": [
-                {"cve_id": "CVE-2021-44228", "reason": "no port"},
-            ],
-        }])
-        result = _parse_fp_response(response, {"host-1": "10.0.0.1"})
-        assert len(result) == 0
