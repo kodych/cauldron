@@ -103,15 +103,6 @@ def _parse_host(elem: ET.Element) -> Host | None:
         except (ValueError, TypeError):
             host.os_accuracy = None
 
-    # TTL (from the first port's IP ID or from distance)
-    distance_elem = elem.find("distance")
-    if distance_elem is not None:
-        try:
-            # Distance gives hops, not TTL directly, but useful
-            pass
-        except (ValueError, TypeError):
-            pass
-
     # Ports & Services
     for port_elem in elem.findall("ports/port"):
         service = _parse_port(port_elem)

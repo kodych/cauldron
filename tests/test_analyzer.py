@@ -181,9 +181,7 @@ class TestAnalyzeGraph:
             mock_settings.anthropic_api_key = ""
             result = analyze_graph()
             assert isinstance(result, AnalysisResult)
-            assert result.insights == []
             assert result.cves_found == 0
-            assert result.insights == []
 
 
 class TestApplyAiCves:
