@@ -712,14 +712,34 @@ def collect(filter_name: str | None, port: int | None, role: str | None,
 
 
 @cli.command()
-@click.option("--host", "-h", default="0.0.0.0", help="Bind address")
+@click.option(
+    "--host",
+    "-h",
+    default="127.0.0.1",
+    help="Bind address (default: 127.0.0.1 — loopback only). "
+         "Pass 0.0.0.0 to expose on the local network.",
+)
 @click.option("--port", "-p", default=8000, type=int, help="Port number")
 @click.option("--reload", is_flag=True, default=False, help="Auto-reload on code changes")
 def serve(host: str, port: int, reload: bool):
-    """Start the REST API server."""
+    """Start the REST API server.
+
+    Defaults to loopback only. The API ships without authentication — on a
+    pentest workstation connected to the engagement network, binding to
+    0.0.0.0 would let anyone on that network call DELETE /api/v1/reset and
+    wipe the graph mid-engagement. Opt in explicitly with ``-h 0.0.0.0``
+    only when you understand that trade-off.
+    """
     console.print(BANNER)
     console.print(f"[bold cyan]Starting API server on {host}:{port}[/bold cyan]")
-    console.print(f"[dim]  Docs: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs[/dim]")
+    if host == "0.0.0.0":
+        console.print(
+            "[bold yellow]⚠  Bound to 0.0.0.0 — the API has no authentication. "
+            "Anyone on this network can read and modify the graph, including "
+            "DELETE /api/v1/reset.[/bold yellow]",
+        )
+    display_host = "localhost" if host in ("0.0.0.0", "127.0.0.1") else host
+    console.print(f"[dim]  Docs: http://{display_host}:{port}/docs[/dim]")
     console.print()
 
     import uvicorn
