@@ -1,5 +1,26 @@
 @import "tailwindcss";
 
+/* Brand palette. Anchors: `#23334d` (cauldron dark side) and `#4c5d77`
+   (cauldron light side) straight from the logo. The rest of the scale
+   is interpolated lighter / darker so `text-steel-400` remains legible
+   on dark bg-gray-950 and `bg-steel-600` holds up as a primary button
+   fill. Used in place of Tailwind's default indigo so the UI accent
+   colour reads as part of the same visual system as the logo instead
+   of a generic SaaS indigo. */
+@theme {
+  --color-steel-50:  #dae1ec;
+  --color-steel-100: #bfc9da;
+  --color-steel-200: #a0aec2;
+  --color-steel-300: #8fa3c0;
+  --color-steel-400: #6d82a5;
+  --color-steel-500: #4c5d77;
+  --color-steel-600: #3d4e6b;
+  --color-steel-700: #2d3c5a;
+  --color-steel-800: #23334d;
+  --color-steel-900: #1a2740;
+  --color-steel-950: #111a2e;
+}
+
 body {
   margin: 0;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;

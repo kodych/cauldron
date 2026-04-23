@@ -21,7 +21,7 @@ export function StatsPanel({ refreshKey = 0 }: { refreshKey?: number }) {
   if (!stats) return null;
 
   const statCards = [
-    { label: 'Hosts', value: stats.hosts, color: 'text-indigo-400' },
+    { label: 'Hosts', value: stats.hosts, color: 'text-steel-400' },
     { label: 'Services', value: stats.services, color: 'text-blue-400' },
     { label: 'Vulnerabilities', value: stats.vulnerabilities, color: 'text-red-400' },
     { label: 'Findings', value: stats.findings ?? 0, color: 'text-orange-400' },

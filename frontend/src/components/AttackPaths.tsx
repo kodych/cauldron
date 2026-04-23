@@ -118,7 +118,7 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
               onClick={() => { setFilter(f.value); setSelectedIndex(null); onSelectPath?.(null); }}
               className={`rounded px-1.5 py-0.5 text-xs transition-colors ${
                 filter === f.value
-                  ? 'bg-indigo-600 text-white'
+                  ? 'bg-steel-600 text-white'
                   : 'bg-gray-800 text-gray-500 hover:text-gray-300'
               }`}
               title={`${f.tooltip} — ${count} paths`}
@@ -134,7 +134,7 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
       {data.summary && (
         <div className="grid grid-cols-3 gap-2 p-3 border-b border-gray-800">
           <div className="text-center">
-            <p className="text-lg font-semibold text-indigo-400">{data.summary.vulnerable_hosts}</p>
+            <p className="text-lg font-semibold text-steel-400">{data.summary.vulnerable_hosts}</p>
             <p className="text-xs text-gray-600">Vulnerable</p>
           </div>
           <div className="text-center">
@@ -184,7 +184,7 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
 
 
   return (
-    <div className={`border-b border-gray-800/50 ${selected ? 'bg-indigo-950/30' : ''}`}>
+    <div className={`border-b border-gray-800/50 ${selected ? 'bg-steel-950/30' : ''}`}>
       <button
         onClick={() => { setExpanded(!expanded); onSelect?.(); }}
         className="w-full px-3 py-2.5 text-left hover:bg-gray-800/30 transition-colors"
@@ -253,7 +253,7 @@ function PathCard({ path, index, selected, onSelect, onSelectHost }: {
                   {node.role !== 'scan_source' && onSelectHost ? (
                     <button
                       onClick={(e) => { e.stopPropagation(); onSelectHost(node.ip); }}
-                      className="text-gray-300 hover:text-indigo-400 hover:underline transition-colors"
+                      className="text-gray-300 hover:text-steel-400 hover:underline transition-colors"
                     >
                       {node.ip}
                     </button>

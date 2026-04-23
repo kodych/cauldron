@@ -156,7 +156,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
         onClick={() => fileInputRef.current?.click()}
         className={`border-2 border-dashed rounded-lg p-4 text-center cursor-pointer transition-colors ${
           dragOver
-            ? 'border-indigo-400 bg-indigo-950/20'
+            ? 'border-steel-400 bg-steel-950/20'
             : file
               ? 'border-green-600/50 bg-green-950/10'
               : 'border-gray-700 hover:border-gray-600'
@@ -196,7 +196,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
             value={source}
             onChange={(e) => setSource(e.target.value)}
             placeholder="e.g., 10.0.0.7 or kali-external"
-            className="w-full rounded bg-gray-800 px-2 py-1.5 text-xs font-mono text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
+            className="w-full rounded bg-gray-800 px-2 py-1.5 text-xs font-mono text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-steel-500"
           />
           <p className="mt-1 text-xs text-gray-600">
             Identifies the scan position in the network. Multiple scans from different positions build multi-perspective attack paths.
@@ -209,7 +209,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
         <button
           onClick={handleImport}
           disabled={importing}
-          className="w-full flex items-center justify-center gap-1.5 rounded bg-indigo-600 py-2 text-xs text-white hover:bg-indigo-500 disabled:opacity-50"
+          className="w-full flex items-center justify-center gap-1.5 rounded bg-steel-600 py-2 text-xs text-white hover:bg-steel-500 disabled:opacity-50"
         >
           {importing ? (
             <>
@@ -351,55 +351,67 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
             )}
           </div>
         ) : (
-          <div className="rounded bg-orange-950/20 border border-orange-800/30 p-2 space-y-2">
-            <div className="flex items-center gap-1.5">
-              <Check size={13} className="text-orange-400" />
-              <span className="text-xs font-medium text-orange-400">Analysis complete</span>
+          <div className="space-y-2">
+            <div className="rounded bg-orange-950/20 border border-orange-800/30 p-2 space-y-2">
+              <div className="flex items-center gap-1.5">
+                <Check size={13} className="text-orange-400" />
+                <span className="text-xs font-medium text-orange-400">Analysis complete</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+                {analyzeResult.classification?.classified != null && (
+                  <>
+                    <span className="text-gray-500">Classified:</span>
+                    <span className="text-gray-300">{String(analyzeResult.classification.classified)} hosts</span>
+                  </>
+                )}
+                {analyzeResult.exploits?.matched != null && (
+                  <>
+                    <span className="text-gray-500">Exploits found:</span>
+                    <span className="text-gray-300">{String(analyzeResult.exploits.matched)}</span>
+                  </>
+                )}
+                {analyzeResult.path_summary?.vulnerable_hosts != null && (
+                  <>
+                    <span className="text-gray-500">Vulnerable hosts:</span>
+                    <span className="text-gray-300">{String(analyzeResult.path_summary.vulnerable_hosts)}</span>
+                  </>
+                )}
+                {(analyzeResult.ai_vulns_dismissed ?? 0) > 0 && (
+                  <>
+                    <span className="text-gray-500">AI dismissed:</span>
+                    <span className="text-red-400">-{analyzeResult.ai_vulns_dismissed} vulns</span>
+                  </>
+                )}
+                {(analyzeResult.ai_vulns_kept ?? 0) > 0 && (
+                  <>
+                    <span className="text-gray-500">AI kept:</span>
+                    <span className="text-green-400">{analyzeResult.ai_vulns_kept} gold</span>
+                  </>
+                )}
+                {(analyzeResult.ai_targets_set ?? 0) > 0 && (
+                  <>
+                    <span className="text-gray-500">AI targets:</span>
+                    <span className="text-red-400">+{analyzeResult.ai_targets_set} targets</span>
+                  </>
+                )}
+                {(analyzeResult.ai_cves_found ?? 0) > 0 && (
+                  <>
+                    <span className="text-gray-500">AI CVEs:</span>
+                    <span className="text-purple-400">+{analyzeResult.ai_cves_found} new</span>
+                  </>
+                )}
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
-              {analyzeResult.classification?.classified != null && (
-                <>
-                  <span className="text-gray-500">Classified:</span>
-                  <span className="text-gray-300">{String(analyzeResult.classification.classified)} hosts</span>
-                </>
-              )}
-              {analyzeResult.exploits?.matched != null && (
-                <>
-                  <span className="text-gray-500">Exploits found:</span>
-                  <span className="text-gray-300">{String(analyzeResult.exploits.matched)}</span>
-                </>
-              )}
-              {analyzeResult.path_summary?.vulnerable_hosts != null && (
-                <>
-                  <span className="text-gray-500">Vulnerable hosts:</span>
-                  <span className="text-gray-300">{String(analyzeResult.path_summary.vulnerable_hosts)}</span>
-                </>
-              )}
-              {(analyzeResult.ai_vulns_dismissed ?? 0) > 0 && (
-                <>
-                  <span className="text-gray-500">AI dismissed:</span>
-                  <span className="text-red-400">-{analyzeResult.ai_vulns_dismissed} vulns</span>
-                </>
-              )}
-              {(analyzeResult.ai_vulns_kept ?? 0) > 0 && (
-                <>
-                  <span className="text-gray-500">AI kept:</span>
-                  <span className="text-green-400">{analyzeResult.ai_vulns_kept} gold</span>
-                </>
-              )}
-              {(analyzeResult.ai_targets_set ?? 0) > 0 && (
-                <>
-                  <span className="text-gray-500">AI targets:</span>
-                  <span className="text-red-400">+{analyzeResult.ai_targets_set} targets</span>
-                </>
-              )}
-              {(analyzeResult.ai_cves_found ?? 0) > 0 && (
-                <>
-                  <span className="text-gray-500">AI CVEs:</span>
-                  <span className="text-purple-400">+{analyzeResult.ai_cves_found} new</span>
-                </>
-              )}
-            </div>
+            {/* Keeps the results visible but gives a way back to the
+                "Run Analysis" button. Without this the only ways to
+                re-trigger analysis are a full page reload or resetting
+                the database. */}
+            <button
+              onClick={() => setAnalyzeResult(null)}
+              className="w-full rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-gray-200"
+            >
+              Run another analysis
+            </button>
           </div>
         )}
       </div>
@@ -430,7 +442,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
               key={fmt}
               href={`/api/v1/report?fmt=${fmt}${includeNotes ? '&notes=true' : ''}`}
               download={`cauldron_report.${fmt === 'md' ? 'md' : fmt}`}
-              className="flex-1 flex items-center justify-center gap-1 rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-indigo-950/30 hover:text-indigo-400 transition-colors"
+              className="flex-1 flex items-center justify-center gap-1 rounded bg-gray-800 py-1.5 text-xs text-gray-400 hover:bg-steel-950/30 hover:text-steel-400 transition-colors"
             >
               <Download size={11} />
               {fmt.toUpperCase()}

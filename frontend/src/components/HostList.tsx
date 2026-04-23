@@ -63,7 +63,7 @@ export function HostList({ onSelectHost, selectedHost, refreshKey = 0 }: Props) 
             placeholder="Filter hosts, CVE, product, notes..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full rounded bg-gray-800 py-1.5 pl-8 pr-7 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
+            className="w-full rounded bg-gray-800 py-1.5 pl-8 pr-7 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-steel-500"
           />
           {search && (
             <button
@@ -105,7 +105,7 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
   return (
     <div
       className={`border-b border-gray-800/50 transition-colors ${
-        selected ? 'bg-indigo-950/30' : 'hover:bg-gray-800/30'
+        selected ? 'bg-steel-950/30' : 'hover:bg-gray-800/30'
       } ${host.is_stale ? 'opacity-40' : ''}`}
     >
       <button

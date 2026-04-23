@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Network, BarChart3, Crosshair, ChevronLeft, ChevronRight,
   Target, Upload,
@@ -10,7 +10,6 @@ import { CollectPanel } from './CollectPanel';
 import { ImportPanel } from './ImportPanel';
 import { HostDetail } from './HostDetail';
 import { GraphCanvas } from './GraphCanvas';
-import { Legend } from './Legend';
 
 type Tab = 'stats' | 'hosts' | 'paths' | 'collect' | 'import';
 
@@ -108,7 +107,24 @@ export function Layout() {
     setSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
   }, []);
 
+  // Latest showHostDetail value read via ref so the callback identity
+  // can stay stable across toggles. Putting the state in deps caused
+  // GraphCanvas to re-create its Sigma instance every time the detail
+  // pane opened or closed, which triggered a brief "tiny graph" flash
+  // while the new Sigma caught up with the container dimensions.
+  const showHostDetailRef = useRef(showHostDetail);
+  useEffect(() => {
+    showHostDetailRef.current = showHostDetail;
+  }, [showHostDetail]);
+
   const handleSelectHost = useCallback((ip: string | null) => {
+    // Graph's clickStage fires `onSelectHost(null)` to clear the
+    // highlight on empty canvas. When HostDetail is already open
+    // that would break the study session — the detail card vanishes,
+    // tabs stay hidden, and the only way back is the Back button on
+    // an otherwise empty pane. Preserve state in that case; Back is
+    // still the explicit way out of the detail view.
+    if (ip === null && showHostDetailRef.current) return;
     setSelectedHost(ip);
     if (ip) {
       setShowHostDetail(true);
@@ -116,7 +132,12 @@ export function Layout() {
   }, []);
 
   const handleBackFromDetail = useCallback(() => {
+    // Close the detail pane and drop the graph highlight in one shot.
+    // Leaving `selectedHost` set after an explicit Back kept the host
+    // glowing on the canvas with no way to un-glow it except a graph
+    // stage click — confusing because the detail card is already gone.
     setShowHostDetail(false);
+    setSelectedHost(null);
   }, []);
 
   const bumpDataVersion = useCallback(() => setDataVersion((v) => v + 1), []);
@@ -207,7 +228,7 @@ export function Layout() {
                 onClick={() => { setActiveTab(tab.id); setShowHostDetail(false); }}
                 className={`flex flex-1 items-center justify-center gap-1 py-2.5 text-xs font-medium transition-colors ${
                   activeTab === tab.id && !showHostDetail
-                    ? 'border-b-2 border-indigo-400 text-indigo-400'
+                    ? 'border-b-2 border-steel-400 text-steel-400'
                     : 'text-gray-500 hover:text-gray-300'
                 }`}
               >
@@ -245,8 +266,10 @@ export function Layout() {
           </div>
         )}
 
-        {/* Legend at bottom */}
-        {!collapsed && !showHostDetail && <Legend />}
+        {/* Legend moved to the graph canvas top-right as a hover-flyout.
+            It is only meaningful on the graph view, and freeing the
+            sidebar bottom gives more room to tab content regardless of
+            the current tab. */}
 
         {/* Resize handle on the sidebar's right edge.
             - Drag to resize, double-click to reset to default width.
@@ -260,8 +283,8 @@ export function Layout() {
             title="Drag to resize · double-click to reset"
             className={`absolute top-0 right-0 h-full w-1 cursor-ew-resize z-30 ${
               resizing
-                ? 'bg-indigo-500'
-                : 'bg-transparent hover:bg-indigo-500/60'
+                ? 'bg-steel-500'
+                : 'bg-transparent hover:bg-steel-500/60'
             }`}
           />
         )}

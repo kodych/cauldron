@@ -1,8 +1,9 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import { MultiGraph } from 'graphology';
 import Sigma from 'sigma';
-import { Crosshair, Network, SlidersHorizontal, Lock, Unlock, Target, Check, Shield, X as XIcon } from 'lucide-react';
+import { Crosshair, Network, SlidersHorizontal, Skull, Target, Check, Shield, X as XIcon } from 'lucide-react';
 import { Badge } from './Badge';
+import { Legend } from './Legend';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
@@ -456,33 +457,49 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
           }
           size = Math.min(size, 22);
         }
+        // Scan-diff prefixes + ownership markers. Colour emoji render
+        // via the browser font stack in Sigma's label pipeline, so they
+        // stand out naturally against the dark canvas. Shape is the
+        // primary signal (skull vs bullseye vs sparkles vs arrows vs X)
+        // so colorblind viewers can still tell them apart without
+        // relying on hue.
         if (info.isStale) {
-          label = `× ${label}`;
+          label = `❌ ${label}`;
           forceLabel = true;
         } else if (info.isNew) {
-          label = `★ ${label}`;
+          label = `⭐ ${label}`;
           forceLabel = true;
         } else if (info.hasChanges) {
-          label = `⚠ ${label}`;
+          // `\uFE0F` is the VS16 emoji variation selector — forces the
+          // warning sign to render as the yellow emoji glyph instead of
+          // a monochrome text symbol across every OS font stack.
+          label = `⚠\uFE0F ${label}`;
           forceLabel = true;
         }
 
-        // Owned/Target markers
         if (info.owned) {
-          label = `🔓 ${label}`;
+          // 💀 matches the Skull icon on the "Mark as Owned" context
+          // menu and carries the pentester "pwned" semantic.
+          label = `💀 ${label}`;
           forceLabel = true;
         }
         if (info.target) {
           label = `🎯 ${label}`;
           forceLabel = true;
+          // Mild size boost so targets remain spottable on a crowded
+          // graph without changing the role colour (role colour = DC
+          // red would collide with a "target red" override).
+          size = Math.min(size * 1.35, 28);
         }
       }
 
       let nodeColor = attrs.color as string;
-      // Owned hosts: green tint ring effect via brighter color
+      // Owned is the one colour override: once compromised, "access
+      // state" dominates "what the host is" for pentester intent.
       if (info?.owned && !attrs.isScanSource) {
         nodeColor = '#22c55e';  // green — we have access
       }
+
       const base = { ...attrs, size, label, forceLabel, color: nodeColor };
 
       // Path highlight mode: dim everything except selected path
@@ -643,9 +660,23 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center bg-gray-950">
-        <div className="text-center">
-          <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent mx-auto" />
-          <p className="text-sm text-gray-400">Loading graph...</p>
+        <div className="flex flex-col items-center gap-3 text-center">
+          {/* Cauldron mid-brew as the loading indicator. On a large
+              dataset the graph can take 5-15 seconds to fetch and
+              layout — a bubbling cauldron reads as "the pipeline is
+              actively working", which is what's happening, instead of
+              the neutral "please wait" of a spinner. */}
+          <img
+            src="/brand/cauldron-anim-32.webp"
+            alt=""
+            width={80}
+            height={80}
+            style={{
+              imageRendering: 'pixelated',
+              filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.5))',
+            }}
+          />
+          <p className="text-sm text-gray-400">Brewing the graph…</p>
         </div>
       </div>
     );
@@ -659,7 +690,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
           <p className="mb-3 text-xs text-gray-500">{error}</p>
           <button
             onClick={refetch}
-            className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-500"
+            className="rounded bg-steel-600 px-3 py-1.5 text-xs text-white hover:bg-steel-500"
           >
             Retry
           </button>
@@ -720,20 +751,24 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       {/* Controls bar */}
       <div className="absolute top-3 right-3 flex items-center gap-2">
 
+      {/* Legend — hover chip. Lives on the graph canvas because that
+          is the only view where role colours and state glyphs apply. */}
+      <Legend />
+
       {/* Filter button */}
       <div className="relative">
         <button
           onClick={() => setShowFilters(!showFilters)}
           className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs border transition-colors ${
             (filterVulnOnly || filterRoles.size > 0)
-              ? 'bg-indigo-900/90 border-indigo-600 text-indigo-300'
+              ? 'bg-steel-900/90 border-steel-600 text-steel-300'
               : 'bg-gray-900/90 border-gray-700 text-gray-400 hover:text-gray-200'
           }`}
         >
           <SlidersHorizontal size={13} />
           Filters
           {(filterVulnOnly || filterRoles.size > 0) && (
-            <span className="rounded-full bg-indigo-500 text-white px-1.5 py-0 text-xs leading-4">
+            <span className="rounded-full bg-steel-500 text-white px-1.5 py-0 text-xs leading-4">
               {(filterVulnOnly ? 1 : 0) + filterRoles.size}
             </span>
           )}
@@ -747,7 +782,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
                 type="checkbox"
                 checked={filterVulnOnly}
                 onChange={(e) => setFilterVulnOnly(e.target.checked)}
-                className="rounded border-gray-600 bg-gray-800 text-indigo-500"
+                className="rounded border-gray-600 bg-gray-800 text-steel-500"
               />
               <span className="text-xs text-gray-300">Vulnerable hosts only</span>
             </label>
@@ -768,7 +803,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
                       else next.delete(role);
                       setFilterRoles(next);
                     }}
-                    className="rounded border-gray-600 bg-gray-800 text-indigo-500"
+                    className="rounded border-gray-600 bg-gray-800 text-steel-500"
                   />
                   <div className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
                   <span className="text-xs text-gray-400">{role.toLowerCase().replace(/_/g, ' ')}</span>
@@ -797,7 +832,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
         <button
           onClick={() => setAttackOnly(false)}
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs transition-colors ${
-            !attackOnly ? 'bg-indigo-600 text-white' : 'text-gray-400 hover:text-gray-200'
+            !attackOnly ? 'bg-steel-600 text-white' : 'text-gray-400 hover:text-gray-200'
           }`}
         >
           <Network size={13} />
@@ -842,11 +877,10 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               onDataChanged?.();
             }}
           >
-            {contextMenu.owned ? (
-              <Unlock size={13} className="text-green-400 shrink-0" />
-            ) : (
-              <Lock size={13} className="text-gray-500 shrink-0" />
-            )}
+            <Skull
+              size={13}
+              className={`${contextMenu.owned ? 'text-green-400' : 'text-gray-500'} shrink-0`}
+            />
             <span className={contextMenu.owned ? 'text-green-400' : 'text-gray-400'}>
               {contextMenu.owned ? 'Unmark Owned' : 'Mark as Owned'}
             </span>

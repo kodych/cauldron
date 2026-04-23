@@ -108,7 +108,7 @@ export function CollectPanel({ refreshKey = 0 }: CollectPanelProps) {
       {/* Filter grid */}
       <div className="p-2 border-b border-gray-800">
         <div className="flex items-center gap-1.5 mb-2">
-          <Filter size={13} className="text-indigo-400" />
+          <Filter size={13} className="text-steel-400" />
           <span className="text-xs font-medium text-gray-400">Quick Filters</span>
         </div>
         <div className="grid grid-cols-4 gap-1">
@@ -119,7 +119,7 @@ export function CollectPanel({ refreshKey = 0 }: CollectPanelProps) {
               disabled={loading}
               className={`rounded px-1.5 py-1 text-xs transition-colors ${
                 activeFilter === f.name
-                  ? 'bg-indigo-600 text-white'
+                  ? 'bg-steel-600 text-white'
                   : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
               }`}
               title={f.desc}
@@ -138,7 +138,7 @@ export function CollectPanel({ refreshKey = 0 }: CollectPanelProps) {
             value={customPort}
             onChange={(e) => setCustomPort(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleCustomPort()}
-            className="flex-1 rounded bg-gray-800 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-indigo-500"
+            className="flex-1 rounded bg-gray-800 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:ring-1 focus:ring-steel-500"
           />
           <button
             onClick={handleCustomPort}
@@ -176,7 +176,7 @@ export function CollectPanel({ refreshKey = 0 }: CollectPanelProps) {
       {/* Results */}
       {loading && (
         <div className="p-4 text-center">
-          <div className="h-6 w-6 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent mx-auto" />
+          <div className="h-6 w-6 animate-spin rounded-full border-2 border-steel-400 border-t-transparent mx-auto" />
         </div>
       )}
 
