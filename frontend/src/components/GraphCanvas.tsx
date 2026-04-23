@@ -671,9 +671,26 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   if (!data || data.nodes.length === 0) {
     return (
       <div className="flex h-full items-center justify-center bg-gray-950">
-        <div className="text-center">
-          <p className="text-sm text-gray-400">No graph data</p>
-          <p className="mt-1 text-xs text-gray-600">Import a scan to get started</p>
+        <div className="flex flex-col items-center gap-4 text-center">
+          {/* Hero cauldron — empty canvas, nothing to distract from it.
+              Drop-shadow grounds the sprite on the dark background and
+              gives the pixel silhouette a touch of depth without breaking
+              the pixel-art aesthetic. */}
+          <img
+            src="/brand/cauldron-splash.webp"
+            alt="Cauldron"
+            width={200}
+            height={200}
+            className="select-none"
+            style={{
+              imageRendering: 'pixelated',
+              filter: 'drop-shadow(0 10px 24px rgba(0,0,0,0.5))',
+            }}
+          />
+          <div>
+            <p className="text-base font-semibold text-gray-200">An empty cauldron</p>
+            <p className="mt-1 text-xs text-gray-500">Drop a scan on the Import tab and start brewing.</p>
+          </div>
         </div>
       </div>
     );

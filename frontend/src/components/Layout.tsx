@@ -160,21 +160,35 @@ export function Layout() {
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-gray-800 px-3 py-3">
-          {!collapsed && (
-            <div className="flex items-center gap-2">
+          {!collapsed ? (
+            <div className="flex items-center gap-2.5">
               {/* Pixel-art logo via rectangle-per-pixel SVG — scales to any
                   size with crisp edges, works at 1x and HiDPI alike without
                   the browser-downscale blur a fixed-size PNG would give. */}
               <img
                 src="/brand/cauldron.svg"
                 alt="Cauldron"
-                width={22}
-                height={22}
+                width={44}
+                height={44}
                 className="shrink-0"
                 style={{ imageRendering: 'pixelated' }}
               />
-              <span className="text-sm font-semibold text-gray-100">Cauldron</span>
+              <span className="text-base font-semibold text-gray-100">Cauldron</span>
             </div>
+          ) : (
+            /* Collapsed sidebar still carries the brand so the graph
+               canvas does not stare at a blank 48px strip of chrome.
+               Animated WebP because the collapsed header is the only
+               visible sidebar element and a living logo makes that
+               strip feel purposeful. */
+            <img
+              src="/brand/cauldron-anim-32.webp"
+              alt="Cauldron"
+              width={24}
+              height={24}
+              className="shrink-0 mx-auto"
+              style={{ imageRendering: 'pixelated' }}
+            />
           )}
           <button
             onClick={() => setCollapsed(!collapsed)}

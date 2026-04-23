@@ -316,8 +316,8 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
                   <img
                     src="/brand/cauldron-anim-32.webp"
                     alt=""
-                    width={20}
-                    height={20}
+                    width={26}
+                    height={26}
                     className="shrink-0"
                     style={{ imageRendering: 'pixelated' }}
                   />
