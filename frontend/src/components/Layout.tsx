@@ -310,6 +310,7 @@ export function Layout() {
           highlightPathIps={selectedPathIps}
           onClearPath={handleClearPath}
           onDataChanged={bumpDataVersion}
+          onCloseDetail={handleBackFromDetail}
           refreshKey={dataVersion}
         />
       </div>

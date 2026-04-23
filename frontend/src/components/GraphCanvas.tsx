@@ -17,6 +17,7 @@ interface Props {
   highlightPathIps?: string[] | null;
   onClearPath?: () => void;
   onDataChanged?: () => void;
+  onCloseDetail?: () => void;
   refreshKey?: number;
 }
 
@@ -32,7 +33,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged, refreshKey = 0 }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged, onCloseDetail, refreshKey = 0 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -42,6 +43,23 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
   const [showFilters, setShowFilters] = useState(false);
   const [filterVulnOnly, setFilterVulnOnly] = useState(false);
   const [filterRoles, setFilterRoles] = useState<Set<string>>(new Set());
+  // Filters popover uses the same hover-with-delay pattern as Legend:
+  // panel opens on mouse-enter, stays while mouse is on either the
+  // trigger or the panel itself, closes 150ms after mouse leaves both.
+  // The delay covers the gap the cursor crosses between trigger and
+  // panel so the popover doesn't flicker closed mid-travel.
+  const filtersCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showFiltersPanel = () => {
+    if (filtersCloseTimer.current) {
+      clearTimeout(filtersCloseTimer.current);
+      filtersCloseTimer.current = null;
+    }
+    setShowFilters(true);
+  };
+  const scheduleHideFilters = () => {
+    if (filtersCloseTimer.current) clearTimeout(filtersCloseTimer.current);
+    filtersCloseTimer.current = setTimeout(() => setShowFilters(false), 150);
+  };
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; ip: string; owned: boolean; target: boolean;
   } | null>(null);
@@ -292,6 +310,54 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       defaultEdgeType: 'arrow',
       stagePadding: 40,
       zIndex: true,
+      // Sigma's default hover draws a white pill behind node+label, which
+      // clashes with the dark canvas and hides the gray label text. Same
+      // geometry, dark fill — pill reads as a subtle highlight instead of
+      // a glare. Mirrors the default in sigma/src/rendering/node-hover.ts.
+      defaultDrawNodeHover: (context, data, settings) => {
+        const size = settings.labelSize;
+        const font = settings.labelFont;
+        const weight = settings.labelWeight;
+        context.font = `${weight} ${size}px ${font}`;
+
+        context.fillStyle = 'rgb(86, 86, 86)';
+        context.shadowOffsetX = 0;
+        context.shadowOffsetY = 0;
+        context.shadowBlur = 8;
+        context.shadowColor = '#000';
+
+        const PADDING = 2;
+        if (typeof data.label === 'string') {
+          const textWidth = context.measureText(data.label).width;
+          const boxWidth = Math.round(textWidth + 5);
+          const boxHeight = Math.round(size + 2 * PADDING);
+          const radius = Math.max(data.size, size / 2) + PADDING;
+          const angleRadian = Math.asin(boxHeight / 2 / radius);
+          const xDeltaCoord = Math.sqrt(
+            Math.abs(radius * radius - (boxHeight / 2) * (boxHeight / 2)),
+          );
+          context.beginPath();
+          context.moveTo(data.x + xDeltaCoord, data.y + boxHeight / 2);
+          context.lineTo(data.x + radius + boxWidth, data.y + boxHeight / 2);
+          context.lineTo(data.x + radius + boxWidth, data.y - boxHeight / 2);
+          context.lineTo(data.x + xDeltaCoord, data.y - boxHeight / 2);
+          context.arc(data.x, data.y, radius, angleRadian, -angleRadian);
+          context.closePath();
+          context.fill();
+        } else {
+          context.beginPath();
+          context.arc(data.x, data.y, data.size + PADDING, 0, Math.PI * 2);
+          context.closePath();
+          context.fill();
+        }
+
+        context.shadowBlur = 0;
+
+        if (data.label) {
+          context.fillStyle = '#e5e7eb'; // gray-200 — same as labelColor
+          context.fillText(data.label, data.x + data.size + 3, data.y + size / 3);
+        }
+      },
     });
 
     sigma.on('clickNode', ({ node }) => {
@@ -332,6 +398,16 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
         owned: info?.owned ?? false,
         target: info?.target ?? false,
       });
+    });
+
+    // Right-click on empty canvas = close the host detail pane.
+    // Mirrors the pentester "cancel / back out" habit from tools like
+    // Burp / BloodHound. Left-click stage is deliberately NOT wired here
+    // so an accidental click on the graph while studying a host can't
+    // wipe the workspace — right-click is deliberate, left-click isn't.
+    sigma.on('rightClickStage', ({ event }) => {
+      event.original.preventDefault();
+      onCloseDetail?.();
     });
 
     // --- Node drag-and-drop ---
@@ -386,7 +462,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       sigma.kill();
       sigmaRef.current = null;
     };
-  }, [graph, onSelectHost, onClearPath]);
+  }, [graph, onSelectHost, onClearPath, onCloseDetail]);
 
   // Collect nodes that participate in attack paths
   const attackNodeIds = useMemo(() => {
@@ -669,8 +745,8 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
           <img
             src="/brand/cauldron-anim-32.webp"
             alt=""
-            width={80}
-            height={80}
+            width={144}
+            height={144}
             style={{
               imageRendering: 'pixelated',
               filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.5))',
@@ -710,8 +786,8 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
           <img
             src="/brand/cauldron-splash.webp"
             alt="Cauldron"
-            width={200}
-            height={200}
+            width={144}
+            height={144}
             className="select-none"
             style={{
               imageRendering: 'pixelated',
@@ -756,9 +832,15 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       <Legend />
 
       {/* Filter button */}
-      <div className="relative">
+      <div
+        className="relative"
+        onMouseEnter={showFiltersPanel}
+        onMouseLeave={scheduleHideFilters}
+        onFocus={showFiltersPanel}
+        onBlur={scheduleHideFilters}
+      >
         <button
-          onClick={() => setShowFilters(!showFilters)}
+          type="button"
           className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs border transition-colors ${
             (filterVulnOnly || filterRoles.size > 0)
               ? 'bg-steel-900/90 border-steel-600 text-steel-300'
