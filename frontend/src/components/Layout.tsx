@@ -179,9 +179,12 @@ export function Layout() {
         }`}
         style={{ width: collapsed ? SIDEBAR_COLLAPSED_WIDTH : sidebarWidth }}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-gray-800 px-3 py-3">
-          {!collapsed ? (
+        {/* Header — horizontal when the sidebar is wide (logo + title on the
+            left, chevron on the right); vertical stack when collapsed so the
+            48 px strip doesn't have to cram a 24 px logo and a 24 px button
+            side-by-side. */}
+        {!collapsed ? (
+          <div className="flex items-center justify-between border-b border-gray-800 px-3 py-3">
             <div className="flex items-center gap-2.5">
               {/* Pixel-art logo via rectangle-per-pixel SVG — scales to any
                   size with crisp edges, works at 1x and HiDPI alike without
@@ -196,28 +199,36 @@ export function Layout() {
               />
               <span className="text-base font-semibold text-gray-100">Cauldron</span>
             </div>
-          ) : (
-            /* Collapsed sidebar still carries the brand so the graph
-               canvas does not stare at a blank 48px strip of chrome.
-               Animated WebP because the collapsed header is the only
-               visible sidebar element and a living logo makes that
-               strip feel purposeful. */
+            <button
+              onClick={() => setCollapsed(true)}
+              className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+              title="Collapse sidebar"
+            >
+              <ChevronLeft size={16} />
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-1.5 border-b border-gray-800 py-2">
+            {/* Animated WebP because the collapsed strip is the only sidebar
+                element visible, and a living logo makes the chrome feel like
+                a deliberate part of the product instead of a blank bar. */}
             <img
               src="/brand/cauldron-anim-32.webp"
               alt="Cauldron"
-              width={24}
-              height={24}
-              className="shrink-0 mx-auto"
+              width={28}
+              height={28}
+              className="shrink-0"
               style={{ imageRendering: 'pixelated' }}
             />
-          )}
-          <button
-            onClick={() => setCollapsed(!collapsed)}
-            className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
-          >
-            {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
-          </button>
-        </div>
+            <button
+              onClick={() => setCollapsed(false)}
+              className="rounded p-1 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
+              title="Expand sidebar"
+            >
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        )}
 
         {/* Tabs */}
         {!collapsed && (
