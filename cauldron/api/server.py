@@ -7,6 +7,7 @@ Start with: cauldron serve
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import threading
 import time
@@ -32,8 +33,6 @@ app = FastAPI(
 # Pin to the Vite dev server (port 3000 per frontend/vite.config.ts) plus
 # the API's own origin so Swagger UI at /docs keeps working. Override with
 # CAULDRON_CORS_ORIGINS=host1,host2 when running behind a custom gateway.
-import os
-
 _default_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -186,7 +185,6 @@ class AnalyzeResponse(BaseModel):
     exploits: dict[str, Any]
     scripts: dict[str, Any]
     cve_enrichment: dict[str, Any]
-    topology: dict[str, Any]
     path_summary: dict[str, Any]
     ai_false_positives: int = 0
     ai_vulns_kept: int = 0
@@ -231,13 +229,10 @@ class GraphResponse(BaseModel):
 class TopologySegment(BaseModel):
     cidr: str
     hosts: int
-    reaches: int
 
 
 class TopologyResponse(BaseModel):
     segments: list[TopologySegment]
-    gateways: int
-    total_reach_edges: int
 
 
 # ---------------------------------------------------------------------------
@@ -801,35 +796,21 @@ def get_graph(
             if src_node_id and host_id in seen_nodes and src_node_id != host_id:
                 edges.append(GraphEdge(source=src_node_id, target=host_id, type="SCANNED_FROM"))
 
-        # CAN_REACH edges between segments
-        result = session.run(
-            "MATCH (s1:NetworkSegment)-[:CAN_REACH]->(s2:NetworkSegment) RETURN s1.cidr AS src, s2.cidr AS dst"
-        )
-        for r in result:
-            src_id = f"segment:{r['src']}"
-            dst_id = f"segment:{r['dst']}"
-            if src_id in seen_nodes and dst_id in seen_nodes:
-                edges.append(GraphEdge(source=src_id, target=dst_id, type="CAN_REACH"))
-
     return GraphResponse(nodes=nodes, edges=edges, total_hosts=total_hosts)
 
 
 @app.get("/api/v1/topology", response_model=TopologyResponse)
 def get_topology():
-    """Network topology statistics."""
+    """Segment-level orientation stats — host counts per /24."""
     _check_neo4j()
     from cauldron.graph.topology import get_topology_stats
 
     stats = get_topology_stats()
     segments = [
-        TopologySegment(cidr=s["cidr"], hosts=s["hosts"], reaches=s["reaches"])
+        TopologySegment(cidr=s["cidr"], hosts=s["hosts"])
         for s in stats["segments"]
     ]
-    return TopologyResponse(
-        segments=segments,
-        gateways=stats["gateways"],
-        total_reach_edges=stats["total_reach_edges"],
-    )
+    return TopologyResponse(segments=segments)
 
 
 @app.post("/api/v1/import", response_model=ImportResponse)
@@ -902,7 +883,6 @@ def _run_analysis_pipeline(
     from cauldron.exploits.matcher import (
         ExploitDB, upgrade_confidence_from_scripts, mark_bruteforceable_services,
     )
-    from cauldron.graph.topology import build_segment_connectivity
     from cauldron.ai.attack_paths import get_path_summary
 
     def _bump(phase: str, msg: str = "", current: int = 0, total: int = 0):
@@ -935,9 +915,6 @@ def _run_analysis_pipeline(
 
         cve_stats = enrich_services_from_graph(progress_callback=_nvd_cb)
 
-    _bump("topology", "Building topology")
-    topo_stats = build_segment_connectivity()
-
     _bump("paths", "Computing attack paths")
     summary = get_path_summary()
 
@@ -965,7 +942,6 @@ def _run_analysis_pipeline(
         exploits=exploit_stats,
         scripts=script_stats,
         cve_enrichment=cve_stats,
-        topology=topo_stats,
         path_summary=summary,
         ai_false_positives=ai_fp_count,
         ai_vulns_kept=ai_kept,

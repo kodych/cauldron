@@ -48,21 +48,12 @@ def _setup_attack_graph():
         Segments:
           10.0.1.0/24 (servers): DC01, DB01
           10.0.2.0/24 (DMZ): WEB01, WEB02
-
-        CAN_REACH:
-          10.0.2.0/24 -> 10.0.1.0/24
     """
     with get_session() as session:
         session.run("CREATE (:ScanSource {name: '192.168.1.100'})")
 
         session.run("CREATE (:NetworkSegment {cidr: '10.0.1.0/24'})")
         session.run("CREATE (:NetworkSegment {cidr: '10.0.2.0/24'})")
-
-        session.run("""
-            MATCH (s1:NetworkSegment {cidr: '10.0.2.0/24'}),
-                  (s2:NetworkSegment {cidr: '10.0.1.0/24'})
-            CREATE (s1)-[:CAN_REACH]->(s2)
-        """)
 
         session.run("""
             CREATE (:Host {ip: '10.0.2.20', hostname: 'web01.corp.local',
@@ -690,7 +681,6 @@ class TestFullPipeline:
         from cauldron.ai.classifier import classify_hosts
         from cauldron.exploits.matcher import ExploitDB, upgrade_confidence_from_scripts
         from cauldron.graph.ingestion import ingest_scan
-        from cauldron.graph.topology import build_segment_connectivity
         from cauldron.parsers.nmap_parser import parse_nmap_xml
 
         xml_path = Path(__file__).parent.parent / "data" / "samples" / "corporate_network.xml"
@@ -702,11 +692,10 @@ class TestFullPipeline:
         classify_hosts(scan.hosts_up)
         ingest_scan(scan, source_name="10.0.0.100")
 
-        # Boil phases: exploit DB + scripts + topology
+        # Boil phases: exploit DB + scripts
         exploit_db = ExploitDB()
         exploit_db.match_from_graph()
         upgrade_confidence_from_scripts()
-        build_segment_connectivity()
 
         # Paths — discovered dynamically from vulns
         paths = discover_attack_paths()

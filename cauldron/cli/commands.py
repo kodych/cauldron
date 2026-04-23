@@ -209,28 +209,21 @@ def taste():
             role_table.add_row(f"  {icon} {role_display}", str(count))
         console.print(role_table)
 
-    # Topology info
+    # Segment orientation — /24 buckets with host counts. Not a reachability
+    # claim, just "here is how the hosts bucket by subnet".
     from cauldron.graph.topology import get_topology_stats
 
     topo = get_topology_stats()
     if topo["segments"]:
         console.print()
-        console.print("[bold]Network Topology:[/bold]")
+        console.print("[bold]Subnets:[/bold]")
         seg_table = Table(show_header=True, box=None, padding=(0, 2))
         seg_table.add_column("Segment", style="cyan")
         seg_table.add_column("Hosts", style="bold", justify="right")
-        seg_table.add_column("Reaches", style="green", justify="right")
 
         for seg in topo["segments"]:
-            seg_table.add_row(
-                seg["cidr"],
-                str(seg["hosts"]),
-                str(seg["reaches"]) if seg["reaches"] > 0 else "[dim]-[/dim]",
-            )
+            seg_table.add_row(seg["cidr"], str(seg["hosts"]))
         console.print(seg_table)
-
-        if topo["gateways"]:
-            console.print(f"  [dim]Gateway hosts: {topo['gateways']}[/dim]")
 
     console.print()
 
@@ -352,23 +345,9 @@ def boil(nvd: bool, ai: bool, run_all: bool):
     else:
         console.print("  [dim]Skipped (use --nvd to enable)[/dim]")
 
-    # Phase 4: Network topology
+    # Phase 4: Attack path discovery
     console.print()
-    console.print("[bold cyan]Phase 4: Network Topology[/bold cyan]")
-
-    from cauldron.graph.topology import build_segment_connectivity
-
-    with console.status("[bold green]Building segment connectivity..."):
-        topo_stats = build_segment_connectivity()
-
-    console.print(f"  [green]+[/green] Analyzed {topo_stats['segments_analyzed']} network segments")
-    console.print(f"  [green]+[/green] {topo_stats['can_reach_created']} reachability paths between segments")
-    if topo_stats["gateway_hosts"]:
-        console.print(f"  [green]+[/green] {topo_stats['gateway_hosts']} gateway/router hosts detected")
-
-    # Phase 5: Attack path discovery
-    console.print()
-    console.print("[bold cyan]Phase 5: Attack Paths[/bold cyan]")
+    console.print("[bold cyan]Phase 4: Attack Paths[/bold cyan]")
 
     from cauldron.ai.attack_paths import get_path_summary
 
@@ -379,10 +358,10 @@ def boil(nvd: bool, ai: bool, run_all: bool):
     if summary["pivot_hosts"]:
         console.print(f"  [green]+[/green] {summary['pivot_hosts']} true pivot hosts detected (multi-scan)")
 
-    # Phase 6: AI Analysis (optional)
+    # Phase 5: AI Analysis (optional)
     if ai:
         console.print()
-        console.print("[bold cyan]Phase 6: AI Analysis[/bold cyan]")
+        console.print("[bold cyan]Phase 5: AI Analysis[/bold cyan]")
 
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
 

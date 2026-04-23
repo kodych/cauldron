@@ -170,9 +170,10 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       });
     }
 
-    // Topology edges: thin, dim green — skip IN_SEGMENT and CAN_REACH
+    // Topology edges: thin, dim green — skip IN_SEGMENT (hosts-to-segment
+    // clutter the canvas, segments are hidden from UI anyway).
     for (const edge of data.edges) {
-      if (edge.type === 'IN_SEGMENT' || edge.type === 'CAN_REACH') continue;
+      if (edge.type === 'IN_SEGMENT') continue;
       if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
         const edgeKey = `topo:${edge.source}->${edge.target}`;
         if (!g.hasEdge(edgeKey)) {

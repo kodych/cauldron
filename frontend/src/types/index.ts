@@ -135,13 +135,10 @@ export interface GraphResponse {
 export interface TopologySegment {
   cidr: string;
   hosts: number;
-  reaches: number;
 }
 
 export interface TopologyResponse {
   segments: TopologySegment[];
-  gateways: number;
-  total_reach_edges: number;
 }
 
 export interface VulnListItem {
@@ -185,7 +182,6 @@ export interface AnalyzeResponse {
   exploits: { matched?: number; hosts_matched?: number; exploits_found?: number } | null;
   scripts: { upgraded?: number } | null;
   cve_enrichment: { enriched?: number; cached?: number } | null;
-  topology: { segments?: number; reach_edges?: number } | null;
   path_summary: PathSummary | null;
   ai_vulns_kept?: number;
   ai_vulns_dismissed?: number;

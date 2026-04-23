@@ -13,7 +13,6 @@ const PHASE_LABELS: Record<string, string> = {
   scripts:   'Verifying NSE scripts',
   brute:     'Detecting brute-forceable',
   nvd:       'Enriching CVEs (NVD)',
-  topology:  'Building topology',
   paths:     'Computing attack paths',
   ai:        'AI triage',
   done:      'Complete',
@@ -346,7 +345,7 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
             )}
             {!analyzing && (
               <p className="text-xs text-gray-600 px-1 mt-1">
-                Classify hosts, match exploits, build topology{useNvd ? ', NVD CVEs' : ''}{useAi ? ', AI analysis' : ''}
+                Classify hosts, match exploits, find attack paths{useNvd ? ', NVD CVEs' : ''}{useAi ? ', AI analysis' : ''}
               </p>
             )}
           </div>
