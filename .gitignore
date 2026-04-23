@@ -42,3 +42,12 @@ docs/
 # Claude
 CLAUDE.md
 .claude/
+
+# Operator-local helper scripts — one-off generators, debug harnesses,
+# asset-pipeline glue. Never tracked in git: they hard-code local
+# absolute paths (D:/Cauldron/...) and reference non-shipped working
+# folders. If a helper becomes reusable, promote it to a proper
+# cauldron/cli/ command with tests instead of checking it in here.
+scripts/
+tools/
+tmp_*
