@@ -26,10 +26,30 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS — allow any origin in dev, restrict in production
+# CORS — restricted to local dev origins. ``allow_origins=["*"]`` combined
+# with ``allow_credentials=True`` is both a browser-spec violation (rejected
+# silently) and a CSRF vector if the wildcard ever becomes spec-compliant.
+# Pin to the Vite dev server (port 3000 per frontend/vite.config.ts) plus
+# the API's own origin so Swagger UI at /docs keeps working. Override with
+# CAULDRON_CORS_ORIGINS=host1,host2 when running behind a custom gateway.
+import os
+
+_default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+_env_origins = os.environ.get("CAULDRON_CORS_ORIGINS", "").strip()
+_allowed_origins = (
+    [o.strip() for o in _env_origins.split(",") if o.strip()]
+    if _env_origins
+    else _default_origins
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
