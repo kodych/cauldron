@@ -329,7 +329,7 @@ def boil(nvd: bool, ai: bool, run_all: bool):
     console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")
 
     if nvd:
-        from cauldron.ai.cve_enricher import enrich_services_from_graph
+        from cauldron.ai.cve_enricher import enrich_epss_from_graph, enrich_services_from_graph
 
         with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
             cve_stats = enrich_services_from_graph()
@@ -342,6 +342,19 @@ def boil(nvd: bool, ai: bool, run_all: bool):
             console.print(f"  [dim]  ({cve_stats['skipped']} services skipped — no version/CPE)[/dim]")
         if cve_stats["errors"]:
             console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
+
+        with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
+            epss_stats = enrich_epss_from_graph()
+
+        if epss_stats["checked"]:
+            console.print(
+                f"  [green]+[/green] EPSS scores: {epss_stats['updated']}/{epss_stats['checked']}"
+                f" CVEs ({epss_stats['from_cache']} cached, {epss_stats['fetched']} fetched)",
+            )
+            if epss_stats["missing"]:
+                console.print(
+                    f"  [dim]  ({epss_stats['missing']} CVEs not in EPSS dataset)[/dim]",
+                )
     else:
         console.print("  [dim]Skipped (use --nvd to enable)[/dim]")
 

@@ -907,13 +907,24 @@ def _run_analysis_pipeline(
 
     cve_stats: dict = {"services_checked": 0, "services_with_cves": 0, "total_cves_found": 0}
     if nvd:
-        from cauldron.ai.cve_enricher import enrich_services_from_graph
+        from cauldron.ai.cve_enricher import enrich_epss_from_graph, enrich_services_from_graph
         _bump("nvd", "Starting NVD enrichment")
 
         def _nvd_cb(current: int, total: int, message: str):
             _bump("nvd", message, current, total)
 
         cve_stats = enrich_services_from_graph(progress_callback=_nvd_cb)
+
+        # Piggy-back on the --nvd flag: once we have CVEs on the graph,
+        # fetch EPSS scores for them. Cheap batch API call, 24h-cached,
+        # provides the forward-looking "will this get exploited in the
+        # next 30 days" signal that complements CVSS / KEV / has_exploit.
+        _bump("epss", "Enriching EPSS scores")
+
+        def _epss_cb(current: int, total: int, message: str):
+            _bump("epss", message, current, total)
+
+        enrich_epss_from_graph(progress_callback=_epss_cb)
 
     _bump("paths", "Computing attack paths")
     summary = get_path_summary()

@@ -13,6 +13,7 @@ const PHASE_LABELS: Record<string, string> = {
   scripts:   'Verifying NSE scripts',
   brute:     'Detecting brute-forceable',
   nvd:       'Enriching CVEs (NVD)',
+  epss:      'Fetching EPSS scores',
   paths:     'Computing attack paths',
   ai:        'AI triage',
   done:      'Complete',

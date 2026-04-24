@@ -8,6 +8,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from cauldron.graph.connection import clear_database, get_session, verify_connection
+
 from cauldron.ai.cve_enricher import (
     CVECache,
     CVEInfo,
@@ -1337,6 +1341,182 @@ class TestTransientErrorDoesNotPoisonCache:
 
         # Critical: nothing written to cache, so next run will retry
         assert cache.size == 0
+
+class TestEPSSFetchAndCache:
+    """Regression: the CVEInfo.epss field was declared but never populated.
+    enrich_epss_from_graph must fetch scores from FIRST.org, cache them
+    with the 24h TTL, and write v.epss on matching Vulnerability nodes.
+    Only real CVE-* IDs are eligible; CAULDRON-* synthetic IDs are
+    skipped because FIRST.org only scores real CVEs.
+    """
+
+    def _epss_response(self, scores: dict[str, str]):
+        """Build a mock FIRST.org response body."""
+        import json as _json
+        from unittest.mock import MagicMock as _MagicMock
+        body = _json.dumps({
+            "status": "OK",
+            "data": [{"cve": cid, "epss": val, "percentile": "0.5",
+                      "date": "2026-04-24"}
+                     for cid, val in scores.items()],
+        }).encode()
+        mock = _MagicMock()
+        mock.read.return_value = body
+        return mock
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_fetch_batch_parses_scores(self, mock_urlopen):
+        from cauldron.ai.cve_enricher import _fetch_epss_batch
+
+        mock_urlopen.return_value = self._epss_response({
+            "CVE-2021-41773": "0.97351",
+            "CVE-2020-1472": "0.94120",
+        })
+
+        scores = _fetch_epss_batch(["CVE-2021-41773", "CVE-2020-1472"])
+
+        assert scores == pytest.approx({
+            "CVE-2021-41773": 0.97351,
+            "CVE-2020-1472": 0.94120,
+        })
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_fetch_empty_cve_list_short_circuits(self, mock_urlopen):
+        from cauldron.ai.cve_enricher import _fetch_epss_batch
+
+        assert _fetch_epss_batch([]) == {}
+        mock_urlopen.assert_not_called()
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_fetch_network_error_returns_empty_dict(self, mock_urlopen):
+        """EPSS is a nice-to-have — transient failures must NOT break the
+        boil. Empty dict lets the caller skip the write and move on."""
+        import urllib.error
+
+        from cauldron.ai.cve_enricher import _fetch_epss_batch
+
+        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+
+        assert _fetch_epss_batch(["CVE-2021-41773"]) == {}
+
+    def test_epss_cache_round_trip(self, tmp_path):
+        from cauldron.ai.cve_enricher import EPSSCache
+
+        cache = EPSSCache(cache_file=tmp_path / "epss.json")
+        cache.put_batch({"CVE-2021-41773": 0.97, "CVE-2020-1472": 0.94})
+
+        # Reload from disk to exercise the persistence path, not just
+        # the in-memory dict.
+        cache2 = EPSSCache(cache_file=tmp_path / "epss.json")
+        assert cache2.get("CVE-2021-41773") == pytest.approx(0.97)
+        assert cache2.get("CVE-2020-1472") == pytest.approx(0.94)
+        assert cache2.get("CVE-1234-5678") is None
+
+    def test_epss_cache_respects_ttl(self, tmp_path):
+        from cauldron.ai.cve_enricher import EPSSCache
+
+        cache = EPSSCache(cache_file=tmp_path / "epss.json", ttl=1)
+        cache.put_batch({"CVE-2021-41773": 0.5})
+        assert cache.get("CVE-2021-41773") == pytest.approx(0.5)
+
+        import time as _t
+        _t.sleep(1.1)
+        assert cache.get("CVE-2021-41773") is None  # expired
+
+
+@pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
+class TestEnrichEPSSFromGraph:
+    """Integration: pulls CVE IDs from the graph, writes v.epss."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_db(self):
+        clear_database()
+        yield
+        clear_database()
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_writes_epss_on_cve_nodes(self, mock_urlopen, tmp_path, monkeypatch):
+        """Seed a CVE node without epss, expect v.epss populated."""
+        import json as _json
+        from unittest.mock import MagicMock as _MagicMock
+
+        from cauldron.ai.cve_enricher import enrich_epss_from_graph
+
+        # Isolate cache to a temp file so prior runs don't pollute.
+        monkeypatch.setattr(
+            "cauldron.ai.cve_enricher.EPSS_CACHE_FILE",
+            tmp_path / "epss.json",
+        )
+
+        with get_session() as session:
+            session.run("""
+                CREATE (v:Vulnerability {cve_id: 'CVE-2021-41773',
+                                         source: 'nvd', cvss: 7.5})
+            """)
+
+        mock_response = _MagicMock()
+        mock_response.read.return_value = _json.dumps({
+            "status": "OK",
+            "data": [{"cve": "CVE-2021-41773", "epss": "0.97351",
+                      "percentile": "0.99985", "date": "2026-04-24"}],
+        }).encode()
+        mock_urlopen.return_value = mock_response
+
+        stats = enrich_epss_from_graph()
+
+        assert stats["checked"] == 1
+        assert stats["fetched"] == 1
+        assert stats["updated"] == 1
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (v:Vulnerability {cve_id: 'CVE-2021-41773'}) "
+                "RETURN v.epss AS epss",
+            ).single()
+            assert r["epss"] == pytest.approx(0.97351)
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_skips_cauldron_synthetic_ids(self, mock_urlopen, tmp_path, monkeypatch):
+        """CAULDRON-* IDs have no EPSS upstream — must not be queried."""
+        from cauldron.ai.cve_enricher import enrich_epss_from_graph
+
+        monkeypatch.setattr(
+            "cauldron.ai.cve_enricher.EPSS_CACHE_FILE",
+            tmp_path / "epss.json",
+        )
+
+        with get_session() as session:
+            session.run("""
+                CREATE (v:Vulnerability {cve_id: 'CAULDRON-125',
+                                         source: 'exploit_db'})
+            """)
+
+        stats = enrich_epss_from_graph()
+
+        assert stats["checked"] == 0
+        mock_urlopen.assert_not_called()
+
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    def test_skips_cves_already_having_epss(self, mock_urlopen, tmp_path, monkeypatch):
+        """Incremental re-runs only touch CVEs still missing a score."""
+        from cauldron.ai.cve_enricher import enrich_epss_from_graph
+
+        monkeypatch.setattr(
+            "cauldron.ai.cve_enricher.EPSS_CACHE_FILE",
+            tmp_path / "epss.json",
+        )
+
+        with get_session() as session:
+            session.run("""
+                CREATE (v:Vulnerability {cve_id: 'CVE-2021-41773',
+                                         source: 'nvd', epss: 0.42})
+            """)
+
+        stats = enrich_epss_from_graph()
+
+        assert stats["checked"] == 0
+        mock_urlopen.assert_not_called()
+
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")

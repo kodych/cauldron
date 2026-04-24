@@ -48,9 +48,24 @@ class NvdTransientError(RuntimeError):
 # NVD API base URL
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
+# EPSS (Exploit Prediction Scoring System) API. FIRST.org publishes a
+# per-CVE 0.0-1.0 probability of in-the-wild exploitation in the next 30
+# days. Complements has_exploit (binary PoC existence) and CISA KEV
+# (retrospective "was used") with a forward-looking threat-intel signal.
+# Free, no auth, batch query via comma-separated ``cve=A,B,C``.
+EPSS_API_BASE = "https://api.first.org/data/v1/epss"
+
+# How many CVEs to pack per EPSS request. FIRST.org's URL-length ceiling
+# handles several hundred, but batches of 100 keep URLs readable and
+# progress granular for large scans.
+_EPSS_BATCH_SIZE = 100
+
 # Cache location
 CACHE_DIR = Path.home() / ".cauldron"
 CACHE_FILE = CACHE_DIR / "cve_cache.json"
+# EPSS cache: scores update daily on FIRST.org so a 24h TTL matches the
+# upstream refresh cadence without pointlessly re-fetching on every boil.
+EPSS_CACHE_FILE = CACHE_DIR / "epss_cache.json"
 
 # Rate limiting: track last request time
 _last_request_time: float = 0.0
@@ -216,6 +231,53 @@ class CVECache:
     @property
     def size(self) -> int:
         return len(self._data)
+
+
+class EPSSCache:
+    """JSON cache for per-CVE EPSS scores. 24h TTL matches FIRST.org's
+    daily refresh cadence — no point re-fetching more often than the
+    data actually changes.
+    """
+
+    DEFAULT_TTL = 24 * 3600  # 24 hours
+
+    def __init__(self, cache_file: Path | None = None, ttl: int | None = None):
+        # Read EPSS_CACHE_FILE at call time rather than as a default-arg
+        # sentinel so monkeypatch-style redirection in tests works (the
+        # default-arg binding would otherwise freeze the original path at
+        # class-definition time).
+        self._file = cache_file if cache_file is not None else EPSS_CACHE_FILE
+        self._ttl = ttl if ttl is not None else self.DEFAULT_TTL
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if self._file.exists():
+            try:
+                self._data = json.loads(self._file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._data = {}
+
+    def _save(self) -> None:
+        self._file.parent.mkdir(parents=True, exist_ok=True)
+        self._file.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+
+    def get(self, cve_id: str) -> float | None:
+        """Return cached EPSS score for cve_id, or None if missing/expired."""
+        entry = self._data.get(cve_id)
+        if entry is None:
+            return None
+        if self._ttl > 0 and time.time() - entry.get("_cached_at", 0) > self._ttl:
+            del self._data[cve_id]
+            return None
+        return entry.get("epss")
+
+    def put_batch(self, scores: dict[str, float]) -> None:
+        """Cache a batch of CVE -> EPSS scores with a single save."""
+        now = time.time()
+        for cve_id, epss in scores.items():
+            self._data[cve_id] = {"epss": epss, "_cached_at": now}
+        self._save()
 
 
 def _rate_limit() -> None:
@@ -1350,6 +1412,132 @@ def enrich_services_from_graph(
                 for cve in enrichment.cves:
                     _upsert_vulnerability(session, product or "", version or "", cpe_list, cve)
 
+    return stats
+
+
+def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
+    """Query FIRST.org for EPSS scores in a single batch request.
+
+    Returns a {cve_id: epss_score} dict. CVEs missing from the response
+    (unknown to EPSS) are simply absent from the dict — callers treat
+    that as "no EPSS data" and leave ``v.epss`` null on the graph.
+
+    Transient failures return an empty dict and log a warning; the next
+    boil retries. We do not raise NvdTransientError here because EPSS
+    is a nice-to-have signal — a temporary FIRST.org outage must not
+    break the entire boil pipeline the way NVD would.
+    """
+    if not cve_ids:
+        return {}
+
+    cve_param = ",".join(cve_ids)
+    url = f"{EPSS_API_BASE}?cve={cve_param}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Cauldron/0.1.0"})
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            OSError, json.JSONDecodeError) as e:
+        logger.warning("EPSS fetch failed for %d CVEs: %s", len(cve_ids), e)
+        return {}
+
+    scores: dict[str, float] = {}
+    for entry in data.get("data", []):
+        cve_id = entry.get("cve")
+        raw = entry.get("epss")
+        if not cve_id or raw is None:
+            continue
+        try:
+            scores[cve_id] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return scores
+
+
+def enrich_epss_from_graph(progress_callback=None) -> dict:
+    """Populate ``v.epss`` on every Vulnerability node that still lacks it.
+
+    Pulls CVE-format IDs from the graph, consults the 24h EPSS cache
+    first, batches remaining IDs to FIRST.org in chunks of
+    ``_EPSS_BATCH_SIZE``, and writes the scores back. Non-CVE synthetic
+    IDs (``CAULDRON-*``) are skipped — FIRST.org only scores real CVEs.
+
+    Returns:
+        Dict with {checked, from_cache, fetched, updated, missing}.
+    """
+    from cauldron.graph.connection import get_session
+
+    stats = {
+        "checked": 0,
+        "from_cache": 0,
+        "fetched": 0,
+        "updated": 0,
+        "missing": 0,
+    }
+
+    with get_session() as session:
+        rows = list(session.run(
+            """
+            MATCH (v:Vulnerability)
+            WHERE v.cve_id STARTS WITH 'CVE-' AND v.epss IS NULL
+            RETURN v.cve_id AS cve_id
+            """,
+        ))
+
+    cve_ids = [r["cve_id"] for r in rows]
+    stats["checked"] = len(cve_ids)
+    if not cve_ids:
+        return stats
+
+    cache = EPSSCache()
+    scores: dict[str, float] = {}
+    to_fetch: list[str] = []
+
+    for cve_id in cve_ids:
+        cached = cache.get(cve_id)
+        if cached is not None:
+            scores[cve_id] = cached
+            stats["from_cache"] += 1
+        else:
+            to_fetch.append(cve_id)
+
+    # Batch the rest to FIRST.org — one URL per _EPSS_BATCH_SIZE CVEs.
+    total_batches = (len(to_fetch) + _EPSS_BATCH_SIZE - 1) // _EPSS_BATCH_SIZE
+    for idx, start in enumerate(range(0, len(to_fetch), _EPSS_BATCH_SIZE), 1):
+        batch = to_fetch[start : start + _EPSS_BATCH_SIZE]
+        if progress_callback:
+            try:
+                progress_callback(idx, total_batches, f"EPSS batch {idx}/{total_batches}")
+            except Exception:  # noqa: BLE001
+                pass
+        fetched = _fetch_epss_batch(batch)
+        stats["fetched"] += len(fetched)
+        if fetched:
+            cache.put_batch(fetched)
+            scores.update(fetched)
+
+    stats["missing"] = len(cve_ids) - len(scores)
+
+    # Write back to Neo4j in one batched query — UNWIND a pairs list so
+    # the driver does not pay a round-trip per CVE.
+    if scores:
+        pairs = [{"cve_id": cid, "epss": epss} for cid, epss in scores.items()]
+        with get_session() as session:
+            session.run(
+                """
+                UNWIND $pairs AS p
+                MATCH (v:Vulnerability {cve_id: p.cve_id})
+                SET v.epss = p.epss
+                """,
+                pairs=pairs,
+            )
+        stats["updated"] = len(scores)
+
+    logger.info(
+        "EPSS enrichment: %d CVEs checked (%d cached, %d fetched, %d missing)",
+        stats["checked"], stats["from_cache"], stats["fetched"], stats["missing"],
+    )
     return stats
 
 
