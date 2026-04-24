@@ -433,3 +433,108 @@ class TestFalsePositiveExclusion:
             """)
         result = collect_targets(filter_name="exploitable")
         assert "10.0.1.20" in [h.ip for h in result.hosts]
+
+
+class TestEngagementFilters:
+    """New filters for the post-boil pentester workflow: KEV targets,
+    engagement state (owned / target), and targets that don't have any
+    actionable vuln to attack through.
+    """
+
+    def test_kev_filter_returns_only_kev_hosts(self):
+        _setup_network()
+        # WEB01 gets a KEV vuln, DB01 gets a non-KEV vuln, DC01 nothing.
+        with get_session() as session:
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
+                    cve_id: 'CVE-2021-44228', cvss: 10.0, in_cisa_kev: true
+                })
+            """)
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(:Vulnerability {
+                    cve_id: 'CVE-2024-PLAIN', cvss: 6.0, in_cisa_kev: false
+                })
+            """)
+        result = collect_targets(filter_name="kev")
+        ips = [h.ip for h in result.hosts]
+        assert "10.0.1.20" in ips
+        assert "10.0.1.30" not in ips
+        assert "10.0.1.10" not in ips
+
+    def test_kev_filter_still_excludes_false_positive(self):
+        """The match_vuln auto-exclusion of FP-marked findings must still
+        apply to the KEV filter — operator-dismissed findings do not
+        count even if they were KEV."""
+        _setup_network()
+        with get_session() as session:
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed',
+                                      checked_status: 'false_positive'}]
+                      ->(:Vulnerability {
+                    cve_id: 'CVE-2021-44228', cvss: 10.0, in_cisa_kev: true
+                })
+            """)
+        result = collect_targets(filter_name="kev")
+        assert "10.0.1.20" not in [h.ip for h in result.hosts]
+
+    def test_owned_filter(self):
+        _setup_network()
+        with get_session() as session:
+            session.run("MATCH (h:Host {ip: '10.0.1.20'}) SET h.owned = true")
+        result = collect_targets(filter_name="owned")
+        ips = [h.ip for h in result.hosts]
+        assert ips == ["10.0.1.20"]
+
+    def test_target_filter(self):
+        _setup_network()
+        with get_session() as session:
+            session.run("MATCH (h:Host {ip: '10.0.1.10'}) SET h.target = true")
+            session.run("MATCH (h:Host {ip: '10.0.1.30'}) SET h.target = true")
+        result = collect_targets(filter_name="target")
+        ips = sorted(h.ip for h in result.hosts)
+        assert ips == ["10.0.1.10", "10.0.1.30"]
+
+    def test_target_blocked_returns_targets_with_no_vulns(self):
+        """Engagement blockers: targets without any active finding we
+        can attack. Targets WITH a vuln (even if only 'check' confidence)
+        are NOT blocked — operator still has something to try."""
+        _setup_network()
+        with get_session() as session:
+            # DC01: target, zero vulns → blocked
+            session.run("MATCH (h:Host {ip: '10.0.1.10'}) SET h.target = true")
+            # DB01: target, but has an active vuln → NOT blocked
+            session.run("MATCH (h:Host {ip: '10.0.1.30'}) SET h.target = true")
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(:Vulnerability {
+                    cve_id: 'CVE-2024-X', cvss: 5.0
+                })
+            """)
+            # WEB01: NOT a target at all → excluded regardless
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(:Vulnerability {
+                    cve_id: 'CVE-2024-Y', cvss: 5.0
+                })
+            """)
+        result = collect_targets(filter_name="target-blocked")
+        ips = [h.ip for h in result.hosts]
+        assert ips == ["10.0.1.10"]
+
+    def test_target_blocked_ignores_false_positive_vulns(self):
+        """A target with only FP-marked vulns is still blocked — FPs are
+        not actionable."""
+        _setup_network()
+        with get_session() as session:
+            session.run("MATCH (h:Host {ip: '10.0.1.10'}) SET h.target = true")
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.10'})-[:HAS_SERVICE]->(s:Service {port: 445})
+                CREATE (s)-[:HAS_VULN {confidence: 'check',
+                                      checked_status: 'false_positive'}]
+                      ->(:Vulnerability {cve_id: 'CVE-FP-ONLY', cvss: 5.0})
+            """)
+        result = collect_targets(filter_name="target-blocked")
+        assert "10.0.1.10" in [h.ip for h in result.hosts]

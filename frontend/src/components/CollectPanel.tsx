@@ -7,6 +7,12 @@ import type { CollectResponse, VulnListItem } from '../types';
 import { Badge } from './Badge';
 
 const QUICK_FILTERS = [
+  // Engagement state — the first thing to check after a boil
+  { name: 'kev', label: 'KEV', desc: 'Hosts with actively-exploited CVEs (CISA KEV)' },
+  { name: 'target', label: 'Targets', desc: 'Hosts flagged as engagement goal' },
+  { name: 'owned', label: 'Owned', desc: 'Hosts where we have shell/access' },
+  { name: 'target-blocked', label: 'Blocked', desc: 'Target hosts with no actionable vuln yet' },
+  // Port-based
   { name: 'smb', label: 'SMB', desc: 'Port 445' },
   { name: 'rdp', label: 'RDP', desc: 'Port 3389' },
   { name: 'ssh', label: 'SSH', desc: 'Port 22' },
@@ -14,9 +20,11 @@ const QUICK_FILTERS = [
   { name: 'mssql', label: 'MSSQL', desc: 'Port 1433' },
   { name: 'mysql', label: 'MySQL', desc: 'Port 3306' },
   { name: 'ftp', label: 'FTP', desc: 'Port 21' },
+  // Vuln-based
   { name: 'vuln', label: 'Vuln', desc: 'Any vulnerability' },
   { name: 'exploitable', label: 'Exploitable', desc: 'Has exploit' },
   { name: 'rce', label: 'RCE', desc: 'Remote code exec' },
+  // Role-based
   { name: 'dc', label: 'DC', desc: 'Domain controllers' },
   { name: 'db', label: 'DB', desc: 'Databases' },
   { name: 'brute', label: 'Brute', desc: 'Bruteforceable services' },

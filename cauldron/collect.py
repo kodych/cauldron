@@ -119,6 +119,28 @@ BUILTIN_FILTERS: dict[str, dict] = {
         "match_vuln": True,
         "where": "v.enables_pivot = true",
     },
+    "kev": {
+        "description": "Hosts with CISA Known Exploited Vulnerabilities (actively exploited in the wild)",
+        "match_vuln": True,
+        "where": "coalesce(v.in_cisa_kev, false) = true",
+    },
+    "owned": {
+        "description": "Hosts marked as owned (we have shell/access)",
+        "where": "coalesce(h.owned, false) = true",
+    },
+    "target": {
+        "description": "Hosts marked as target (engagement goals)",
+        "where": "coalesce(h.target, false) = true",
+    },
+    "target-blocked": {
+        "description": "Target hosts with no actionable vulnerability — engagement blockers",
+        "where": (
+            "coalesce(h.target, false) = true AND NOT EXISTS { "
+            "MATCH (h)-[:HAS_SERVICE]->(:Service)-[r:HAS_VULN]->(:Vulnerability) "
+            "WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive' "
+            "}"
+        ),
+    },
     "dc": {
         "description": "Domain Controllers",
         "where": "h.role = 'domain_controller'",
