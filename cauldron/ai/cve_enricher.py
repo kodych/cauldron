@@ -1126,22 +1126,6 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
     )
 
 
-def verify_cve_via_nvd(cve_id: str) -> CVEInfo | None:
-    """Look up a single CVE ID in NVD and return verified data.
-
-    Used to validate AI-generated CVE claims — replaces AI-hallucinated
-    CVSS scores and descriptions with real NVD data.
-
-    Returns None if CVE not found, rejected, or not relevant.
-    """
-    _rate_limit()
-    url = f"{NVD_API_BASE}?cveId={cve_id}"
-    cves = _execute_nvd_query(url, f"verify:{cve_id}")
-    if cves and len(cves) > 0:
-        return cves[0]
-    return None
-
-
 # --- Public API ---
 
 def enrich_service(

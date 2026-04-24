@@ -184,79 +184,163 @@ class TestAnalyzeGraph:
             assert result.cves_found == 0
 
 
-class TestApplyAiCves:
-    def test_index_based_matching(self):
-        from cauldron.ai.analyzer import _apply_ai_cves
+class TestIsValidCpe23:
+    """CPE 2.3 format validator — AI may hallucinate strings with wrong
+    shape; we reject before spending an NVD API call on them."""
 
-        pairs = [("Apache", "2.4.49"), ("nginx", "1.14.1")]
-        response = json.dumps([{
+    def test_valid_app_cpe(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        assert _is_valid_cpe23(
+            "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        )
+
+    def test_valid_os_cpe(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        assert _is_valid_cpe23(
+            "cpe:2.3:o:vmware:esxi:8.0.3:*:*:*:*:*:*:*",
+        )
+
+    def test_wildcard_version_ok(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        assert _is_valid_cpe23(
+            "cpe:2.3:a:nginx:nginx:*:*:*:*:*:*:*:*",
+        )
+
+    def test_missing_fields_rejected(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        # Only 5 colons instead of 12 — classic AI hallucination shape.
+        assert not _is_valid_cpe23("cpe:2.3:a:apache:http_server:2.4.49")
+
+    def test_wrong_prefix_rejected(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        # CPE 2.2 format — NVD expects 2.3.
+        assert not _is_valid_cpe23("cpe:/a:apache:http_server:2.4.49")
+
+    def test_invalid_part_type_rejected(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        # Only a/o/h are valid per CPE 2.3 spec.
+        assert not _is_valid_cpe23(
+            "cpe:2.3:x:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+        )
+
+    def test_non_string_rejected(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        assert not _is_valid_cpe23(None)
+        assert not _is_valid_cpe23(42)
+
+    def test_empty_string_rejected(self):
+        from cauldron.ai.analyzer import _is_valid_cpe23
+        assert not _is_valid_cpe23("")
+
+
+class TestAiCpesForBatch:
+    """Batch prompt construction + response parsing for Phase 1 CPE extraction."""
+
+    def _svc(self, port=80, protocol="tcp", **kwargs):
+        base = {
+            "port": port, "protocol": protocol,
+            "name": None, "product": None, "version": None,
+            "extra_info": None, "banner": None, "servicefp": None,
+            "os_name": None,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_parses_valid_response(self):
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
+
+        batch = [("10.0.0.1", [self._svc(port=5432, product="PostgreSQL DB")])]
+        fake_response = json.dumps([
+            {"index": 0, "cpes": [
+                "cpe:2.3:a:postgresql:postgresql:14.5:*:*:*:*:*:*:*",
+            ]},
+        ])
+
+        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+            out = _ai_cpes_for_batch(batch)
+
+        assert out == [{
+            "ip": "10.0.0.1", "port": 5432, "protocol": "tcp",
+            "cpes": ["cpe:2.3:a:postgresql:postgresql:14.5:*:*:*:*:*:*:*"],
+        }]
+
+    def test_empty_cpes_list_is_respected(self):
+        """AI returning empty cpes is the correct no-guess behavior —
+        keep the entry so the caller can see 'we asked, AI had nothing'."""
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
+
+        batch = [("10.0.0.2", [self._svc(banner="opaque custom banner")])]
+        with patch(
+            "cauldron.ai.analyzer._call_claude",
+            return_value=json.dumps([{"index": 0, "cpes": []}]),
+        ):
+            out = _ai_cpes_for_batch(batch)
+        assert len(out) == 1
+        assert out[0]["cpes"] == []
+
+    def test_handles_multiple_cpes_per_service(self):
+        """A host may expose a stack (nginx fronting tomcat). Both CPEs kept."""
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
+
+        batch = [("10.0.0.3", [self._svc(port=443, product="nginx/tomcat stack")])]
+        fake_response = json.dumps([{
             "index": 0,
-            "cves": [{
-                "cve_id": "CVE-2021-41773",
-                "cvss": 7.5,
-                "severity": "HIGH",
-                "has_exploit": True,
-                "description": "Path traversal",
-            }],
+            "cpes": [
+                "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
+                "cpe:2.3:a:apache:tomcat:9.0.50:*:*:*:*:*:*:*",
+            ],
         }])
+        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+            out = _ai_cpes_for_batch(batch)
+        assert len(out[0]["cpes"]) == 2
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
-            # Mock link query to return linked=1
-            mock_result = MagicMock()
-            mock_result.single.return_value = {"linked": 1}
-            mock_session.run.return_value = mock_result
+    def test_index_out_of_range_dropped(self):
+        """AI index that points past the service list is ignored, not crashed on."""
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
 
-            cves, services = _apply_ai_cves(response, pairs)
-            assert cves == 1
-            assert services == 1
+        batch = [("10.0.0.4", [self._svc(port=22)])]
+        fake_response = json.dumps([
+            {"index": 0, "cpes": ["cpe:2.3:a:openbsd:openssh:7.4:*:*:*:*:*:*:*"]},
+            {"index": 99, "cpes": ["cpe:2.3:a:fake:stuff:1.0:*:*:*:*:*:*:*"]},
+        ])
+        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+            out = _ai_cpes_for_batch(batch)
+        assert len(out) == 1
+        assert out[0]["port"] == 22
 
-    def test_fallback_to_product_version(self):
-        """When no index provided, falls back to product+version fields."""
-        from cauldron.ai.analyzer import _apply_ai_cves
+    def test_empty_batch_returns_empty(self):
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
+        assert _ai_cpes_for_batch([]) == []
 
-        response = json.dumps([{
-            "product": "Apache",
-            "version": "2.4.49",
-            "cves": [{"cve_id": "CVE-2021-41773", "cvss": 7.5}],
-        }])
+    def test_claude_unavailable_returns_empty(self):
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
-            mock_result = MagicMock()
-            mock_result.single.return_value = {"linked": 1}
-            mock_session.run.return_value = mock_result
+        batch = [("10.0.0.5", [self._svc(port=80)])]
+        with patch("cauldron.ai.analyzer._call_claude", return_value=None):
+            assert _ai_cpes_for_batch(batch) == []
 
-            cves, services = _apply_ai_cves(response)
-            assert cves == 1
+    def test_prompt_includes_servicefp_and_banner(self):
+        """The whole point of this phase is feeding AI the raw signals
+        nmap itself couldn't resolve. Make sure both land in the prompt."""
+        from cauldron.ai.analyzer import _ai_cpes_for_batch
 
-    def test_skips_invalid_cve_ids(self):
-        from cauldron.ai.analyzer import _apply_ai_cves
+        batch = [("10.0.0.6", [self._svc(
+            port=8443,
+            banner="Server: Artica Proxy v4.40",
+            servicefp="NULL,\\n\\n\\nGetRequest,\\n\\n\\n...",
+        )])]
 
-        response = json.dumps([{
-            "index": 0,
-            "cves": [{"cve_id": "NOT-A-CVE", "cvss": 5.0}],
-        }])
+        captured: dict = {}
 
-        with patch("cauldron.ai.analyzer.get_session") as mock_get_session:
-            mock_session = MagicMock()
-            mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
-            mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
+        def fake_call(prompt, max_tokens=None):  # noqa: ARG001
+            captured["prompt"] = prompt
+            return json.dumps([{"index": 0, "cpes": []}])
 
-            cves, services = _apply_ai_cves(response, [("Apache", "2.4.49")])
-            assert cves == 0
-            assert services == 0
+        with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
+            _ai_cpes_for_batch(batch)
 
-    def test_handles_invalid_json(self):
-        from cauldron.ai.analyzer import _apply_ai_cves
-
-        cves, services = _apply_ai_cves("not json")
-        assert cves == 0
-        assert services == 0
+        assert "Artica Proxy" in captured["prompt"]
+        assert "GetRequest" in captured["prompt"]
 
 
 # --- Integration tests (require Neo4j) ---

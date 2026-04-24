@@ -1,13 +1,22 @@
 """AI-powered network analysis using Claude API.
 
-Four integrated AI phases that directly affect the graph:
-1. CVE discovery — find vulnerabilities NVD missed based on product+version
-2. Host classification — re-classify ambiguous hosts (anonymized)
-3. Attack chain discovery — find non-obvious attack insights (anonymized)
-4. False positive detection — AI reviews CVE assignments and marks misclassifications
+Three integrated AI phases that directly affect the graph:
 
-Phases 2-4 anonymize all client data (IPs, hostnames) before sending to AI API.
-Only product names, versions, ports, CVEs, and OS info are sent — these are public knowledge.
+1. CPE extraction — for services where nmap had partial signal (raw
+   servicefp, banner, vendor string not in PRODUCT_CPE_MAP), ask the
+   LLM to distill a CPE 2.3 identifier, then run the standard NVD CPE
+   query. AI augments product→CPE mapping; NVD remains the authority
+   on CVE → product applicability. Self-correcting: hallucinated CPEs
+   return NVD 404 and drop out.
+2. Host classification — re-classify ambiguous hosts (anonymized).
+3. Contextual vuln triage — AI reviews every NVD/exploit_db finding with
+   engagement context (scan positions, owned, target) and dismisses
+   noise, keeps gold.
+
+Phase 2 & 3 anonymize client data (IPs, hostnames) before leaving the
+process. Phase 1 sends product strings, banners, and servicefp probe
+responses — public knowledge about the software running, not about the
+engagement.
 """
 
 from __future__ import annotations
@@ -45,7 +54,8 @@ def is_ai_available() -> bool:
 def analyze_graph() -> AnalysisResult:
     """Run all AI analysis phases on the current graph.
 
-    Phase 1: Find CVEs that NVD missed (based on product+version).
+    Phase 1: Extract CPEs from services nmap couldn't fully identify,
+             then let the standard NVD pipeline find CVEs for those CPEs.
     Phase 2: Re-classify ambiguous hosts.
     Phase 3: Contextual engagement triage — AI reviews every vuln with the
              scan-position / owned / target context and dismisses the noise
@@ -60,8 +70,9 @@ def analyze_graph() -> AnalysisResult:
 
     result = AnalysisResult()
 
-    # Phase 1: AI CVE enrichment (most impactful — fills the CVSS/exploit columns)
-    cves, services = _ai_enrich_cves()
+    # Phase 1: AI CPE extraction for services with banners / servicefp
+    # that nmap and PRODUCT_CPE_MAP couldn't resolve on their own.
+    cves, services = _ai_extract_cpes()
     result.cves_found = cves
     result.services_enriched = services
 
@@ -92,153 +103,267 @@ def analyze_graph() -> AnalysisResult:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: AI CVE Enrichment
+# Phase 1: AI CPE Extraction
 # ---------------------------------------------------------------------------
 
+# CPE 2.3 layout: ``cpe:2.3:<part>:<vendor>:<product>:<version>:<update>:
+# <edition>:<language>:<sw_edition>:<target_sw>:<target_hw>:<other>``.
+# Thirteen colon-separated fields total. Validate format before trusting
+# AI output — malformed strings break NVD queries downstream.
+_CPE23_RE = re.compile(
+    r"^cpe:2\.3:[aoh]:[^:\s]+:[^:\s]+:[^:\s]+:[^:\s]*:[^:\s]*:[^:\s]*:"
+    r"[^:\s]*:[^:\s]*:[^:\s]*:[^:\s]*$",
+)
 
-def _ai_enrich_cves() -> tuple[int, int]:
-    """Ask AI to identify CVEs for services that NVD couldn't match.
+# How many hosts packed into one AI request. Host-level batching keeps the
+# adjacent services of a host visible together (SMTP + IMAP + webmail → mail
+# stack) so the LLM can cross-reference. Five hosts stay well under token
+# limits with servicefp probe responses of a few hundred bytes each.
+_HOSTS_PER_AI_BATCH = 5
 
-    Uses index-based referencing to avoid product name mismatch between
-    AI response and Neo4j data.
+
+def _ai_extract_cpes() -> tuple[int, int]:
+    """Ask AI to extract CPE identifiers from services nmap couldn't fully identify.
+
+    Targets services where nmap has SOME signal (``servicefp`` probe
+    response, banner, product string) but Cauldron's own
+    ``_get_cpe_for_service`` could not derive a CPE from nmap's CPE tag
+    or ``PRODUCT_CPE_MAP``. The LLM distills the raw signal into a CPE
+    2.3 tuple, then the standard NVD CPE enrichment runs over each
+    extracted CPE.
+
+    Self-correcting against hallucinations: NVD is the authoritative
+    CPE dictionary. An AI-invented ``cpe:2.3:a:madeup:vendor:1.0`` will
+    come back with zero CVEs and simply not link anything. Real CPEs
+    for the wrong product remain a residual risk, bounded by the
+    targeting rule — only services where nmap couldn't identify the
+    product itself are sent for AI extraction, so there's nothing for
+    the AI result to contradict.
 
     Returns:
-        (total_cves_created, services_enriched)
+        (total_cves_linked, services_enriched)
     """
-    # Get services with product+version but no CVEs
+    from cauldron.ai.cve_enricher import _get_cpe_for_service, _query_nvd_cpe
+
     with get_session() as session:
         result = session.run(
             """
             MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)
-            WHERE s.product IS NOT NULL AND s.version IS NOT NULL
-            AND NOT (s)-[:HAS_VULN]->(:Vulnerability)
-            RETURN DISTINCT s.product AS product, s.version AS version
-            """
+            WHERE NOT (s)-[:HAS_VULN]->(:Vulnerability {source: 'nvd'})
+              AND (
+                    s.servicefp IS NOT NULL
+                    OR s.banner   IS NOT NULL
+                    OR s.product  IS NOT NULL
+                  )
+            RETURN h.ip AS ip, h.os_name AS os_name,
+                   s.port AS port, s.protocol AS protocol,
+                   s.name AS name, s.product AS product, s.version AS version,
+                   s.extra_info AS extra_info, s.banner AS banner,
+                   s.servicefp AS servicefp, s.cpe AS cpe
+            ORDER BY h.ip, s.port
+            """,
         )
-        pairs = [(r["product"], r["version"]) for r in result]
+        rows = [dict(r) for r in result]
 
-    if not pairs:
+    # Only services Cauldron couldn't map itself. If the standard pipeline
+    # already has a CPE for this service, NVD enrichment will handle it —
+    # no AI needed, no false-positive risk.
+    candidates: list[dict] = []
+    for row in rows:
+        cpe_list = row["cpe"].split(";") if row["cpe"] else []
+        if _get_cpe_for_service(cpe_list, row["product"], row["version"]):
+            continue
+        candidates.append(row)
+
+    if not candidates:
         return 0, 0
 
-    # Build indexed prompt — AI returns index, we match by original product+version
-    lines = [f"{i}. {p} {v}" for i, (p, v) in enumerate(pairs)]
-    prompt = f"""You are a vulnerability researcher. For each software product+version below, list known CVEs with CVSS scores.
+    logger.info(
+        "AI CPE extraction: %d candidate services across %d hosts",
+        len(candidates),
+        len({c["ip"] for c in candidates}),
+    )
 
-Products:
-{chr(10).join(lines)}
+    from collections import defaultdict
+    by_host: dict[str, list[dict]] = defaultdict(list)
+    for c in candidates:
+        by_host[c["ip"]].append(c)
+    hosts_list = list(by_host.items())
 
-Respond with ONLY a JSON array:
-[{{"index": 0, "cves": [{{"cve_id": "CVE-YYYY-NNNNN", "cvss": 7.5, "severity": "HIGH", "has_exploit": true, "description": "brief"}}]}}]
-
-Rules:
-- "index" must match the product number from the list above
-- Only include REAL, published CVEs (no guessing)
-- Include CVSS v3.1 score
-- has_exploit = true only if public exploit exists (ExploitDB, Metasploit, GitHub PoC)
-- If no known CVEs for a product, omit it from the array
-- Focus on pentester-relevant CVEs: RCE, auth bypass, privesc, not DoS or info disclosure
-- Respond with ONLY the JSON, no other text"""
-
-    response = _call_claude(prompt, max_tokens=2048)
-    if not response:
-        return 0, 0
-
-    return _apply_ai_cves(response, pairs)
-
-
-def _apply_ai_cves(response: str, pairs: list[tuple[str, str]] | None = None) -> tuple[int, int]:
-    """Parse AI CVE response and create Vulnerability nodes.
-
-    Uses index-based matching: AI returns {"index": N} which maps to
-    the original product+version pair, avoiding name mismatch issues.
-    """
-    data = _parse_json_response(response)
-    if not isinstance(data, list):
-        return 0, 0
-
-    total_cves = 0
+    total_vulns = 0
     services_enriched = 0
-
-    with get_session() as session:
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            # Resolve product+version from index or fallback to direct fields
-            idx = item.get("index")
-            if idx is not None and pairs and isinstance(idx, int) and 0 <= idx < len(pairs):
-                product, version = pairs[idx]
-            else:
-                product = item.get("product")
-                version = item.get("version")
-
-            cves = item.get("cves", [])
-            if not product or not version or not cves:
-                continue
-
-            svc_cve_count = 0
-            for cve in cves:
-                if not isinstance(cve, dict):
+    for i in range(0, len(hosts_list), _HOSTS_PER_AI_BATCH):
+        batch = hosts_list[i : i + _HOSTS_PER_AI_BATCH]
+        extracted = _ai_cpes_for_batch(batch)
+        if not extracted:
+            continue
+        for entry in extracted:
+            linked_here = 0
+            for cpe23 in entry.get("cpes", []):
+                if not _is_valid_cpe23(cpe23):
+                    logger.info("AI returned invalid CPE, dropping: %s", cpe23)
                     continue
-                cve_id = cve.get("cve_id", "")
-                if not cve_id.startswith("CVE-"):
+                try:
+                    cves = _query_nvd_cpe(cpe23)
+                except Exception:  # noqa: BLE001
+                    logger.exception("NVD query failed for AI CPE %s", cpe23)
                     continue
-
-                # Verify CVE via NVD API — never trust AI-generated CVSS/description
-                from cauldron.ai.cve_enricher import verify_cve_via_nvd
-
-                verified = verify_cve_via_nvd(cve_id)
-                if verified:
-                    # Use real NVD data instead of AI hallucinations
-                    cvss = verified.cvss or 0.0
-                    severity = verified.severity or "MEDIUM"
-                    has_exploit = verified.has_exploit
-                    description = verified.description or ""
-                    exploit_url = verified.exploit_url
-                else:
-                    # CVE not in NVD or rejected — skip it entirely
-                    logger.info("AI CVE %s not verified by NVD — skipping", cve_id)
+                if not cves:  # empty list or None (404) — AI CPE unknown to NVD
                     continue
-
-                # Create Vulnerability node with verified NVD data
-                session.run(
-                    """
-                    MERGE (v:Vulnerability {cve_id: $cve_id})
-                    ON CREATE SET
-                        v.cvss = $cvss, v.severity = $severity,
-                        v.has_exploit = $has_exploit, v.description = $description,
-                        v.exploit_url = $exploit_url,
-                        v.source = 'ai', v.confidence = 'check'
-                    """,
-                    cve_id=cve_id, cvss=cvss, severity=severity,
-                    has_exploit=has_exploit, description=description,
-                    exploit_url=exploit_url,
-                )
-
-                # Link to matching services using exact product+version from our data
-                # Count only NEW links (not already existing)
-                link_result = session.run(
-                    """
-                    MATCH (s:Service)
-                    WHERE s.product = $product AND s.version = $version
-                    AND NOT (s)-[:HAS_VULN]->(:Vulnerability {cve_id: $cve_id})
-                    MATCH (v:Vulnerability {cve_id: $cve_id})
-                    MERGE (s)-[:HAS_VULN]->(v)
-                    RETURN count(s) AS linked
-                    """,
-                    product=product, version=version, cve_id=cve_id,
-                )
-                linked = link_result.single()
-                new_links = linked["linked"] if linked else 0
-                if new_links > 0:
-                    svc_cve_count += 1
-                    total_cves += 1
-                    logger.info("AI linked %s to %s %s (%d services)", cve_id, product, version, new_links)
-
-            if svc_cve_count > 0:
+                for cve in cves:
+                    if _link_ai_cve_to_service(entry, cve):
+                        linked_here += 1
+                        total_vulns += 1
+            if linked_here:
                 services_enriched += 1
 
-    return total_cves, services_enriched
+    return total_vulns, services_enriched
+
+
+def _is_valid_cpe23(cpe: str) -> bool:
+    """Reject obviously malformed CPE strings before sending to NVD."""
+    return isinstance(cpe, str) and bool(_CPE23_RE.match(cpe))
+
+
+def _truncate(text: str | None, limit: int) -> str:
+    """Clip a banner / fingerprint to ``limit`` chars and collapse newlines
+    so the prompt stays readable and token-bounded.
+    """
+    if not text:
+        return ""
+    clipped = text[:limit].replace("\n", " ").replace("\r", " ").strip()
+    return clipped + ("…" if len(text) > limit else "")
+
+
+def _ai_cpes_for_batch(batch: list[tuple[str, list[dict]]]) -> list[dict]:
+    """Send a batch of hosts' unidentified services to Claude, return CPE tuples.
+
+    Output shape per entry:
+        {"ip": str, "port": int, "protocol": str, "cpes": list[str]}
+    """
+    host_blocks: list[str] = []
+    index_map: list[dict] = []  # position → {ip, port, protocol}
+
+    for ip, services in batch:
+        os_label = services[0].get("os_name") or "unknown"
+        svc_lines: list[str] = []
+        for svc in services:
+            idx = len(index_map)
+            index_map.append(
+                {"ip": ip, "port": svc["port"], "protocol": svc["protocol"]},
+            )
+            parts = [f"#{idx} {svc['port']}/{svc['protocol']}"]
+            if svc.get("name"):
+                parts.append(f"name={svc['name']}")
+            if svc.get("product"):
+                parts.append(f"product={svc['product']!r}")
+            if svc.get("version"):
+                parts.append(f"version={svc['version']!r}")
+            if svc.get("extra_info"):
+                parts.append(f"extra={_truncate(svc['extra_info'], 120)!r}")
+            if svc.get("banner"):
+                parts.append(f"banner={_truncate(svc['banner'], 200)!r}")
+            if svc.get("servicefp"):
+                parts.append(f"fp={_truncate(svc['servicefp'], 400)!r}")
+            svc_lines.append(" ".join(parts))
+        host_blocks.append(f"Host (OS: {os_label}):\n  " + "\n  ".join(svc_lines))
+
+    if not index_map:
+        return []
+
+    prompt = f"""You are a vulnerability analyst. Extract CPE 2.3 identifiers from the service data below.
+
+Each line is labelled "#N" where N is the service index. Respond with CPE 2.3 format:
+  cpe:2.3:a:<vendor>:<product>:<version>:*:*:*:*:*:*:*
+
+Use part type "a" for applications and "o" for operating systems. Use the NVD-registered vendor/product names — e.g. apache:http_server, openbsd:openssh, postgresql:postgresql, microsoft:exchange_server, f5:nginx (NVD uses "f5" for nginx post-acquisition), vmware:esxi, mikrotik:routeros.
+
+Rules:
+- One service may expose multiple products (e.g. nginx fronting tomcat). Return each as a separate CPE in the cpes list.
+- If version cannot be determined, use "*".
+- If you CANNOT confidently identify the product, return an empty cpes list. DO NOT GUESS. Empty is better than wrong — a wrong CPE pins CVEs for a different product onto this service.
+- Skip entries where the service is clearly generic Microsoft RPC / netbios-ssn / similar protocol-level listeners with no specific vendor product.
+
+=== SERVICES ===
+{chr(10).join(host_blocks)}
+
+Respond with ONLY JSON, no prose, no markdown fences:
+[
+  {{"index": 0, "cpes": ["cpe:2.3:a:vendor:product:version:*:*:*:*:*:*:*"]}},
+  {{"index": 1, "cpes": []}}
+]"""
+
+    response = _call_claude(prompt, max_tokens=4096)
+    if not response:
+        return []
+
+    data = _parse_json_response(response)
+    if not isinstance(data, list):
+        return []
+
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(index_map):
+            continue
+        cpes = item.get("cpes", [])
+        if not isinstance(cpes, list):
+            continue
+        coords = index_map[idx]
+        out.append({**coords, "cpes": [c for c in cpes if isinstance(c, str)]})
+    return out
+
+
+def _link_ai_cve_to_service(coords: dict, cve) -> bool:
+    """Create / refresh a Vulnerability node and link it to the exact service
+    that produced the CPE match. Returns True if a new HAS_VULN was created.
+    """
+    with get_session() as session:
+        session.run(
+            """
+            MERGE (v:Vulnerability {cve_id: $cve_id})
+            ON CREATE SET
+                v.cvss = $cvss,
+                v.cvss_vector = $vector,
+                v.severity = $severity,
+                v.description = $description,
+                v.has_exploit = $has_exploit,
+                v.exploit_url = $exploit_url,
+                v.in_cisa_kev = $in_cisa_kev,
+                v.cisa_kev_added = $cisa_kev_added,
+                v.source = 'ai',
+                v.confidence = 'check'
+            ON MATCH SET
+                v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
+                v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END
+            """,
+            cve_id=cve.cve_id,
+            cvss=cve.cvss,
+            vector=cve.cvss_vector,
+            severity=cve.severity,
+            description=cve.description,
+            has_exploit=cve.has_exploit,
+            exploit_url=cve.exploit_url,
+            in_cisa_kev=cve.in_cisa_kev,
+            cisa_kev_added=cve.cisa_kev_added,
+        )
+
+        result = session.run(
+            """
+            MATCH (s:Service {host_ip: $ip, port: $port, protocol: $proto})
+            WHERE NOT (s)-[:HAS_VULN]->(:Vulnerability {cve_id: $cve_id})
+            MATCH (v:Vulnerability {cve_id: $cve_id})
+            MERGE (s)-[:HAS_VULN]->(v)
+            RETURN s.host_ip AS linked
+            """,
+            ip=coords["ip"],
+            port=coords["port"],
+            proto=coords["protocol"],
+            cve_id=cve.cve_id,
+        )
+        return result.single() is not None
 
 
 # ---------------------------------------------------------------------------
