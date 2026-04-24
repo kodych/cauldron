@@ -197,6 +197,74 @@ class TestParseCVE:
         assert cve is not None
         assert cve.cvss == 7.5
 
+    def test_parse_cve_v40_primary(self):
+        """NVD tags new CVEs (post-2023) with CVSS 4.0. Without v40 in
+        the preference chain, modern findings came back cvss=None and
+        the UI showed "N/A" — a regression that hit every fresh vuln
+        the moment NVD migrated its scoring methodology."""
+        cve_data = {
+            "id": "CVE-2024-9999",
+            "descriptions": [{"lang": "en", "value": "Hypothetical v4-only CVE"}],
+            "metrics": {
+                "cvssMetricV40": [
+                    {
+                        "cvssData": {
+                            "version": "4.0",
+                            "baseScore": 8.7,
+                            "vectorString": (
+                                "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/"
+                                "VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+                            ),
+                            "baseSeverity": "HIGH",
+                        },
+                    },
+                ],
+            },
+            "references": [],
+        }
+        cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.cvss == 8.7
+        assert cve.severity == "HIGH"
+        assert cve.cvss_vector and cve.cvss_vector.startswith("CVSS:4.0/")
+
+    def test_parse_cve_prefers_v40_over_v31_when_both_present(self):
+        """NVD sometimes backports both v31 and v40 onto the same CVE.
+        The v40 score reflects the current (post-2023) methodology and
+        must win — pin that so a future re-ordering of the preference
+        chain can't silently regress the source-of-truth choice."""
+        cve_data = {
+            "id": "CVE-2024-8888",
+            "descriptions": [{"lang": "en", "value": "Dual-scored CVE"}],
+            "metrics": {
+                "cvssMetricV40": [
+                    {
+                        "cvssData": {
+                            "version": "4.0",
+                            "baseScore": 7.3,
+                            "vectorString": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+                            "baseSeverity": "HIGH",
+                        },
+                    },
+                ],
+                "cvssMetricV31": [
+                    {
+                        "cvssData": {
+                            "baseScore": 9.8,
+                            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                            "baseSeverity": "CRITICAL",
+                        },
+                    },
+                ],
+            },
+            "references": [],
+        }
+        cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.cvss == 7.3
+        assert cve.severity == "HIGH"
+        assert cve.cvss_vector and cve.cvss_vector.startswith("CVSS:4.0/")
+
     def test_parse_cve_no_id_returns_none(self):
         assert _parse_cve({}) is None
 

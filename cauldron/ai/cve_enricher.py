@@ -11,7 +11,7 @@ Strategy (in order of accuracy):
 Features:
 - Local JSON file cache to avoid repeated API calls
 - Rate limiting (NVD: 5 req/30s without key, 50 req/30s with key)
-- CVSS v3.1/v3.0/v2 score extraction
+- CVSS v4.0/v3.1/v3.0/v2 score extraction
 - Version validation against CVE configurations
 - Filters disputed/rejected CVEs
 """
@@ -1143,13 +1143,20 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
             description = desc.get("value", "")
             break
 
-    # CVSS score (prefer v3.1 > v3.0 > v2)
+    # CVSS score — prefer the newest methodology NVD exposes. Since late
+    # 2023 NVD has been tagging new CVEs with v4.0 (``cvssMetricV40``);
+    # without it in the chain post-2024 CVEs came back as cvss=None and
+    # the UI showed "N/A" on fresh findings. v40/v31/v30 all share the
+    # same inner shape (cvssData.{baseScore, vectorString, baseSeverity}),
+    # so the same branch handles all three. v2's severity field sits at
+    # the entry level, not inside cvssData — that asymmetry is NVD's,
+    # not ours, and stays in its own branch below.
     cvss = None
     cvss_vector = None
     severity = None
     metrics = cve_data.get("metrics", {})
 
-    for metric_key in ("cvssMetricV31", "cvssMetricV30"):
+    for metric_key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30"):
         if metric_key in metrics and metrics[metric_key]:
             cvss_data = metrics[metric_key][0].get("cvssData", {})
             cvss = cvss_data.get("baseScore")
