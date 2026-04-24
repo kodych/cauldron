@@ -197,6 +197,10 @@ class AnalyzeResponse(BaseModel):
     ai_vulns_dismissed: int = 0
     ai_targets_set: int = 0
     ai_cves_found: int = 0
+    # Populated when the Anthropic key is rejected during boil so the UI
+    # can show a prominent "fix your API key" banner instead of
+    # reporting every AI counter as zero.
+    ai_auth_error: str | None = None
 
 
 class VulnStatusUpdate(BaseModel):
@@ -941,6 +945,7 @@ def _run_analysis_pipeline(
     ai_dismissed = 0
     ai_targets = 0
     ai_cves = 0
+    ai_auth_error: str | None = None
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
@@ -951,6 +956,7 @@ def _run_analysis_pipeline(
             ai_dismissed = ai_result.vulns_dismissed
             ai_cves = ai_result.cves_found
             ai_targets = ai_result.targets_set
+            ai_auth_error = ai_result.auth_error
 
     if ai and (ai_dismissed or ai_cves):
         summary = get_path_summary()
@@ -966,6 +972,7 @@ def _run_analysis_pipeline(
         ai_vulns_dismissed=ai_dismissed,
         ai_targets_set=ai_targets,
         ai_cves_found=ai_cves,
+        ai_auth_error=ai_auth_error,
     )
 
 

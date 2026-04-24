@@ -367,6 +367,13 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
                 <Check size={13} className="text-orange-400" />
                 <span className="text-xs font-medium text-orange-400">Analysis complete</span>
               </div>
+              {analyzeResult.ai_auth_error && (
+                <div className="mb-2 rounded border border-red-700 bg-red-950/40 px-2 py-1.5 text-xs text-red-300">
+                  <span className="font-semibold text-red-200">AI aborted:</span>{' '}
+                  {analyzeResult.ai_auth_error}. Fix <code className="text-red-200">CAULDRON_ANTHROPIC_API_KEY</code> and
+                  re-run analysis.
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
                 {analyzeResult.classification?.classified != null && (
                   <>

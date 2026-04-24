@@ -129,8 +129,14 @@ class TestCallClaude:
                 assert result == "test response"
                 mock_client.messages.create.assert_called_once()
 
-    def test_auth_error(self):
-        from cauldron.ai.analyzer import _call_claude
+    def test_auth_error_raises_to_short_circuit_pipeline(self):
+        """``_call_claude`` must raise ClaudeAuthError on a 401 instead
+        of returning None — otherwise every AI phase in a boil burns a
+        second Anthropic request with the same bad key and logs
+        duplicate 'Invalid API key' noise."""
+        import pytest
+
+        from cauldron.ai.analyzer import ClaudeAuthError, _call_claude
 
         with patch("cauldron.ai.analyzer.settings") as mock_settings:
             mock_settings.anthropic_api_key = "bad-key"
@@ -144,8 +150,8 @@ class TestCallClaude:
                 )
                 mock_anthropic.return_value = mock_client
 
-                result = _call_claude("test")
-                assert result is None
+                with pytest.raises(ClaudeAuthError):
+                    _call_claude("test")
 
     def test_rate_limit(self):
         from cauldron.ai.analyzer import _call_claude
@@ -182,6 +188,35 @@ class TestAnalyzeGraph:
             result = analyze_graph()
             assert isinstance(result, AnalysisResult)
             assert result.cves_found == 0
+
+    def test_auth_error_short_circuits_remaining_phases(self):
+        """Phase 1's first _call_claude hits 401 → remaining phases must
+        NOT be attempted. Caller sees ``result.auth_error`` populated
+        (so UI can surface a banner) instead of silent zeros across
+        every counter."""
+        from cauldron.ai.analyzer import ClaudeAuthError
+
+        classify_mock = MagicMock(return_value=0)
+        triage_mock = MagicMock(return_value=(0, 0, 0))
+
+        with (
+            patch("cauldron.ai.analyzer.is_ai_available", return_value=True),
+            patch(
+                "cauldron.ai.analyzer._ai_extract_cpes",
+                side_effect=ClaudeAuthError("Invalid Anthropic API key"),
+            ),
+            patch("cauldron.ai.analyzer._classify_ambiguous_hosts", classify_mock),
+            patch("cauldron.ai.analyzer._contextual_vuln_triage", triage_mock),
+        ):
+            result = analyze_graph()
+
+        assert result.auth_error == "Invalid Anthropic API key"
+        # Phases 2 and 3 must not have run.
+        classify_mock.assert_not_called()
+        triage_mock.assert_not_called()
+        assert result.ambiguous_classified == 0
+        assert result.vulns_kept == 0
+        assert result.vulns_dismissed == 0
 
 
 class TestIsValidCpe23:

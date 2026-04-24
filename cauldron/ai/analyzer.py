@@ -33,6 +33,12 @@ from cauldron.graph.connection import get_session
 logger = logging.getLogger(__name__)
 
 
+class ClaudeAuthError(Exception):
+    """Anthropic API rejected the key. Raised from ``_call_claude`` so the
+    entire analysis pipeline short-circuits on the first phase, instead
+    of burning three rounds of log noise and returning silent zeros."""
+
+
 @dataclass
 class AnalysisResult:
     """Result of AI analysis run."""
@@ -44,6 +50,10 @@ class AnalysisResult:
     vulns_kept: int = 0
     vulns_dismissed: int = 0
     targets_set: int = 0
+    # Populated when the Anthropic key is rejected. Callers (CLI, API)
+    # read this to show a prominent failure message instead of silently
+    # reporting "0 insights" across every counter.
+    auth_error: str | None = None
 
 
 def is_ai_available() -> bool:
@@ -70,23 +80,34 @@ def analyze_graph() -> AnalysisResult:
 
     result = AnalysisResult()
 
-    # Phase 1: AI CPE extraction for services with banners / servicefp
-    # that nmap and PRODUCT_CPE_MAP couldn't resolve on their own.
-    cves, services = _ai_extract_cpes()
-    result.cves_found = cves
-    result.services_enriched = services
+    # One try/except wraps all three phases. ClaudeAuthError is raised
+    # by the very first ``_call_claude`` invocation that 401s, so we
+    # don't waste two more phases retrying with the same bad key.
+    try:
+        # Phase 1: AI CPE extraction for services with banners / servicefp
+        # that nmap and PRODUCT_CPE_MAP couldn't resolve on their own.
+        cves, services = _ai_extract_cpes()
+        result.cves_found = cves
+        result.services_enriched = services
 
-    # Phase 2: Re-classify ambiguous hosts
-    result.ambiguous_classified = _classify_ambiguous_hosts()
+        # Phase 2: Re-classify ambiguous hosts
+        result.ambiguous_classified = _classify_ambiguous_hosts()
 
-    # Phase 3: Contextual engagement triage
-    # AI reviews ALL vulns with engagement context (owned/target/scan sources)
-    # and dismisses noise — keeping only gold findings
-    kept, dismissed, targets = _contextual_vuln_triage()
-    result.vulns_kept = kept
-    result.vulns_dismissed = dismissed
-    result.false_positives_found = dismissed
-    result.targets_set = targets
+        # Phase 3: Contextual engagement triage
+        # AI reviews ALL vulns with engagement context (owned/target/scan sources)
+        # and dismisses noise — keeping only gold findings
+        kept, dismissed, targets = _contextual_vuln_triage()
+        result.vulns_kept = kept
+        result.vulns_dismissed = dismissed
+        result.false_positives_found = dismissed
+        result.targets_set = targets
+    except ClaudeAuthError as e:
+        result.auth_error = str(e)
+        logger.error(
+            "AI analysis aborted: %s. Remaining phases skipped — "
+            "fix CAULDRON_ANTHROPIC_API_KEY and re-run boil.", e,
+        )
+        return result
 
     # Recount AI CVEs that survived triage (not dismissed)
     with get_session() as session:
@@ -853,9 +874,13 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
             messages=[{"role": "user", "content": prompt}],
         )
         return message.content[0].text
-    except anthropic.AuthenticationError:
+    except anthropic.AuthenticationError as e:
+        # Short-circuit the whole boil pipeline — every subsequent phase
+        # would hit the same 401 and spam the same log line. Caller is
+        # ``analyze_graph`` which turns this into a user-visible
+        # ``AnalysisResult.auth_error`` message.
         logger.error("Invalid Anthropic API key. Check CAULDRON_ANTHROPIC_API_KEY.")
-        return None
+        raise ClaudeAuthError("Invalid Anthropic API key") from e
     except anthropic.RateLimitError:
         logger.warning("Anthropic API rate limit hit, skipping AI analysis")
         return None

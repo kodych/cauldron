@@ -191,6 +191,10 @@ export interface AnalyzeResponse {
   ai_vulns_dismissed?: number;
   ai_targets_set?: number;
   ai_cves_found?: number;
+  // Present when the Anthropic API key is rejected during boil. The UI
+  // surfaces this as a prominent banner so the operator knows why AI
+  // counters came back zero.
+  ai_auth_error?: string | null;
 }
 
 export type VulnStatus = 'exploited' | 'false_positive' | 'mitigated' | null;

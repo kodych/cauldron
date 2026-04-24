@@ -384,6 +384,11 @@ def boil(nvd: bool, ai: bool, run_all: bool):
             with console.status("[bold green]Running AI analysis (this may take a while)..."):
                 ai_result = analyze_graph()
 
+            if ai_result.auth_error:
+                console.print(
+                    f"  [bold red]! AI analysis aborted: {ai_result.auth_error}. "
+                    "Check CAULDRON_ANTHROPIC_API_KEY and re-run [cyan]cauldron boil[/cyan].[/bold red]"
+                )
             if ai_result.cves_found:
                 console.print(f"  [green]+[/green] AI found {ai_result.cves_found} CVEs across {ai_result.services_enriched} services")
             if ai_result.ambiguous_classified:
