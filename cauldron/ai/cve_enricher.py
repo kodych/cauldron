@@ -32,6 +32,19 @@ from cauldron.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class NvdTransientError(RuntimeError):
+    """Raised when NVD is unreachable after all retries (network errors,
+    5xx responses, malformed JSON).
+
+    The whole point of having a dedicated exception rather than returning
+    ``[]`` is to separate "NVD definitively told us zero CVEs" from "we
+    never got an authoritative answer". The first is a cacheable fact;
+    the second is a temporary hole that must not poison the cache for
+    the next seven days.
+    """
+
+
 # NVD API base URL
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -804,8 +817,12 @@ def _execute_nvd_query(
         if e.code == 404:
             logger.info("NVD CPE not found (404) for %s — will try keyword fallback", context)
             return None
-        logger.error("NVD API error %d for %s", e.code, context)
-        return []
+        # Non-404 HTTP error after retries (or a 4xx we do not retry). Raise
+        # so the caller skips caching — a 401 / 400 / 5xx-after-retries is
+        # not an authoritative "zero CVEs" answer and must not poison the
+        # 7-day cache with a false negative.
+        logger.error("NVD API error %d for %s — not cacheable", e.code, context)
+        raise NvdTransientError(f"HTTP {e.code} from NVD for {context}") from e
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         # Transient network error — retry with exponential backoff
         if _retries < 3:
@@ -819,7 +836,7 @@ def _execute_nvd_query(
                 url, context, product_hint, version_hint, version_applies_product, _retries + 1,
             )
         logger.error("NVD API request failed for %s after 3 retries: %s", context, e)
-        return []
+        raise NvdTransientError(f"NVD unreachable for {context}: {e}") from e
 
     # Normalize product hint for matching
     product_lower = product_hint.lower().strip() if product_hint else None
@@ -1164,47 +1181,64 @@ def enrich_service(
     if cached is not None:
         return EnrichmentResult(product=product, version=version or "", cves=cached, from_cache=True)
 
-    # Query NVD
+    # Query NVD. NvdTransientError bubbles up from _execute_nvd_query when
+    # NVD is unreachable after retries — we refuse to cache that outcome
+    # (empty list from a failed query would silently hide real CVEs for a
+    # week). Every other outcome (including a legitimate empty result) is
+    # authoritative and gets cached.
     cves: list[CVEInfo] = []
-    if cpe23:
-        cpe_result = _query_nvd_cpe(cpe23)
-        if cpe_result is None:
-            # CPE not recognized by NVD (404) — fall back to keyword search.
-            # Applies the three-rule strategy: if we have a parseable version,
-            # search "product version"; otherwise search by product alone and
-            # let _query_nvd_keyword return top-critical recent entries.
+    try:
+        if cpe23:
+            cpe_result = _query_nvd_cpe(cpe23)
+            if cpe_result is None:
+                # CPE not recognized by NVD (404) — fall back to keyword search.
+                # Applies the three-rule strategy: if we have a parseable version,
+                # search "product version"; otherwise search by product alone and
+                # let _query_nvd_keyword return top-critical recent entries.
+                clean_ver = _extract_version(version)
+                logger.info("CPE 404 for %s, falling back to keyword: %s %s", cpe23, product, clean_ver)
+                cves = _query_nvd_keyword(product, clean_ver)
+            elif not cpe_result and _has_specific_version(cpe23):
+                # Specific-version query returned zero CVEs. Common NVD quirk: a
+                # vendor pins CVEs to major version only (e.g.
+                # vmware:vcenter_server:7.0) but nmap reports a patch level
+                # (7.0.3), so literal match fails. Retry once with the version
+                # wildcarded out — works across vendors (not a product-specific
+                # hack), and preserves the "top-critical CVEs for this service"
+                # principle because _query_nvd_cpe still filters by CVSS.
+                relaxed = _relax_cpe_version(cpe23)
+                if relaxed and relaxed != cpe23:
+                    logger.info("CPE %s returned 0 CVEs, retrying with %s", cpe23, relaxed)
+                    # Thread the original service version so the applicability
+                    # filter can still do range/major.minor matching — without
+                    # this the relaxed CPE falls into the unconstrained-only
+                    # rule and drops every modern vendor CVE.
+                    cves = _query_nvd_cpe(relaxed, service_version_override=version) or []
+            else:
+                cves = cpe_result
+        elif version:
             clean_ver = _extract_version(version)
-            logger.info("CPE 404 for %s, falling back to keyword: %s %s", cpe23, product, clean_ver)
-            cves = _query_nvd_keyword(product, clean_ver)
-        elif not cpe_result and _has_specific_version(cpe23):
-            # Specific-version query returned zero CVEs. Common NVD quirk: a
-            # vendor pins CVEs to major version only (e.g.
-            # vmware:vcenter_server:7.0) but nmap reports a patch level
-            # (7.0.3), so literal match fails. Retry once with the version
-            # wildcarded out — works across vendors (not a product-specific
-            # hack), and preserves the "top-critical CVEs for this service"
-            # principle because _query_nvd_cpe still filters by CVSS.
-            relaxed = _relax_cpe_version(cpe23)
-            if relaxed and relaxed != cpe23:
-                logger.info("CPE %s returned 0 CVEs, retrying with %s", cpe23, relaxed)
-                # Thread the original service version so the applicability
-                # filter can still do range/major.minor matching — without
-                # this the relaxed CPE falls into the unconstrained-only
-                # rule and drops every modern vendor CVE.
-                cves = _query_nvd_cpe(relaxed, service_version_override=version) or []
+            if clean_ver != "*":
+                cves = _query_nvd_keyword(product, clean_ver)
+            else:
+                return EnrichmentResult(product=product, version=version or "", error="No parseable version")
         else:
-            cves = cpe_result
-    elif version:
-        clean_ver = _extract_version(version)
-        if clean_ver != "*":
-            cves = _query_nvd_keyword(product, clean_ver)
-        else:
-            return EnrichmentResult(product=product, version=version or "", error="No parseable version")
-    else:
-        # No CPE and no version — skip (too noisy)
-        return EnrichmentResult(product=product, version="", error="No CPE and no version")
+            # No CPE and no version — skip (too noisy)
+            return EnrichmentResult(product=product, version="", error="No CPE and no version")
+    except NvdTransientError as e:
+        # NVD failed transiently — skip without caching. Next run will
+        # retry with a clean slate instead of reading a poisoned empty
+        # result out of the 7-day cache.
+        logger.warning("NVD transient failure for %s %s: %s", product, version or "", e)
+        return EnrichmentResult(
+            product=product,
+            version=version or "",
+            error=f"NVD transient failure: {e}",
+        )
 
-    # Cache results (even empty — to avoid re-querying)
+    # Cache only authoritative NVD answers (including legitimate zero-CVE
+    # responses). Transient failures already returned above without touching
+    # the cache.
     cache.put(cache_key, cves)
 
     return EnrichmentResult(product=product, version=version or "", cves=cves)

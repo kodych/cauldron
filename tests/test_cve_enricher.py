@@ -1243,40 +1243,131 @@ class TestCVEAppliesTo:
 
 
 class TestExecuteNVDRetry:
-    """Test that retries are capped and don't recurse infinitely."""
+    """Retries are capped and exhaustion raises NvdTransientError.
+
+    Raising (instead of returning []) is the whole point of the
+    transient-vs-authoritative distinction: a failed query is not the
+    same as "NVD said zero CVEs" and must not poison the 7-day cache.
+    """
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
     @patch("cauldron.ai.cve_enricher._rate_limit")
     @patch("cauldron.ai.cve_enricher.time.sleep")
-    def test_403_retries_capped(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
-        """Persistent 403 should retry a bounded number of times."""
-        from cauldron.ai.cve_enricher import _execute_nvd_query
+    def test_403_retries_capped_then_raises(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
+        import pytest
+
+        from cauldron.ai.cve_enricher import NvdTransientError, _execute_nvd_query
 
         mock_settings.nvd_api_key = None
         mock_urlopen.side_effect = urllib_403_error()
 
-        result = _execute_nvd_query("https://example.com", "test")
-        assert result == []
-        # Initial attempt + 3 retries = 3 sleeps (exponential backoff)
+        with pytest.raises(NvdTransientError):
+            _execute_nvd_query("https://example.com", "test")
         assert mock_sleep.call_count == 3
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
     @patch("cauldron.ai.cve_enricher._rate_limit")
     @patch("cauldron.ai.cve_enricher.time.sleep")
-    def test_transient_network_error_retries(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
-        """Transient URLError/OSError should also retry with backoff."""
+    def test_transient_network_error_raises(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
+        """URLError / OSError / JSONDecodeError after retries raises."""
         import urllib.error
-        from cauldron.ai.cve_enricher import _execute_nvd_query
+
+        import pytest
+
+        from cauldron.ai.cve_enricher import NvdTransientError, _execute_nvd_query
 
         mock_settings.nvd_api_key = None
         mock_urlopen.side_effect = urllib.error.URLError("Connection timed out")
 
-        result = _execute_nvd_query("https://example.com", "test")
-        assert result == []
-        # Initial attempt + 3 retries = 3 sleeps
+        with pytest.raises(NvdTransientError):
+            _execute_nvd_query("https://example.com", "test")
         assert mock_sleep.call_count == 3
+
+    @patch("cauldron.ai.cve_enricher.settings")
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    @patch("cauldron.ai.cve_enricher._rate_limit")
+    def test_404_still_returns_none(self, mock_rate, mock_urlopen, mock_settings):
+        """404 remains the keyword-fallback signal — not a transient error."""
+        import urllib.error
+
+        from cauldron.ai.cve_enricher import _execute_nvd_query
+
+        mock_settings.nvd_api_key = None
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://nvd.nist.gov", 404, "Not Found", {}, None,
+        )
+
+        result = _execute_nvd_query("https://example.com", "test")
+        assert result is None
+
+
+class TestTransientErrorDoesNotPoisonCache:
+    """Transient NVD outage must NOT write an empty-list cache entry.
+
+    Before this guard, a failed query cached ``[]`` for 7 days, which meant
+    the next six boils would silently report zero CVEs for every affected
+    service without ever retrying.
+    """
+
+    @patch("cauldron.ai.cve_enricher.settings")
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    @patch("cauldron.ai.cve_enricher._rate_limit")
+    @patch("cauldron.ai.cve_enricher.time.sleep")
+    def test_network_failure_skips_cache(
+        self, mock_sleep, mock_rate, mock_urlopen, mock_settings, tmp_path,
+    ):
+        import urllib.error
+
+        from cauldron.ai.cve_enricher import CVECache, enrich_service
+
+        mock_settings.nvd_api_key = None
+        mock_urlopen.side_effect = urllib.error.URLError("Connection refused")
+
+        cache_file = tmp_path / "cache.json"
+        cache = CVECache(cache_file=cache_file)
+
+        result = enrich_service("Apache httpd", "2.4.49", cache=cache)
+
+        # Error surface to caller — not silent empty list
+        assert result.error is not None
+        assert "transient" in result.error.lower()
+        assert result.cves == []
+
+        # Critical: nothing written to cache, so next run will retry
+        assert cache.size == 0
+
+    @patch("cauldron.ai.cve_enricher.settings")
+    @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
+    @patch("cauldron.ai.cve_enricher._rate_limit")
+    def test_legitimate_empty_result_is_cached(
+        self, mock_rate, mock_urlopen, mock_settings, tmp_path,
+    ):
+        """Contrast case: when NVD authoritatively returns zero CVEs, that
+        IS cacheable — we don't want to re-query the same unknown product
+        every boil."""
+        import json as _json
+        from unittest.mock import MagicMock as _MagicMock
+
+        from cauldron.ai.cve_enricher import CVECache, enrich_service
+
+        mock_settings.nvd_api_key = None
+
+        mock_response = _MagicMock()
+        mock_response.read.return_value = _json.dumps({"vulnerabilities": []}).encode()
+        mock_urlopen.return_value = mock_response
+
+        cache_file = tmp_path / "cache.json"
+        cache = CVECache(cache_file=cache_file)
+
+        # Use a product we know will derive a CPE — Apache is in PRODUCT_CPE_MAP
+        result = enrich_service("Apache httpd", "2.4.49", cache=cache)
+
+        # Authoritative zero-CVE answer: no error, and cache gained an entry
+        assert result.error is None
+        assert result.cves == []
+        assert cache.size == 1
 
 
 def urllib_403_error():
