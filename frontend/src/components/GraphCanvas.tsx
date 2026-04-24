@@ -742,9 +742,11 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
               dataset the graph can take 5-15 seconds to fetch and
               layout — a bubbling cauldron reads as "the pipeline is
               actively working", which is what's happening, instead of
-              the neutral "please wait" of a spinner. */}
+              the neutral "please wait" of a spinner.
+              Use the 84×100 splash sprite (animated, 12 frames) — the
+              smaller anim-32 source turned mushy when scaled to 144. */}
           <img
-            src="/brand/cauldron-anim-32.webp"
+            src="/brand/cauldron-splash.webp"
             alt=""
             width={144}
             height={144}
