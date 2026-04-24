@@ -285,7 +285,19 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
       <div className="flex items-center gap-1.5 px-3 py-2">
         <Bug size={13} className="text-red-400" />
         <span className="text-xs font-medium text-gray-400">
-          Vulnerabilities ({grouped.filter(g => g.vuln.checked_status !== 'false_positive').length}{grouped.length !== vulns.length ? ` on ${vulns.filter(v => v.checked_status !== 'false_positive').length} ports` : ''})
+          {(() => {
+            const active = vulns.filter(v => v.checked_status !== 'false_positive');
+            const activeGroups = grouped.filter(g => g.vuln.checked_status !== 'false_positive');
+            // Distinct ports that carry at least one active finding — the
+            // earlier denominator used ``active.length`` (one entry per
+            // CVE×port pairing), so 5 CVEs each present on 2 ports read as
+            // "5 on 10 ports" instead of "5 on 2 ports".
+            const portCount = new Set(
+              active.map(v => v.port).filter((p): p is number => p != null),
+            ).size;
+            const suffix = portCount > 1 ? ` on ${portCount} ports` : '';
+            return `Vulnerabilities (${activeGroups.length}${suffix})`;
+          })()}
         </span>
       </div>
       <div className="px-3 pb-2 space-y-1">
