@@ -362,3 +362,74 @@ class TestNoDuplicates:
         _setup_network()
         result = collect_targets(filter_name="http")
         assert result.total == 1
+
+
+class TestFalsePositiveExclusion:
+    """Regression: once an operator marks a finding as false_positive, it
+    must drop out of every vuln-based collect filter. Enforced at the
+    match_vuln level in the query builder so a new vuln filter can't
+    silently re-introduce the leak.
+    """
+
+    def _setup_fp_fixture(self):
+        """WEB01: RCE vuln, operator marked as false_positive.
+        DB01: separate vuln, untouched."""
+        _setup_network()
+        with get_session() as session:
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed',
+                                      checked_status: 'false_positive',
+                                      ai_fp_reason: 'Patched — operator verified'}]
+                      ->(:Vulnerability {
+                    cve_id: 'CVE-2024-FP-TEST', cvss: 9.8,
+                    enables_pivot: true, has_exploit: true
+                })
+            """)
+            # DB01 gets a real (non-FP) confirmed vuln so the test asserts
+            # the filter returns what it should AND only what it should.
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
+                    cve_id: 'CVE-2024-REAL-TEST', cvss: 8.0,
+                    enables_pivot: true, has_exploit: true
+                })
+            """)
+
+    def test_vuln_filter_excludes_false_positive(self):
+        self._setup_fp_fixture()
+        result = collect_targets(filter_name="vuln")
+        ips = [h.ip for h in result.hosts]
+        assert "10.0.1.20" not in ips, "WEB01's FP vuln must be excluded"
+        assert "10.0.1.30" in ips, "DB01's real vuln still returned"
+
+    def test_exploitable_filter_excludes_false_positive(self):
+        self._setup_fp_fixture()
+        result = collect_targets(filter_name="exploitable")
+        ips = [h.ip for h in result.hosts]
+        assert "10.0.1.20" not in ips
+        assert "10.0.1.30" in ips
+
+    def test_rce_filter_excludes_false_positive(self):
+        self._setup_fp_fixture()
+        result = collect_targets(filter_name="rce")
+        ips = [h.ip for h in result.hosts]
+        assert "10.0.1.20" not in ips
+        assert "10.0.1.30" in ips
+
+    def test_other_checked_statuses_stay(self):
+        """Only 'false_positive' is dismissed. 'exploited' and 'mitigated'
+        are engagement verdicts, not disqualifications — keep them."""
+        _setup_network()
+        with get_session() as session:
+            session.run("""
+                MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed',
+                                      checked_status: 'exploited'}]
+                      ->(:Vulnerability {
+                    cve_id: 'CVE-2024-EXPL-TEST', cvss: 9.8,
+                    enables_pivot: true, has_exploit: true
+                })
+            """)
+        result = collect_targets(filter_name="exploitable")
+        assert "10.0.1.20" in [h.ip for h in result.hosts]

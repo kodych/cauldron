@@ -194,6 +194,13 @@ def collect_targets(
             # (confidence, checked_status) work without accidentally reading
             # node-scoped confidence from the shared Vulnerability.
             match_clauses.append("MATCH (h)-[:HAS_SERVICE]->(:Service)-[rel:HAS_VULN]->(v:Vulnerability)")
+            # Every vuln-based filter auto-excludes operator-dismissed
+            # findings. Enforced here, once, so a future new vuln filter
+            # can't silently re-introduce the "FP-marked vulns still come
+            # back from --filter exploitable" bug.
+            where_clauses.append(
+                "(rel.checked_status IS NULL OR rel.checked_status <> 'false_positive')",
+            )
         elif filt.get("match_service"):
             match_clauses.append("MATCH (h)-[:HAS_SERVICE]->(s:Service)")
         if filt.get("where"):
