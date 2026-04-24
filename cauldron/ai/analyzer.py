@@ -373,10 +373,22 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# How many ambiguous hosts per Claude request. 50 is a sweet spot:
+# small enough that the LLM doesn't lose track of indices and produce
+# sloppy matches, large enough that the fixed prompt overhead (role
+# list, instructions, JSON schema — ~200 tokens per call) amortises
+# across many hosts. A 500-host scan needs 10 calls at this size, and
+# progress logging makes the wait visible to the operator.
+_CLASSIFY_BATCH_SIZE = 50
+
+
 def _classify_ambiguous_hosts() -> int:
     """Use AI to classify hosts where rule-based classifier has low confidence.
 
     Anonymized: real IPs replaced with host-N aliases before sending to AI.
+    Processes every ambiguous host (role_confidence in (0, 0.6)) in
+    batches — the earlier LIMIT 15 hard-cap silently dropped everyone
+    past the fifteenth on networks with many partially-identified hosts.
     """
     with get_session() as session:
         result = session.run(
@@ -388,23 +400,54 @@ def _classify_ambiguous_hosts() -> int:
                             name: s.name, product: s.product, version: s.version}) AS services
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS current_role,
                    h.role_confidence AS confidence, services
-            LIMIT 15
-            """
+            ORDER BY h.ip
+            """,
         )
         hosts = list(result)
 
     if not hosts:
         return 0
 
+    total = len(hosts)
+    batch_total = (total + _CLASSIFY_BATCH_SIZE - 1) // _CLASSIFY_BATCH_SIZE
+    logger.info(
+        "AI classification: %d ambiguous hosts across %d batch%s",
+        total, batch_total, "" if batch_total == 1 else "es",
+    )
+
+    total_updated = 0
+    for i in range(0, total, _CLASSIFY_BATCH_SIZE):
+        batch = hosts[i : i + _CLASSIFY_BATCH_SIZE]
+        batch_num = i // _CLASSIFY_BATCH_SIZE + 1
+        logger.info(
+            "AI classification batch %d/%d (%d hosts)",
+            batch_num, batch_total, len(batch),
+        )
+        total_updated += _classify_ambiguous_batch(batch)
+
+    return total_updated
+
+
+def _classify_ambiguous_batch(hosts: list) -> int:
+    """Classify one batch of ambiguous hosts via Claude, write results.
+
+    Returns the number of hosts whose role was actually updated in the
+    graph (``_apply_classifications`` refuses to downgrade).
+    """
     ip_map, reverse_map = _build_anonymization_map([h["ip"] for h in hosts])
 
     # Compact prompt with anonymized IPs, no hostnames
     lines = []
     for h in hosts:
         alias = ip_map[h["ip"]]
-        svcs = [f"{s['port']}/{s.get('protocol', 'tcp')} {s.get('product', s.get('name', ''))}"
-                for s in h["services"] if s.get("port")]
-        lines.append(f"{alias}: {', '.join(svcs[:10]) if svcs else 'no services'}")
+        svcs = [
+            f"{s['port']}/{s.get('protocol', 'tcp')} {s.get('product', s.get('name', ''))}"
+            for s in h["services"]
+            if s.get("port")
+        ]
+        lines.append(
+            f"{alias}: {', '.join(svcs[:10]) if svcs else 'no services'}",
+        )
 
     prompt = f"""Classify these network hosts by role based on their services.
 
@@ -416,7 +459,10 @@ Hosts:
 Respond with ONLY JSON: [{{"id": "host-N", "role": "role_name", "confidence": 0.0-1.0}}]
 Only include hosts where confidence > 0.6."""
 
-    response = _call_claude(prompt, max_tokens=1024)
+    # Output budget: up to ~50 hosts × ~50 tokens per JSON entry = 2500,
+    # plus JSON punctuation / safety margin. 4096 covers the whole batch
+    # size without truncating tail entries.
+    response = _call_claude(prompt, max_tokens=4096)
     if not response:
         return 0
 

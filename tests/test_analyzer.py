@@ -363,6 +363,136 @@ def clean_db():
 
 
 @pytestmark_neo4j
+class TestClassifyAmbiguousBatching:
+    """Regression: _classify_ambiguous_hosts used to hard-cap at LIMIT 15
+    inside the Cypher query, silently dropping every ambiguous host past
+    the fifteenth on real scans. Now it batches through ALL of them
+    (_CLASSIFY_BATCH_SIZE hosts per API call) and the operator gets a
+    complete pass in one boil.
+    """
+
+    def _insert_ambiguous(self, count: int):
+        """Seed ``count`` hosts that the rule-based classifier would have
+        left with a weak score (confidence in the open interval (0, 0.6))."""
+        with get_session() as session:
+            for i in range(count):
+                session.run(
+                    """
+                    CREATE (:Host {ip: $ip, state: 'up',
+                                   role: 'unknown', role_confidence: 0.4})
+                    """,
+                    ip=f"10.9.{i // 256}.{i % 256}",
+                )
+
+    def test_processes_every_host_no_hard_cap(self, clean_db):
+        """40 ambiguous hosts spread across batches — every one should be
+        sent to Claude, not just the first 15 of some arbitrary ordering."""
+        from cauldron.ai.analyzer import _classify_ambiguous_hosts
+
+        self._insert_ambiguous(40)
+
+        seen_ids: set[str] = set()
+
+        def fake_call(prompt, max_tokens=None):  # noqa: ARG001
+            # Pull every host-N alias Claude was asked to classify out of
+            # the prompt; we only want to confirm coverage, not the
+            # classification logic itself.
+            import re as _re
+            for match in _re.findall(r"(host-\d+):", prompt):
+                seen_ids.add(match)
+            return "[]"  # no reclassifications needed for this assertion
+
+        with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
+            _classify_ambiguous_hosts()
+
+        # The aliases reset per batch (host-1..host-N where N ≤ batch_size),
+        # but the sheer coverage is what matters: the prompt was assembled
+        # across enough calls to cover 40 hosts.
+        # With _CLASSIFY_BATCH_SIZE = 50 that's one call with 40 aliases;
+        # if the batch size ever shrinks, pytest still catches regressions
+        # by requiring all 40 to land in ``seen_ids`` across all calls.
+        assert len(seen_ids) == 40
+
+    def test_batches_large_set(self, clean_db):
+        """120 hosts → more than one Claude call (multiple batches)."""
+        from cauldron.ai.analyzer import _classify_ambiguous_hosts
+
+        self._insert_ambiguous(120)
+
+        call_count = 0
+
+        def fake_call(prompt, max_tokens=None):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            return "[]"
+
+        with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
+            _classify_ambiguous_hosts()
+
+        # 120 hosts with batch_size=50 → 3 batches. Guard against a future
+        # accidental batch_size=1 or a return to "one huge call".
+        assert 2 <= call_count <= 4
+
+    def test_empty_graph_short_circuits(self, clean_db):
+        """No ambiguous hosts → zero API calls, zero work."""
+        from cauldron.ai.analyzer import _classify_ambiguous_hosts
+
+        call_count = 0
+
+        def fake_call(prompt, max_tokens=None):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            return "[]"
+
+        with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
+            result = _classify_ambiguous_hosts()
+
+        assert result == 0
+        assert call_count == 0
+
+    def test_classification_applied_per_batch(self, clean_db):
+        """Results from each batch reach the graph before the next batch
+        starts — partial progress survives if a later batch fails."""
+        from cauldron.ai.analyzer import _classify_ambiguous_hosts
+        import json as _json
+
+        self._insert_ambiguous(60)
+
+        batch_num = {"n": 0}
+
+        def fake_call(prompt, max_tokens=None):  # noqa: ARG001
+            batch_num["n"] += 1
+            # First batch: reclassify every host it sees as web_server.
+            # Second batch: claim nothing changed. Combined effect =
+            # batch 1's updates must still be in the graph after batch 2
+            # completes, proving _apply_classifications runs per batch.
+            if batch_num["n"] == 1:
+                import re as _re
+                ids = _re.findall(r"(host-\d+):", prompt)
+                return _json.dumps([
+                    {"id": i, "role": "web_server", "confidence": 0.85}
+                    for i in ids
+                ])
+            return "[]"
+
+        with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
+            updated = _classify_ambiguous_hosts()
+
+        # Batch 1 had 50 hosts, batch 2 had 10. Only batch 1 reclassified.
+        assert updated == 50
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH (h:Host)
+                WHERE h.role = 'web_server' AND h.ai_classified = true
+                RETURN count(h) AS n
+                """,
+            ).single()["n"]
+            assert count == 50
+
+
+@pytestmark_neo4j
 class TestApplyClassifications:
     def test_updates_host_role(self, clean_db):
         from cauldron.ai.analyzer import _apply_classifications
