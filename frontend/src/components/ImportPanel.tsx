@@ -124,6 +124,11 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
     setSource('');
     setImportResult(null);
     setError(null);
+    // The <input type="file"> DOM element keeps its internal value even
+    // when React state clears. Without this, selecting the same file
+    // again after "Import another" produces no onChange event (browser
+    // sees an unchanged value), so the drop zone looks frozen.
+    if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
   const handleResetDatabase = useCallback(async () => {
@@ -168,6 +173,11 @@ export function ImportPanel({ onImported, onAnalyzed, onReset }: Props) {
           className="hidden"
           onChange={(e) => {
             if (e.target.files?.[0]) handleFile(e.target.files[0]);
+            // Clear so selecting the same file a second time still fires
+            // onChange. The native input suppresses the event when value
+            // hasn't changed — emptying it here makes every selection a
+            // "new" one from the browser's perspective.
+            e.target.value = '';
           }}
         />
         {file ? (
