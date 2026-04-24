@@ -60,6 +60,12 @@ EPSS_API_BASE = "https://api.first.org/data/v1/epss"
 # progress granular for large scans.
 _EPSS_BATCH_SIZE = 100
 
+# Strict CVE-ID shape. FIRST.org's URL is a comma-separated ``cve=`` list,
+# no quoting — so a malformed id in the graph (left by a buggy enricher,
+# stale data, or a manual Cypher INSERT) could break the URL or cause
+# spurious 400s. Match only the official MITRE syntax client-side.
+_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
 # Cache location
 CACHE_DIR = Path.home() / ".cauldron"
 CACHE_FILE = CACHE_DIR / "cve_cache.json"
@@ -1427,10 +1433,14 @@ def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
     is a nice-to-have signal — a temporary FIRST.org outage must not
     break the entire boil pipeline the way NVD would.
     """
-    if not cve_ids:
+    # Drop anything not in strict MITRE format before building the URL —
+    # the graph may have garbage synthetic IDs that slipped through the
+    # ``STARTS WITH 'CVE-'`` Cypher filter (``CVE-foo`` etc.).
+    valid = [c for c in cve_ids if _CVE_ID_RE.match(c)]
+    if not valid:
         return {}
 
-    cve_param = ",".join(cve_ids)
+    cve_param = ",".join(valid)
     url = f"{EPSS_API_BASE}?cve={cve_param}"
     req = urllib.request.Request(url, headers={"User-Agent": "Cauldron/0.1.0"})
 
