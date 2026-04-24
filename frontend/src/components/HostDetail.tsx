@@ -385,6 +385,18 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             <Badge tone="red">EXPLOIT</Badge>
           </span>
         )}
+        {vuln.epss != null && vuln.epss >= 0.1 && (
+          <span
+            className={`text-xs shrink-0 rounded px-1 py-0 font-mono ${
+              vuln.epss >= 0.9 ? 'bg-red-900/40 text-red-300' :
+              vuln.epss >= 0.5 ? 'bg-orange-900/30 text-orange-300' :
+              'bg-yellow-900/25 text-yellow-400'
+            }`}
+            title={`EPSS ${(vuln.epss * 100).toFixed(1)}% — FIRST.org probability of exploitation in the next 30 days`}
+          >
+            EPSS {Math.round(vuln.epss * 100)}%
+          </span>
+        )}
         {vuln.source && (
           <span className={`text-xs shrink-0 rounded px-1 py-0 ${
             vuln.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :

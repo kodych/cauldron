@@ -144,11 +144,13 @@ def _query_findings_grouped() -> list[dict]:
                    v.source AS source,
                    v.description AS description, v.exploit_url AS exploit_url,
                    v.exploit_module AS exploit_module,
+                   v.epss AS epss,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
                    size(hosts) AS host_count, hosts
             ORDER BY
                 CASE WHEN coalesce(v.in_cisa_kev, false) THEN 0 ELSE 1 END,
                 CASE WHEN v.has_exploit = true THEN 0 ELSE 1 END,
+                coalesce(v.epss, 0) DESC,
                 COALESCE(v.cvss, 0) DESC
         """))
     return [dict(r) for r in rows]
@@ -408,18 +410,22 @@ def generate_markdown(top: int = 0, include_notes: bool = False) -> str:
         w()
     else:
         w(f"{len(findings)} unique vulnerabilities, sorted by exploitability "
-          "(CISA KEV → public exploit → CVSS):")
+          "(CISA KEV → public exploit → EPSS → CVSS):")
         w()
         for i, f_ in enumerate(findings, 1):
             cve = f_["cve_id"]
             cvss = _fmt_cvss(f_["cvss"])
-            # Badge chain: KEV then EXPLOIT — matches frontend UI so the MD
-            # reads the same way the operator sees it in the sidebar.
+            # Badge chain: KEV then EXPLOIT then EPSS — matches frontend UI
+            # so the MD reads the same way the operator sees it in the
+            # sidebar. EPSS shown only when actually meaningful (>= 10%).
             badges = []
             if f_.get("in_cisa_kev"):
                 badges.append("**🔥 KEV**")
             if f_.get("has_exploit"):
                 badges.append("**EXPLOIT**")
+            epss = f_.get("epss")
+            if epss is not None and epss >= 0.1:
+                badges.append(f"**EPSS {round(epss * 100)}%**")
             badge_str = (" · " + " · ".join(badges)) if badges else ""
 
             w(f"### {i}. {cve} — CVSS {cvss}{badge_str}")

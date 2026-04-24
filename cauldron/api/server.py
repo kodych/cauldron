@@ -97,6 +97,12 @@ class VulnOut(BaseModel):
     source: str | None = None  # exploit_db, nvd, ai
     in_cisa_kev: bool = False  # listed in CISA Known Exploited Vulns catalog
     cisa_kev_added: str | None = None
+    # EPSS 0.0-1.0: FIRST.org's prediction that this CVE will be exploited
+    # in the next 30 days. Fills the gap between has_exploit (PoC exists
+    # somewhere) and in_cisa_kev (confirmed past use) with a forward-
+    # looking threat-intel signal. Populated for CVE-* vulns only; stays
+    # null for CAULDRON-* synthetic ids which FIRST.org doesn't score.
+    epss: float | None = None
 
 
 class HostOut(BaseModel):
@@ -261,6 +267,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         ai_fp_reason=v.get("ai_fp_reason"),
         port=v.get("port"),
         source=v.get("source"),
+        epss=v.get("epss"),
         in_cisa_kev=bool(v.get("in_cisa_kev")),
         cisa_kev_added=v.get("cisa_kev_added"),
     )
@@ -444,7 +451,7 @@ def list_hosts(
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
-                       port: s.port, source: v.source,
+                       port: s.port, source: v.source, epss: v.epss,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
                    }}) AS vulns
             """,
@@ -529,7 +536,7 @@ def get_host(ip: str):
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                        confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
-                       port: s.port, source: v.source,
+                       port: s.port, source: v.source, epss: v.epss,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
                    }) AS vulns
             """,
@@ -1321,9 +1328,12 @@ def list_vulns():
                    END AS confidence,
                    v.source AS source,
                    v.description AS description,
+                   v.epss AS epss,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
                    host_count, targets
-            ORDER BY coalesce(v.in_cisa_kev, false) DESC, v.has_exploit DESC, v.cvss DESC
+            ORDER BY coalesce(v.in_cisa_kev, false) DESC,
+                     coalesce(v.epss, 0) DESC,
+                     v.has_exploit DESC, v.cvss DESC
         """))
 
     vulns = []
@@ -1339,6 +1349,7 @@ def list_vulns():
             "confidence": r["confidence"],
             "source": r["source"],
             "description": (r["description"] or "")[:200],
+            "epss": r.get("epss"),
             "in_cisa_kev": bool(r.get("in_cisa_kev")),
             "cisa_kev_added": r.get("cisa_kev_added"),
             "host_count": r["host_count"],

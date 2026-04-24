@@ -36,6 +36,9 @@ export interface VulnOut {
   ai_fp_reason: string | null;
   port: number | null;
   source: string | null; // exploit_db, nvd, ai
+  // EPSS 0.0-1.0 — FIRST.org's probability this CVE gets exploited in
+  // the next 30 days. Null for CAULDRON-* synthetic ids.
+  epss: number | null;
   in_cisa_kev: boolean;
   cisa_kev_added: string | null;
 }
@@ -148,6 +151,7 @@ export interface VulnListItem {
   confidence: string | null;
   source: string | null;
   description: string;
+  epss: number | null;
   in_cisa_kev: boolean;
   cisa_kev_added: string | null;
   host_count: number;
