@@ -466,7 +466,8 @@ def _contextual_vuln_triage() -> tuple[int, int]:
                    s.port AS port, s.product AS product, s.version AS version,
                    v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    v.description AS description, v.source AS source,
-                   v.cvss_vector AS cvss_vector
+                   v.cvss_vector AS cvss_vector,
+                   coalesce(v.in_cisa_kev, false) AS in_cisa_kev
             ORDER BY h.ip, s.port
         """))
 
@@ -502,6 +503,7 @@ def _contextual_vuln_triage() -> tuple[int, int]:
             "description": (row["description"] or "")[:120],
             "source": row["source"],
             "is_local": is_local,
+            "in_cisa_kev": bool(row.get("in_cisa_kev")),
         })
 
     hosts = list(host_data.values())
@@ -564,9 +566,14 @@ def _triage_batch(
             prod = f"{v['product']} {v['version']}" if v.get("product") else ""
             local_tag = " [LOCAL]" if v.get("is_local") else ""
             exploit_tag = " EXPLOIT" if v.get("has_exploit") else ""
+            # CISA KEV = confirmed in-the-wild exploitation. Surface it so
+            # triage treats these as near-untouchable gold — even if some
+            # other heuristic (local vector on non-owned, say) would dismiss
+            # a normal CVE, KEV entries should almost always stay.
+            kev_tag = " KEV" if v.get("in_cisa_kev") else ""
             lines.append(
                 f"  :{v['port']} {prod}  {v['cve_id']} "
-                f"CVSS:{v['cvss'] or '?'}{exploit_tag}{local_tag} [{v['source']}]"
+                f"CVSS:{v['cvss'] or '?'}{exploit_tag}{kev_tag}{local_tag} [{v['source']}]"
             )
             if v.get("description"):
                 lines.append(f"    {v['description']}")
@@ -593,6 +600,8 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
 {''.join(lines)}
 
 === TRIAGE RULES ===
+0. Any vuln tagged KEV (CISA Known Exploited Vulnerabilities): KEEP. These
+   are confirmed in-the-wild exploitation — never dismiss.
 1. Remote RCE/auth bypass on NON-OWNED hosts: KEEP (attack surface)
 2. Local privilege escalation on OWNED hosts: KEEP (we can use these for privesc)
 3. Local exploits on NON-OWNED hosts: DISMISS (we can't use these — no access)
@@ -602,10 +611,16 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
 7. Remote vulns on OWNED hosts: KEEP but note "already owned"
 8. DoS-only without exploit on low-value targets: DISMISS
 9. CAULDRON-* exploit rules: almost always KEEP — these are pentester-focused findings
+10. Version-range sanity check: if the CVE description names a specific version
+    that is CLEARLY not the one running here (e.g. description says "OpenSSH 9.1"
+    but the listed product line shows OpenSSH 7.4), DISMISS with reason "wrong
+    version". Prefer the description-stated affected range over an empty/wildcard
+    product line — wildcard-CPE NVD matches pull in CVEs for any release.
 
-CRITICAL: Do NOT dismiss based on version range comparison. NVD version matching is authoritative.
 CRITICAL: Do NOT dismiss CAULDRON-* IDs just because they are not standard CVEs.
-If unsure, KEEP. Missing a real vuln is worse than keeping noise.
+If unsure, KEEP. Missing a real vuln is worse than keeping noise — except for
+clear OS / product / version mismatches where the CVE description itself names
+the wrong target.
 
 Respond with ONLY JSON:
 [{{"id": "host-N", "suggest_target": true, "vulns": [
