@@ -423,10 +423,21 @@ def classify_graph_hosts() -> dict:
                 role_name = classification.role.value
                 stats["roles"][role_name] = stats["roles"].get(role_name, 0) + 1
 
-            # Auto-target domain controllers
+            # Auto-target domain controllers — but respect explicit user
+            # choice. ``target_manual`` is the same tri-state pattern as
+            # ``bruteforceable_manual`` on services: NULL means the value
+            # was never touched by the operator (auto-managed, can be
+            # overwritten), true means the operator flipped it in either
+            # direction and locked in their intent. Without this flag a
+            # re-boil would keep stomping over "I deliberately unset
+            # target on this DC" every single time.
             if classification.role.value == "domain_controller":
                 session.run(
-                    "MATCH (h:Host {ip: $ip}) WHERE h.target <> true SET h.target = true",
+                    """
+                    MATCH (h:Host {ip: $ip})
+                    WHERE h.target_manual IS NULL
+                    SET h.target = true
+                    """,
                     ip=ip,
                 )
 
@@ -436,12 +447,20 @@ def classify_graph_hosts() -> dict:
 def set_host_owned(ip: str, owned: bool) -> bool:
     """Mark a host as owned (compromised) or unmark it.
 
-    When marking as owned, target is automatically cleared — goal achieved.
+    When marking as owned, target is automatically cleared — goal
+    achieved — and ``target_manual`` is raised so the next boil does
+    not auto-re-target a DC the operator just compromised.
     """
     with get_session() as session:
         if owned:
             result = session.run(
-                "MATCH (h:Host {ip: $ip}) SET h.owned = true, h.target = false RETURN h.ip",
+                """
+                MATCH (h:Host {ip: $ip})
+                SET h.owned = true,
+                    h.target = false,
+                    h.target_manual = true
+                RETURN h.ip
+                """,
                 ip=ip,
             )
         else:
@@ -453,10 +472,19 @@ def set_host_owned(ip: str, owned: bool) -> bool:
 
 
 def set_host_target(ip: str, target: bool) -> bool:
-    """Mark a host as target (engagement goal) or unmark it."""
+    """Mark a host as target (engagement goal) or unmark it.
+
+    Raises ``target_manual`` so subsequent classifier passes respect
+    the operator's choice — a DC explicitly untargeted here will not
+    be auto-retargeted on the next boil.
+    """
     with get_session() as session:
         result = session.run(
-            "MATCH (h:Host {ip: $ip}) SET h.target = $target RETURN h.ip",
+            """
+            MATCH (h:Host {ip: $ip})
+            SET h.target = $target, h.target_manual = true
+            RETURN h.ip
+            """,
             ip=ip, target=target,
         )
         return result.single() is not None

@@ -473,3 +473,91 @@ class TestRoleDistribution:
     def test_empty_graph_returns_empty(self):
         roles = get_host_role_distribution()
         assert roles == {}
+
+
+class TestDomainControllerAutoTarget:
+    """Regression: classify_graph_hosts must respect the operator's explicit
+    target decisions for domain controllers.
+
+    The old behaviour re-set ``target = true`` on every DC on every boil,
+    stomping over anyone who deliberately untargeted one. The fix tracks
+    operator intent via ``target_manual``: once the operator has touched
+    the target flag, the classifier leaves it alone.
+    """
+
+    def _ingest_dc(self, ip: str = "10.0.0.10") -> None:
+        dc = _make_host(
+            ip,
+            [(88, "kerberos"), (389, "ldap"), (445, "microsoft-ds"), (636, "ldaps")],
+        )
+        ingest_scan(_make_scan([dc]), source_name="scanner")
+
+    def test_dc_auto_targets_on_first_classification(self):
+        from cauldron.graph.ingestion import classify_graph_hosts
+
+        self._ingest_dc()
+        classify_graph_hosts()
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.10'}) "
+                "RETURN h.target AS target, h.target_manual AS manual",
+            ).single()
+            assert r["target"] is True
+            # target_manual untouched — auto-defaulted, operator can override.
+            assert r["manual"] is None
+
+    def test_manual_untarget_survives_reclassification(self):
+        from cauldron.graph.ingestion import classify_graph_hosts, set_host_target
+
+        self._ingest_dc()
+        classify_graph_hosts()  # auto-targets the DC
+
+        set_host_target("10.0.0.10", False)  # operator says "not a target"
+        classify_graph_hosts()  # boil again
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.10'}) "
+                "RETURN h.target AS target, h.target_manual AS manual",
+            ).single()
+            assert r["target"] is False
+            assert r["manual"] is True
+
+    def test_manual_retarget_also_sticky(self):
+        from cauldron.graph.ingestion import classify_graph_hosts, set_host_target
+
+        self._ingest_dc()
+        classify_graph_hosts()
+        set_host_target("10.0.0.10", False)
+        set_host_target("10.0.0.10", True)  # operator flips back
+        classify_graph_hosts()
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.10'}) "
+                "RETURN h.target AS target, h.target_manual AS manual",
+            ).single()
+            assert r["target"] is True
+            assert r["manual"] is True
+
+    def test_owning_a_dc_locks_target_off(self):
+        """set_host_owned(True) clears target AND raises target_manual so
+        the next boil does not auto-retarget a host the operator already
+        compromised."""
+        from cauldron.graph.ingestion import classify_graph_hosts, set_host_owned
+
+        self._ingest_dc()
+        classify_graph_hosts()  # auto-target
+        set_host_owned("10.0.0.10", True)  # goal achieved
+        classify_graph_hosts()  # boil should NOT re-target
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (h:Host {ip: '10.0.0.10'}) "
+                "RETURN h.target AS target, h.target_manual AS manual, "
+                "h.owned AS owned",
+            ).single()
+            assert r["owned"] is True
+            assert r["target"] is False
+            assert r["manual"] is True
