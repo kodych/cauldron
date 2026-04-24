@@ -191,6 +191,31 @@ def _upsert_service(session: Session, host_ip: str, service: Service, timestamp:
     cpe_str = ";".join(service.cpe) if service.cpe else None
     ts = timestamp.isoformat() if timestamp else datetime.now().isoformat()
 
+    # If the service was patched between scans (product or version changed),
+    # the old HAS_VULN links are stale — they were computed against the old
+    # evidence. The matcher only MERGEs (never deletes), so without this
+    # sweep a patched Apache 2.4.49 → 2.4.54 would keep its 2.4.49 CVE
+    # attached forever. Preserve relationships the operator has annotated
+    # (checked_status set to exploited / false_positive / mitigated) — those
+    # are historical verdicts on the engagement, not re-derivable from scan
+    # evidence. The next boil will attach correct links for the new version.
+    if service.product is not None or service.version is not None:
+        session.run(
+            """
+            MATCH (svc:Service {host_ip: $ip, port: $port, protocol: $protocol})
+            WHERE ($product IS NOT NULL AND svc.product IS NOT NULL AND svc.product <> $product)
+               OR ($version IS NOT NULL AND svc.version IS NOT NULL AND svc.version <> $version)
+            MATCH (svc)-[r:HAS_VULN]->(:Vulnerability)
+            WHERE r.checked_status IS NULL
+            DELETE r
+            """,
+            ip=host_ip,
+            port=service.port,
+            protocol=service.protocol,
+            product=service.product,
+            version=service.version,
+        )
+
     session.run(
         """
         MATCH (h:Host {ip: $ip})

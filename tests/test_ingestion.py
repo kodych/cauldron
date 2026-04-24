@@ -561,3 +561,128 @@ class TestDomainControllerAutoTarget:
             assert r["owned"] is True
             assert r["target"] is False
             assert r["manual"] is True
+
+
+class TestVersionChangeInvalidatesVulns:
+    """Regression: on re-import, a service whose product or version changed
+    must lose its stale auto-derived vulnerability links. User-annotated
+    edges (exploited / false_positive / mitigated) survive — those are
+    historical engagement verdicts, not re-derivable from the scan.
+    """
+
+    def _fixture(self):
+        """Host with Apache 2.4.49 on :80, two vulns attached: one NVD
+        auto-derived, one operator-marked as exploited."""
+        host = _make_host("10.0.0.20")
+        host.services = [
+            Service(port=80, protocol="tcp", state="open",
+                    name="http", product="Apache httpd", version="2.4.49"),
+        ]
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            session.run(
+                """
+                MATCH (s:Service {host_ip: '10.0.0.20', port: 80})
+                MERGE (v1:Vulnerability {cve_id: 'CVE-2021-41773'})
+                  ON CREATE SET v1.source = 'nvd', v1.cvss = 9.8
+                MERGE (v2:Vulnerability {cve_id: 'CVE-2021-42013'})
+                  ON CREATE SET v2.source = 'nvd', v2.cvss = 9.8
+                MERGE (s)-[:HAS_VULN]->(v1)
+                MERGE (s)-[r:HAS_VULN]->(v2)
+                  SET r.checked_status = 'exploited'
+                """,
+            )
+
+    def _reimport_patched(self, new_version: str):
+        """Re-ingest the same service with a newer (patched) version."""
+        host = _make_host("10.0.0.20")
+        host.services = [
+            Service(port=80, protocol="tcp", state="open",
+                    name="http", product="Apache httpd", version=new_version),
+        ]
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+    def test_version_change_drops_stale_auto_vulns(self):
+        self._fixture()
+        self._reimport_patched("2.4.54")
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.20', port: 80}) "
+                "RETURN s.version AS version",
+            ).single()
+            assert r["version"] == "2.4.54"
+
+            # Auto-derived CVE-2021-41773 was cleared.
+            rows = list(session.run(
+                """
+                MATCH (s:Service {host_ip: '10.0.0.20'})-[:HAS_VULN]->(v:Vulnerability)
+                RETURN v.cve_id AS id
+                """,
+            ))
+            cves = {row["id"] for row in rows}
+            assert "CVE-2021-41773" not in cves, \
+                "stale auto-vuln must be cleared on version change"
+
+    def test_operator_annotated_vulns_survive(self):
+        self._fixture()
+        self._reimport_patched("2.4.54")
+
+        with get_session() as session:
+            rows = list(session.run(
+                """
+                MATCH (s:Service {host_ip: '10.0.0.20'})-[r:HAS_VULN]->(v:Vulnerability)
+                RETURN v.cve_id AS id, r.checked_status AS status
+                """,
+            ))
+            surviving = {row["id"]: row["status"] for row in rows}
+            # Operator-marked 'exploited' is engagement history — must survive.
+            assert surviving.get("CVE-2021-42013") == "exploited"
+
+    def test_same_version_keeps_all_vulns(self):
+        """Re-import with identical product+version is a no-op for vuln
+        invalidation — nothing changed, nothing to clear."""
+        self._fixture()
+        self._reimport_patched("2.4.49")  # same version
+
+        with get_session() as session:
+            rows = list(session.run(
+                """
+                MATCH (s:Service {host_ip: '10.0.0.20'})-[:HAS_VULN]->(v:Vulnerability)
+                RETURN v.cve_id AS id
+                """,
+            ))
+            cves = {row["id"] for row in rows}
+            assert cves == {"CVE-2021-41773", "CVE-2021-42013"}
+
+    def test_version_detection_lost_keeps_old_vulns(self):
+        """Edge case: new scan failed to detect version (nmap returned None).
+        COALESCE preserves the old version, and since the stored product/
+        version didn't actually change, vuln links are not invalidated.
+        Prevents losing intel when a scan is less thorough than the last one.
+        """
+        self._fixture()
+
+        host = _make_host("10.0.0.20")
+        host.services = [
+            Service(port=80, protocol="tcp", state="open",
+                    name="http", product="Apache httpd", version=None),
+        ]
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            r = session.run(
+                "MATCH (s:Service {host_ip: '10.0.0.20', port: 80}) "
+                "RETURN s.version AS version",
+            ).single()
+            assert r["version"] == "2.4.49"  # old value preserved
+
+            rows = list(session.run(
+                """
+                MATCH (s:Service {host_ip: '10.0.0.20'})-[:HAS_VULN]->(v:Vulnerability)
+                RETURN v.cve_id AS id
+                """,
+            ))
+            cves = {row["id"] for row in rows}
+            assert cves == {"CVE-2021-41773", "CVE-2021-42013"}
