@@ -93,17 +93,17 @@ def _setup_vulns():
         # Confirmed exploit on WEB01
         session.run("""
             MATCH (h:Host {ip: '10.0.1.20'})-[:HAS_SERVICE]->(s:Service {port: 80})
-            CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+            CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
                 cve_id: 'CVE-2021-41773', cvss: 7.5,
-                confidence: 'confirmed', enables_pivot: true
+                enables_pivot: true
             })
         """)
         # Check-level on DB01
         session.run("""
             MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
-            CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+            CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(:Vulnerability {
                 cve_id: 'CAULDRON-042', cvss: 5.0,
-                confidence: 'check', enables_pivot: false
+                enables_pivot: false
             })
         """)
 

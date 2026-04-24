@@ -186,7 +186,7 @@ def _find_direct_paths(
              collect(DISTINCT {{
                  cve: v.cve_id, cvss: v.cvss,
                  has_exploit: v.has_exploit, desc: v.description,
-                 confidence: v.confidence, enables_pivot: v.enables_pivot,
+                 confidence: coalesce(r.confidence, 'check'), enables_pivot: v.enables_pivot,
                  port: s.port, in_cisa_kev: v.in_cisa_kev
              }}) AS vulns,
              max(v.cvss) AS max_cvss,
@@ -325,7 +325,7 @@ def _find_pivot_paths(
                  collect(DISTINCT {{
                      cve: v.cve_id, cvss: v.cvss,
                      has_exploit: v.has_exploit, desc: v.description,
-                     confidence: v.confidence, enables_pivot: v.enables_pivot,
+                     confidence: coalesce(r.confidence, 'check'), enables_pivot: v.enables_pivot,
                      port: s.port, in_cisa_kev: v.in_cisa_kev
                  }}) AS vulns,
                  max(v.cvss) AS max_cvss,
@@ -455,7 +455,7 @@ def _get_host_info(session, ip: str) -> PathNode | None:
                max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
                collect(DISTINCT {cve: v.cve_id, cvss: v.cvss,
                        has_exploit: v.has_exploit, desc: v.description,
-                       confidence: v.confidence,
+                       confidence: coalesce(r.confidence, 'check'),
                        enables_pivot: v.enables_pivot,
                        port: s.port, in_cisa_kev: v.in_cisa_kev}) AS vulns
         """,
@@ -559,8 +559,8 @@ def get_path_summary() -> dict:
             WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
             WITH DISTINCT h, max(v.cvss) AS max_cvss,
                  max(CASE WHEN v.has_exploit = true THEN 1 ELSE 0 END) AS has_exploit,
-                 max(CASE WHEN v.confidence = 'confirmed' THEN 3
-                          WHEN v.confidence = 'likely' THEN 2
+                 max(CASE WHEN coalesce(r.confidence, 'check') = 'confirmed' THEN 3
+                          WHEN coalesce(r.confidence, 'check') = 'likely' THEN 2
                           ELSE 1 END) AS conf_level
             RETURN count(h) AS total,
                    count(CASE WHEN has_exploit = 1 THEN 1 END) AS with_exploits,

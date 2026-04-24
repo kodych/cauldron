@@ -55,9 +55,9 @@ def _setup_test_network():
                            role_confidence: 0.90, os_name: 'Ubuntu 22.04', state: 'up'})
             CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.1.20', port: 80, protocol: 'tcp', state: 'open', name: 'http', product: 'Apache httpd', version: '2.4.49'})
             CREATE (h)-[:HAS_SERVICE]->(:Service {host_ip: '10.0.1.20', port: 443, protocol: 'tcp', state: 'open', name: 'https'})
-            CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+            CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
                 cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true,
-                confidence: 'confirmed', enables_pivot: true,
+                enables_pivot: true,
                 description: 'Apache path traversal and RCE'
             })
         """)
@@ -207,9 +207,9 @@ class TestAttackPaths:
         with get_session() as session:
             session.run("""
                 MATCH (h:Host {ip: '10.0.1.30'})-[:HAS_SERVICE]->(s:Service {port: 3306})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(:Vulnerability {
                     cve_id: 'CAULDRON-042', cvss: 5.0,
-                    confidence: 'check', has_exploit: false
+                    has_exploit: false
                 })
             """)
         # Without include_check: only confirmed/likely

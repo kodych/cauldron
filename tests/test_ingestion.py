@@ -686,3 +686,77 @@ class TestVersionChangeInvalidatesVulns:
             ))
             cves = {row["id"] for row in rows}
             assert cves == {"CVE-2021-41773", "CVE-2021-42013"}
+
+
+class TestScriptConfidenceIsPerEdge:
+    """Regression: script-confirmed confidence must NOT leak across hosts.
+
+    Before: v.confidence lived on the Vulnerability node, shared by cve_id.
+    An ms17-010 script confirming on host A set v.confidence='confirmed'
+    globally, so host B (never scripted) also showed 'confirmed'.
+
+    After: confidence lives on the HAS_VULN edge. Upgrade on host A
+    stays on host A; host B keeps its original rule-level confidence.
+    """
+
+    def _two_hosts_sharing_cve(self):
+        with get_session() as session:
+            session.run("""
+                CREATE (a:Host {ip: '10.0.0.101', state: 'up'})
+                CREATE (a)-[:HAS_SERVICE]->(sa:Service {
+                    host_ip: '10.0.0.101', port: 445, protocol: 'tcp'
+                })
+                CREATE (b:Host {ip: '10.0.0.102', state: 'up'})
+                CREATE (b)-[:HAS_SERVICE]->(sb:Service {
+                    host_ip: '10.0.0.102', port: 445, protocol: 'tcp'
+                })
+                MERGE (v:Vulnerability {cve_id: 'CVE-2017-0144'})
+                  ON CREATE SET v.source = 'nvd', v.has_exploit = true
+                MERGE (sa)-[ra:HAS_VULN]->(v)
+                  ON CREATE SET ra.confidence = 'check'
+                MERGE (sb)-[rb:HAS_VULN]->(v)
+                  ON CREATE SET rb.confidence = 'check'
+                SET sa.`script_smb_vuln_ms17_010` = 'VULNERABLE'
+            """)
+
+    def test_script_upgrade_does_not_leak_to_sibling_host(self):
+        from cauldron.exploits.matcher import upgrade_confidence_from_scripts
+
+        self._two_hosts_sharing_cve()
+        upgrade_confidence_from_scripts()
+
+        with get_session() as session:
+            r = session.run("""
+                MATCH (sa:Service {host_ip: '10.0.0.101'})-[ra:HAS_VULN]->(:Vulnerability {cve_id: 'CVE-2017-0144'})
+                MATCH (sb:Service {host_ip: '10.0.0.102'})-[rb:HAS_VULN]->(:Vulnerability {cve_id: 'CVE-2017-0144'})
+                RETURN ra.confidence AS a_conf, rb.confidence AS b_conf
+            """).single()
+
+            assert r["a_conf"] == "confirmed"
+            assert r["b_conf"] == "check"
+
+    def test_migration_backfills_existing_node_confidence(self):
+        """Old graphs stored confidence on the Vulnerability node. At the
+        start of every match_from_graph run we copy node → edge for any
+        edge that doesn't have confidence yet — idempotent, safe."""
+        from cauldron.exploits.matcher import ExploitDB
+
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.200', state: 'up'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {
+                    host_ip: '10.0.0.200', port: 443, protocol: 'tcp'
+                })
+                CREATE (v:Vulnerability {cve_id: 'CVE-LEGACY-1',
+                                         source: 'nvd', confidence: 'likely'})
+                CREATE (s)-[:HAS_VULN]->(v)
+            """)
+
+        ExploitDB().match_from_graph()
+
+        with get_session() as session:
+            r = session.run("""
+                MATCH ()-[r:HAS_VULN]->(:Vulnerability {cve_id: 'CVE-LEGACY-1'})
+                RETURN r.confidence AS conf
+            """).single()
+            assert r["conf"] == "likely"

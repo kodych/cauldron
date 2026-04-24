@@ -1360,7 +1360,14 @@ def _upsert_vulnerability(
     cpe_list: list[str],
     cve: CVEInfo,
 ) -> None:
-    """Create/update Vulnerability node and link to matching services."""
+    """Create/update Vulnerability node and link to matching services.
+
+    Confidence lives on the HAS_VULN relationship, not on the node — a
+    script-confirmed upgrade on one host must not leak "confirmed" onto
+    every other host sharing the same CVE ID. Default for NVD-sourced
+    findings is 'check'; script_upgrades or AI triage can lift a
+    specific edge to 'likely' / 'confirmed' independently.
+    """
     session.run(
         """
         MERGE (v:Vulnerability {cve_id: $cve_id})
@@ -1374,8 +1381,7 @@ def _upsert_vulnerability(
             v.epss = $epss,
             v.in_cisa_kev = $in_cisa_kev,
             v.cisa_kev_added = $cisa_kev_added,
-            v.source = 'nvd',
-            v.confidence = 'check'
+            v.source = 'nvd'
         ON MATCH SET
             v.cvss = COALESCE($cvss, v.cvss),
             v.severity = COALESCE($severity, v.severity),
@@ -1402,7 +1408,8 @@ def _upsert_vulnerability(
             MATCH (s:Service)
             WHERE s.product = $product AND s.version = $version
             MATCH (v:Vulnerability {cve_id: $cve_id})
-            MERGE (s)-[:HAS_VULN]->(v)
+            MERGE (s)-[rel:HAS_VULN]->(v)
+            ON CREATE SET rel.confidence = 'check'
             """,
             product=product,
             version=version,
@@ -1429,7 +1436,8 @@ def _upsert_vulnerability(
                     MATCH (s:Service)
                     WHERE s.cpe STARTS WITH $prefix OR s.cpe CONTAINS $contains
                     MATCH (v:Vulnerability {cve_id: $cve_id})
-                    MERGE (s)-[:HAS_VULN]->(v)
+                    MERGE (s)-[rel:HAS_VULN]->(v)
+                    ON CREATE SET rel.confidence = 'check'
                     """,
                     prefix=cpe_prefix,
                     contains=f";{cpe_prefix}",

@@ -333,8 +333,7 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
                 v.exploit_url = $exploit_url,
                 v.in_cisa_kev = $in_cisa_kev,
                 v.cisa_kev_added = $cisa_kev_added,
-                v.source = 'ai',
-                v.confidence = 'check'
+                v.source = 'ai'
             ON MATCH SET
                 v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
                 v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END
@@ -350,12 +349,15 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
             cisa_kev_added=cve.cisa_kev_added,
         )
 
+        # Confidence lives on the HAS_VULN relationship so a later upgrade
+        # (script confirm, operator verdict) scopes to this specific socket.
         result = session.run(
             """
             MATCH (s:Service {host_ip: $ip, port: $port, protocol: $proto})
             WHERE NOT (s)-[:HAS_VULN]->(:Vulnerability {cve_id: $cve_id})
             MATCH (v:Vulnerability {cve_id: $cve_id})
-            MERGE (s)-[:HAS_VULN]->(v)
+            MERGE (s)-[rel:HAS_VULN]->(v)
+            ON CREATE SET rel.confidence = 'check'
             RETURN s.host_ip AS linked
             """,
             ip=coords["ip"],

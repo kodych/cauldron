@@ -112,7 +112,7 @@ BUILTIN_FILTERS: dict[str, dict] = {
     "exploitable": {
         "description": "Hosts with confirmed/likely exploits",
         "match_vuln": True,
-        "where": "v.confidence IN ['confirmed', 'likely']",
+        "where": "rel.confidence IN ['confirmed', 'likely']",
     },
     "rce": {
         "description": "Hosts with RCE vulnerabilities (enables_pivot = true)",
@@ -190,7 +190,10 @@ def collect_targets(
         filt = BUILTIN_FILTERS[filter_name]
         default_port = filt.get("port")
         if filt.get("match_vuln"):
-            match_clauses.append("MATCH (h)-[:HAS_SERVICE]->(:Service)-[:HAS_VULN]->(v:Vulnerability)")
+            # Bind the HAS_VULN relationship as ``rel`` so per-edge filters
+            # (confidence, checked_status) work without accidentally reading
+            # node-scoped confidence from the shared Vulnerability.
+            match_clauses.append("MATCH (h)-[:HAS_SERVICE]->(:Service)-[rel:HAS_VULN]->(v:Vulnerability)")
         elif filt.get("match_service"):
             match_clauses.append("MATCH (h)-[:HAS_SERVICE]->(s:Service)")
         if filt.get("where"):

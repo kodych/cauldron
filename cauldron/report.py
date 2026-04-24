@@ -121,12 +121,27 @@ def _query_findings_grouped() -> list[dict]:
     in the wild), then CVEs with a public exploit, then CVSS descending.
     """
     with get_session() as s:
+        # confidence is aggregated per-CVE as the max tier seen on any edge:
+        # if any host's finding is script-confirmed, the report row shows
+        # "confirmed" — operator gets the strongest evidence upfront.
         rows = list(s.run("""
             MATCH (h:Host)-[:HAS_SERVICE]->(svc:Service)-[r:HAS_VULN]->(v:Vulnerability)
             WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
-            WITH v, collect(DISTINCT {ip: h.ip, port: svc.port, product: svc.product, version: svc.version}) AS hosts
+            WITH v, r,
+                 CASE coalesce(r.confidence, 'check')
+                     WHEN 'confirmed' THEN 3
+                     WHEN 'likely'    THEN 2
+                     ELSE 1
+                 END AS conf_tier,
+                 {ip: h.ip, port: svc.port, product: svc.product, version: svc.version} AS host_info
+            WITH v, max(conf_tier) AS max_tier, collect(DISTINCT host_info) AS hosts
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
-                   v.confidence AS confidence, v.source AS source,
+                   CASE max_tier
+                       WHEN 3 THEN 'confirmed'
+                       WHEN 2 THEN 'likely'
+                       ELSE 'check'
+                   END AS confidence,
+                   v.source AS source,
                    v.description AS description, v.exploit_url AS exploit_url,
                    v.exploit_module AS exploit_module,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,

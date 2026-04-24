@@ -124,18 +124,17 @@ def _setup_attack_graph():
         # Vulnerabilities
         session.run("""
             MATCH (s:Service {host_ip: '10.0.2.20', port: 80})
-            CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+            CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
                 cve_id: 'CVE-2021-41773', cvss: 7.5, severity: 'HIGH',
                 has_exploit: true, description: 'Path traversal in Apache 2.4.49',
-                confidence: 'confirmed', enables_pivot: true
+                enables_pivot: true
             })
         """)
         session.run("""
             MATCH (s:Service {host_ip: '10.0.1.30', port: 3306})
-            CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+            CREATE (s)-[:HAS_VULN {confidence: 'likely'}]->(:Vulnerability {
                 cve_id: 'CVE-2022-21417', cvss: 6.5, severity: 'MEDIUM',
-                has_exploit: false, description: 'MySQL vulnerability',
-                confidence: 'likely'
+                has_exploit: false, description: 'MySQL vulnerability'
             })
         """)
 
@@ -468,11 +467,10 @@ class TestDiscoverDirectPaths:
                 MATCH (h:Host {ip: '10.0.0.5'})
                 CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.0.5',
                        port: 445, protocol: 'tcp', state: 'open', name: 'microsoft-ds'})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
                     cve_id: 'CAULDRON-SMB-SIGNING', cvss: 0.0,
                     has_exploit: true, enables_pivot: false,
-                    description: 'SMB signing not required - NTLM relay target',
-                    confidence: 'confirmed'
+                    description: 'SMB signing not required - NTLM relay target'
                 })
             """)
 
@@ -511,10 +509,9 @@ class TestTruePivotPaths:
                 CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.1.5',
                        port: 80, protocol: 'tcp', state: 'open',
                        product: 'Apache httpd', version: '2.4.49'})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed'}]->(:Vulnerability {
                     cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true,
-                    enables_pivot: true, description: 'Apache RCE',
-                    confidence: 'confirmed'
+                    enables_pivot: true, description: 'Apache RCE'
                 })
             """)
 
@@ -534,9 +531,9 @@ class TestTruePivotPaths:
                 CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '192.168.1.10',
                        port: 3306, protocol: 'tcp', state: 'open',
                        product: 'MySQL', version: '5.7.38'})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                CREATE (s)-[:HAS_VULN {confidence: 'likely'}]->(:Vulnerability {
                     cve_id: 'CVE-2022-21417', cvss: 6.5, has_exploit: false,
-                    description: 'MySQL vuln', confidence: 'likely'
+                    description: 'MySQL vuln'
                 })
             """)
 
@@ -586,9 +583,9 @@ class TestTruePivotPaths:
                 CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '192.168.1.10',
                        port: 3306, protocol: 'tcp', state: 'open',
                        product: 'MySQL', version: '5.7.38'})
-                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                CREATE (s)-[:HAS_VULN {confidence: 'likely'}]->(:Vulnerability {
                     cve_id: 'CVE-2022-21417', cvss: 6.5, has_exploit: false,
-                    description: 'MySQL vuln', confidence: 'likely'
+                    description: 'MySQL vuln'
                 })
             """)
 

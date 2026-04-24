@@ -442,7 +442,7 @@ def list_hosts(
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
-                       confidence: v.confidence, description: v.description,
+                       confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
@@ -527,7 +527,7 @@ def get_host(ip: str):
                    collect(DISTINCT {
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
-                       confidence: v.confidence, description: v.description,
+                       confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
@@ -1286,15 +1286,32 @@ def list_vulns():
     from cauldron.graph.connection import get_session
 
     with get_session() as session:
+        # confidence lives on the edge — aggregate via max-tier across all
+        # edges for this CVE so the summary shows the strongest evidence
+        # seen anywhere (if one host's finding is script-confirmed, the CVE
+        # surfaces as "confirmed" in the aggregate view).
         result = list(session.run("""
             MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
             WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
+            WITH v, h, s, r,
+                 CASE coalesce(r.confidence, 'check')
+                     WHEN 'confirmed' THEN 3
+                     WHEN 'likely'    THEN 2
+                     ELSE 1
+                 END AS conf_tier
+            WITH v, max(conf_tier) AS max_tier,
+                 count(DISTINCT h.ip) AS host_count,
+                 collect(DISTINCT {ip: h.ip, port: s.port}) AS targets
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
-                   v.confidence AS confidence, v.source AS source,
+                   CASE max_tier
+                       WHEN 3 THEN 'confirmed'
+                       WHEN 2 THEN 'likely'
+                       ELSE 'check'
+                   END AS confidence,
+                   v.source AS source,
                    v.description AS description,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
-                   count(DISTINCT h.ip) AS host_count,
-                   collect(DISTINCT {ip: h.ip, port: s.port}) AS targets
+                   host_count, targets
             ORDER BY coalesce(v.in_cisa_kev, false) DESC, v.has_exploit DESC, v.cvss DESC
         """))
 
