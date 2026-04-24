@@ -103,6 +103,10 @@ class VulnOut(BaseModel):
     # looking threat-intel signal. Populated for CVE-* vulns only; stays
     # null for CAULDRON-* synthetic ids which FIRST.org doesn't score.
     epss: float | None = None
+    # L7 protocol(s) the CVE attacks, e.g. ["http"], ["ssh"], ["smb"].
+    # Empty list = unclassified. UI badge helps the operator see why a
+    # CVE did or didn't attach where they might have expected.
+    attack_surfaces: list[str] = []
 
 
 class HostOut(BaseModel):
@@ -274,6 +278,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         epss=v.get("epss"),
         in_cisa_kev=bool(v.get("in_cisa_kev")),
         cisa_kev_added=v.get("cisa_kev_added"),
+        attack_surfaces=list(v.get("attack_surfaces") or []),
     )
 
 
@@ -456,7 +461,8 @@ def list_hosts(
                        confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
-                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
+                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
+                       attack_surfaces: v.attack_surfaces
                    }}) AS vulns
             """,
             **params,
@@ -918,7 +924,11 @@ def _run_analysis_pipeline(
 
     cve_stats: dict = {"services_checked": 0, "services_with_cves": 0, "total_cves_found": 0}
     if nvd:
-        from cauldron.ai.cve_enricher import enrich_epss_from_graph, enrich_services_from_graph
+        from cauldron.ai.cve_enricher import (
+            enrich_epss_from_graph,
+            enrich_services_from_graph,
+            migrate_attack_surfaces_from_graph,
+        )
         _bump("nvd", "Starting NVD enrichment")
 
         def _nvd_cb(current: int, total: int, message: str):
@@ -936,6 +946,12 @@ def _run_analysis_pipeline(
             _bump("epss", message, current, total)
 
         enrich_epss_from_graph(progress_callback=_epss_cb)
+
+        # Classify attack surfaces and prune HAS_VULN edges where the
+        # service's L7 protocol is incompatible with the CVE surface.
+        # Fixes the CrushFTP-on-SFTP-port-22 class of false positives.
+        _bump("surfaces", "Classifying attack surfaces")
+        migrate_attack_surfaces_from_graph()
 
     _bump("paths", "Computing attack paths")
     summary = get_path_summary()
@@ -1337,6 +1353,7 @@ def list_vulns():
                    v.description AS description,
                    v.epss AS epss,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
+                   v.attack_surfaces AS attack_surfaces,
                    host_count, targets
             ORDER BY coalesce(v.in_cisa_kev, false) DESC,
                      coalesce(v.epss, 0) DESC,
@@ -1359,6 +1376,7 @@ def list_vulns():
             "epss": r.get("epss"),
             "in_cisa_kev": bool(r.get("in_cisa_kev")),
             "cisa_kev_added": r.get("cisa_kev_added"),
+            "attack_surfaces": list(r.get("attack_surfaces") or []),
             "host_count": r["host_count"],
             "targets": targets,
             "ips": sorted(set(t["ip"] for t in targets)),

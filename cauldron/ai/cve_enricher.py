@@ -174,6 +174,12 @@ class CVEInfo:
     # has_exploit, which only means a PoC exists somewhere).
     in_cisa_kev: bool = False
     cisa_kev_added: str | None = None  # ISO date CISA added it
+    # L7 protocol(s) the CVE actually attacks (e.g. ``['http']`` for a
+    # CrushFTP WebInterface SSTI, ``['ssh']`` for a scp command-injection,
+    # ``['smb']`` for a SambaCry RCE). Used at link-time to block wiring
+    # HTTP-only CVEs onto SFTP-only services of the same product. Empty
+    # list = unclassified (we don't know) — conservative, don't block.
+    attack_surfaces: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1137,6 +1143,216 @@ def _cve_matches_product(cve_data: dict, product_lower: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Attack-surface classification
+# ---------------------------------------------------------------------------
+#
+# Goal: prevent the CrushFTP-class bug where an HTTP-only CVE (SSTI in the
+# web admin, CVE-2024-4040) gets wired onto a CrushFTP SFTP service on
+# port 22, where the vulnerability is not reachable. Fix is structural: at
+# parse time we classify each CVE's L7 attack surface; at link time we
+# refuse to MERGE a HAS_VULN edge when the surface doesn't match the
+# service's protocol.
+#
+# Conservative defaults everywhere — if either the CVE or the service is
+# unclassified, we do NOT block. Better to leave some legacy false-positives
+# than to silently drop a real finding because our dictionary missed a
+# product name.
+
+# nmap service name → L7 protocol tag(s). Extends as we see real data.
+_SERVICE_PROTOCOL_MAP: dict[str, frozenset[str]] = {
+    # SSH family
+    "ssh": frozenset({"ssh"}),
+    "ssh2": frozenset({"ssh"}),
+    "sftp": frozenset({"sftp"}),  # product may run its own SFTP (CrushFTP)
+    # FTP family
+    "ftp": frozenset({"ftp"}),
+    "ftp-data": frozenset({"ftp"}),
+    "ftps": frozenset({"ftp"}),
+    # HTTP family
+    "http": frozenset({"http"}),
+    "http-alt": frozenset({"http"}),
+    "http-proxy": frozenset({"http"}),
+    "https": frozenset({"http"}),  # HTTPS is still HTTP at L7
+    "https-alt": frozenset({"http"}),
+    "ssl/http": frozenset({"http"}),
+    "winrm": frozenset({"http", "winrm"}),
+    # SMB / NetBIOS
+    "smb": frozenset({"smb"}),
+    "microsoft-ds": frozenset({"smb"}),
+    "netbios-ssn": frozenset({"smb"}),
+    # LDAP / AD
+    "ldap": frozenset({"ldap"}),
+    "ldapssl": frozenset({"ldap"}),
+    "ldaps": frozenset({"ldap"}),
+    "globalcatldap": frozenset({"ldap"}),
+    "globalcatldapssl": frozenset({"ldap"}),
+    # DNS
+    "dns": frozenset({"dns"}),
+    "domain": frozenset({"dns"}),
+    # Kerberos
+    "kerberos-sec": frozenset({"kerberos"}),
+    "kpasswd5": frozenset({"kerberos"}),
+    # RDP
+    "ms-wbt-server": frozenset({"rdp"}),
+    "rdp": frozenset({"rdp"}),
+    # Databases (each speaks its own wire protocol)
+    "mysql": frozenset({"mysql", "database"}),
+    "mariadb": frozenset({"mysql", "database"}),
+    "postgres": frozenset({"postgres", "database"}),
+    "postgresql": frozenset({"postgres", "database"}),
+    "ms-sql-s": frozenset({"mssql", "database"}),
+    "mssql": frozenset({"mssql", "database"}),
+    "oracle-tns": frozenset({"oracle", "database"}),
+    "mongodb": frozenset({"mongodb", "database"}),
+    "redis": frozenset({"redis", "database"}),
+    # Mail
+    "smtp": frozenset({"smtp"}),
+    "smtps": frozenset({"smtp"}),
+    "submission": frozenset({"smtp"}),
+    "imap": frozenset({"imap"}),
+    "imaps": frozenset({"imap"}),
+    "pop3": frozenset({"pop3"}),
+    "pop3s": frozenset({"pop3"}),
+    # Misc
+    "snmp": frozenset({"snmp"}),
+    "vnc": frozenset({"vnc"}),
+    "telnet": frozenset({"telnet"}),
+    "rpcbind": frozenset({"rpcbind"}),
+}
+
+
+# Keyword → surface. Order matters only for readability. A single CVE may
+# match multiple patterns and end up with multiple surfaces (an HTTP CVE
+# that also mentions "LDAP integration", for example) — that's fine, the
+# match is "any of ours ∩ any of theirs".
+_SURFACE_KEYWORDS: dict[str, list[re.Pattern]] = {
+    "http": [
+        re.compile(r"\b(HTTP|HTTPS)\b"),
+        re.compile(r"\bweb\s+(interface|application|server|UI|admin|console)\b", re.IGNORECASE),
+        re.compile(r"\bWebInterface\b"),
+        re.compile(r"\btemplate\s+injection\b", re.IGNORECASE),
+        re.compile(r"\b(CSRF|XSS|SSRF|SSTI)\b"),
+        re.compile(r"\bmod_\w+", re.IGNORECASE),  # Apache modules
+        re.compile(r"\b(REST|SOAP)\s+API\b", re.IGNORECASE),
+        re.compile(r"\b(URL|URI|uri-path)\b"),
+        re.compile(r"\b(GET|POST|PUT|DELETE)\s+(?:request|method)\b", re.IGNORECASE),
+        re.compile(r"\bcross[-\s]site\b", re.IGNORECASE),
+    ],
+    "ssh": [
+        re.compile(r"\b(SSH|SSHD|OpenSSH|ssh-agent)\b"),
+        re.compile(r"\bscp\b"),
+        re.compile(r"\bsshd\b"),
+    ],
+    "sftp": [
+        re.compile(r"\bSFTP\b"),
+    ],
+    "ftp": [
+        # FTP but not SFTP — use negative lookbehind for the S
+        re.compile(r"(?<!S)\bFTP\b(?![-\w])"),
+    ],
+    "smb": [
+        re.compile(r"\b(SMB|SMB1|SMB2|SMB3|CIFS|NetBIOS)\b"),
+        re.compile(r"\bsamba\b", re.IGNORECASE),
+    ],
+    "ldap": [
+        re.compile(r"\bLDAP(?:S)?\b"),
+        re.compile(r"\bActive\s+Directory\b", re.IGNORECASE),
+    ],
+    "dns": [
+        re.compile(r"\bDNS\s+(?:server|record|query|response|zone)\b", re.IGNORECASE),
+        re.compile(r"\bBIND\s+\d", re.IGNORECASE),
+    ],
+    "kerberos": [
+        re.compile(r"\b(?:Kerberos|krb5|KDC|kadmind)\b"),
+    ],
+    "rdp": [
+        re.compile(r"\b(RDP|Remote\s+Desktop|Terminal\s+Services)\b", re.IGNORECASE),
+    ],
+    "snmp": [
+        re.compile(r"\bSNMP(?:v[123])?\b"),
+    ],
+    "smtp": [
+        re.compile(r"\b(SMTP|ESMTP)\b"),
+    ],
+}
+
+
+# CWE → strong surface hint. Only unambiguous mappings go here; CWE-94
+# (code injection) is too generic to hint at a protocol.
+_CWE_TO_SURFACE: dict[str, frozenset[str]] = {
+    "CWE-79": frozenset({"http"}),    # XSS
+    "CWE-352": frozenset({"http"}),   # CSRF
+    "CWE-91": frozenset({"http"}),    # XML injection
+    "CWE-918": frozenset({"http"}),   # SSRF
+    "CWE-1336": frozenset({"http"}),  # Improper neutralization of special elements in template (SSTI)
+    "CWE-601": frozenset({"http"}),   # Open redirect
+    "CWE-444": frozenset({"http"}),   # HTTP request smuggling
+}
+
+
+def _classify_attack_surface(
+    description: str | None,
+    cwe_ids: list[str] | None = None,
+) -> list[str]:
+    """Classify the L7 protocol(s) a CVE attacks, as a sorted list.
+
+    Inputs are intentionally what a stored ``Vulnerability`` node has —
+    description and CWE IDs. That lets us reclassify old nodes during the
+    boil migration sweep without re-fetching from NVD.
+
+    Returns an empty list when we cannot tell. Callers treat that as
+    "unclassified, don't block" — the whole point is to catch obvious
+    cross-protocol mismatches (HTTP CVE on SFTP service), not to become a
+    strict allowlist that drops anything we didn't explicitly understand.
+    """
+    surfaces: set[str] = set()
+    desc = description or ""
+
+    for surface, patterns in _SURFACE_KEYWORDS.items():
+        for pattern in patterns:
+            if pattern.search(desc):
+                surfaces.add(surface)
+                break
+
+    for cwe in cwe_ids or []:
+        mapped = _CWE_TO_SURFACE.get(cwe)
+        if mapped:
+            surfaces.update(mapped)
+
+    return sorted(surfaces)
+
+
+def _service_protocols(service_name: str | None) -> set[str]:
+    """Return the set of L7 protocol tags for a nmap-detected service name.
+
+    Unknown names return an empty set — that's "we don't know the service
+    protocol", which degrades the compatibility check to a conservative
+    pass (don't block).
+    """
+    if not service_name:
+        return set()
+    key = service_name.lower().strip()
+    return set(_SERVICE_PROTOCOL_MAP.get(key, frozenset()))
+
+
+def _surfaces_compatible(
+    service_protos: set[str] | None,
+    vuln_surfaces: list[str] | None,
+) -> bool:
+    """True if this CVE can plausibly attack this service.
+
+    Returns True (don't block) whenever either side is unclassified — the
+    classifier is deliberately partial, so we never want an unknown
+    product or a terse CVE description to cause false negatives.
+    """
+    if not vuln_surfaces:
+        return True
+    if not service_protos:
+        return True
+    return bool(set(vuln_surfaces) & service_protos)
+
+
 def _parse_cve(cve_data: dict) -> CVEInfo | None:
     """Parse a single CVE entry from NVD API response."""
     cve_id = cve_data.get("id")
@@ -1210,6 +1426,12 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
     cisa_kev_added = cve_data.get("cisaExploitAdd")
     in_cisa_kev = bool(cisa_kev_added)
 
+    # Classify the L7 attack surface while we still have the full CVE
+    # data (description + CWE list). This is what the link-time
+    # compatibility check consults to decide whether an HTTP-only CVE
+    # can attach to an SFTP service.
+    attack_surfaces = _classify_attack_surface(description, cwe_ids)
+
     return CVEInfo(
         cve_id=cve_id,
         cvss=cvss,
@@ -1222,6 +1444,7 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         published=published,
         in_cisa_kev=in_cisa_kev,
         cisa_kev_added=cisa_kev_added,
+        attack_surfaces=attack_surfaces,
     )
 
 
@@ -1479,6 +1702,106 @@ def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
     return scores
 
 
+def migrate_attack_surfaces_from_graph() -> dict:
+    """Backfill ``v.attack_surfaces`` on existing NVD/AI-sourced Vulnerability
+    nodes and drop HAS_VULN edges where the service's protocol is provably
+    incompatible with the vuln's surface.
+
+    Two-phase sweep, idempotent, safe to run every boil:
+
+    1. Classify any Vulnerability that lacks ``attack_surfaces``, using the
+       stored ``description``. CWE is not stored on the node, so precision
+       is a touch lower than parse-time — acceptable, conservative.
+    2. For every HAS_VULN edge whose CVE has classified surfaces AND whose
+       service has a known protocol that doesn't intersect, drop the edge
+       — but ONLY when ``r.checked_status IS NULL``. Operator-touched
+       edges (exploited / mitigated / FP verdicts) are sacred and stay.
+
+    Exploit-DB rules (``source = 'exploit_db'``, CAULDRON-* IDs) are
+    port-scoped by their own ``port_match`` definitions; we skip them.
+
+    Returns stats for the CLI / API boil progress feedback.
+    """
+    from cauldron.graph.connection import get_session
+
+    stats = {"classified": 0, "edges_dropped": 0, "already_done": 0}
+
+    # Phase 1 — classify vulns missing the property. Source filter keeps
+    # us out of CAULDRON-* rules where the port scope already lives on
+    # the rule itself.
+    with get_session() as session:
+        rows = list(session.run(
+            """
+            MATCH (v:Vulnerability)
+            WHERE (v.attack_surfaces IS NULL OR size(v.attack_surfaces) = 0)
+              AND (v.source IS NULL OR v.source IN ['nvd', 'ai'])
+              AND v.description IS NOT NULL
+            RETURN v.cve_id AS cve_id, v.description AS description
+            """,
+        ))
+
+        for row in rows:
+            surfaces = _classify_attack_surface(row["description"], cwe_ids=None)
+            if not surfaces:
+                continue
+            session.run(
+                """
+                MATCH (v:Vulnerability {cve_id: $cve_id})
+                SET v.attack_surfaces = $surfaces
+                """,
+                cve_id=row["cve_id"],
+                surfaces=surfaces,
+            )
+            stats["classified"] += 1
+
+    # Phase 2 — drop incompatible edges where operator hasn't weighed in.
+    # Done in Python to reuse the same compatibility logic as link-time.
+    with get_session() as session:
+        edges = list(session.run(
+            """
+            MATCH (s:Service)-[r:HAS_VULN]->(v:Vulnerability)
+            WHERE r.checked_status IS NULL
+              AND v.attack_surfaces IS NOT NULL
+              AND size(v.attack_surfaces) > 0
+              AND s.name IS NOT NULL
+            RETURN s.host_ip AS host_ip, s.port AS port, s.protocol AS protocol,
+                   s.name AS name, v.cve_id AS cve_id,
+                   v.attack_surfaces AS surfaces
+            """,
+        ))
+
+        for edge in edges:
+            if _surfaces_compatible(
+                _service_protocols(edge["name"]),
+                list(edge["surfaces"] or []),
+            ):
+                continue
+            session.run(
+                """
+                MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
+                      -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
+                WHERE r.checked_status IS NULL
+                DELETE r
+                """,
+                host_ip=edge["host_ip"],
+                port=edge["port"],
+                protocol=edge["protocol"],
+                cve_id=edge["cve_id"],
+            )
+            stats["edges_dropped"] += 1
+            logger.info(
+                "Dropped HAS_VULN %s on %s:%s — surface mismatch (service=%s, vuln=%s)",
+                edge["cve_id"], edge["host_ip"], edge["port"],
+                edge["name"], list(edge["surfaces"] or []),
+            )
+
+    logger.info(
+        "Attack-surface migration: classified=%d, edges_dropped=%d",
+        stats["classified"], stats["edges_dropped"],
+    )
+    return stats
+
+
 def enrich_epss_from_graph(progress_callback=None) -> dict:
     """Populate ``v.epss`` on every Vulnerability node that still lacks it.
 
@@ -1593,13 +1916,19 @@ def _upsert_vulnerability(
             v.epss = $epss,
             v.in_cisa_kev = $in_cisa_kev,
             v.cisa_kev_added = $cisa_kev_added,
+            v.attack_surfaces = $attack_surfaces,
             v.source = 'nvd'
         ON MATCH SET
             v.cvss = COALESCE($cvss, v.cvss),
             v.severity = COALESCE($severity, v.severity),
             v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
             v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
-            v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added)
+            v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added),
+            v.attack_surfaces = CASE
+                WHEN $attack_surfaces IS NOT NULL AND size($attack_surfaces) > 0
+                THEN $attack_surfaces
+                ELSE v.attack_surfaces
+            END
         """,
         cve_id=cve.cve_id,
         cvss=cve.cvss,
@@ -1611,25 +1940,48 @@ def _upsert_vulnerability(
         epss=cve.epss,
         in_cisa_kev=cve.in_cisa_kev,
         cisa_kev_added=cve.cisa_kev_added,
+        attack_surfaces=cve.attack_surfaces,
     )
 
-    # Link to matching services by product+version
+    # Link by product+version, but filtered through the attack-surface
+    # compatibility check — CVE-2024-4040 (SSTI, surfaces=['http']) no
+    # longer attaches to an SFTP service on port 22 of the same product.
+    # Fetch candidates with their service name, filter in Python, then
+    # MERGE only the survivors.
     if product and version:
-        session.run(
+        candidates = list(session.run(
             """
             MATCH (s:Service)
             WHERE s.product = $product AND s.version = $version
-            MATCH (v:Vulnerability {cve_id: $cve_id})
-            MERGE (s)-[rel:HAS_VULN]->(v)
-            ON CREATE SET rel.confidence = 'check'
+            RETURN s.host_ip AS host_ip, s.port AS port, s.protocol AS protocol,
+                   s.name AS name
             """,
             product=product,
             version=version,
-            cve_id=cve.cve_id,
-        )
+        ))
+        for row in candidates:
+            if not _surfaces_compatible(
+                _service_protocols(row.get("name")),
+                cve.attack_surfaces,
+            ):
+                continue
+            session.run(
+                """
+                MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
+                MATCH (v:Vulnerability {cve_id: $cve_id})
+                MERGE (s)-[rel:HAS_VULN]->(v)
+                ON CREATE SET rel.confidence = 'check'
+                """,
+                host_ip=row["host_ip"],
+                port=row["port"],
+                protocol=row["protocol"],
+                cve_id=cve.cve_id,
+            )
 
-    # Also link by CPE (catches services where product name differs but CPE matches)
-    # Must include version to avoid cross-version pollution.
+    # Also link by CPE (catches services where product name differs but
+    # CPE matches). Same surface-compatibility filter as the product+version
+    # path — an HTTP-tagged CVE must not attach to an SFTP service even if
+    # the CPE matches.
     #
     # The part type (a/o/h) must come from the converted CPE 2.3 — NOT
     # hardcoded. ``cpe:/o:vmware:esxi:7.0.3`` stays on the Service as a
@@ -1651,15 +2003,31 @@ def _upsert_vulnerability(
                     cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}:{cpe_version}"
                 else:
                     cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}"
-                session.run(
+                candidates = list(session.run(
                     """
                     MATCH (s:Service)
                     WHERE s.cpe STARTS WITH $prefix OR s.cpe CONTAINS $contains
-                    MATCH (v:Vulnerability {cve_id: $cve_id})
-                    MERGE (s)-[rel:HAS_VULN]->(v)
-                    ON CREATE SET rel.confidence = 'check'
+                    RETURN s.host_ip AS host_ip, s.port AS port,
+                           s.protocol AS protocol, s.name AS name
                     """,
                     prefix=cpe_prefix,
                     contains=f";{cpe_prefix}",
-                    cve_id=cve.cve_id,
-                )
+                ))
+                for row in candidates:
+                    if not _surfaces_compatible(
+                        _service_protocols(row.get("name")),
+                        cve.attack_surfaces,
+                    ):
+                        continue
+                    session.run(
+                        """
+                        MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
+                        MATCH (v:Vulnerability {cve_id: $cve_id})
+                        MERGE (s)-[rel:HAS_VULN]->(v)
+                        ON CREATE SET rel.confidence = 'check'
+                        """,
+                        host_ip=row["host_ip"],
+                        port=row["port"],
+                        protocol=row["protocol"],
+                        cve_id=cve.cve_id,
+                    )

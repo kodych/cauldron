@@ -408,6 +408,16 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             </Badge>
           </span>
         )}
+        {vuln.attack_surfaces && vuln.attack_surfaces.length > 0 && (
+          <span className="shrink-0">
+            <Badge
+              tone="gray"
+              title={`Attack surface(s): ${vuln.attack_surfaces.join(', ')}. Cauldron links this CVE only to services of a matching L7 protocol.`}
+            >
+              {vuln.attack_surfaces.join('/')}
+            </Badge>
+          </span>
+        )}
         {vuln.source && (
           <span className={`text-xs shrink-0 rounded px-1 py-0 ${
             vuln.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :

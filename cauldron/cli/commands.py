@@ -329,7 +329,11 @@ def boil(nvd: bool, ai: bool, run_all: bool):
     console.print("[bold cyan]Phase 3: CVE Enrichment (NVD API)[/bold cyan]")
 
     if nvd:
-        from cauldron.ai.cve_enricher import enrich_epss_from_graph, enrich_services_from_graph
+        from cauldron.ai.cve_enricher import (
+            enrich_epss_from_graph,
+            enrich_services_from_graph,
+            migrate_attack_surfaces_from_graph,
+        )
 
         with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
             cve_stats = enrich_services_from_graph()
@@ -345,6 +349,18 @@ def boil(nvd: bool, ai: bool, run_all: bool):
 
         with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
             epss_stats = enrich_epss_from_graph()
+
+        # Classify attack surfaces on new CVEs and drop edges where the
+        # service's L7 protocol is provably incompatible with the CVE.
+        # Idempotent — the sweep only re-touches vulns/edges that haven't
+        # been resolved yet.
+        with console.status("[bold green]Classifying attack surfaces..."):
+            surface_stats = migrate_attack_surfaces_from_graph()
+        if surface_stats["classified"] or surface_stats["edges_dropped"]:
+            console.print(
+                f"  [green]+[/green] Attack surfaces: classified {surface_stats['classified']}, "
+                f"dropped {surface_stats['edges_dropped']} incompatible links",
+            )
 
         if epss_stats["checked"]:
             console.print(

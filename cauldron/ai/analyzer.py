@@ -381,7 +381,16 @@ Respond with ONLY JSON, no prose, no markdown fences:
 def _link_ai_cve_to_service(coords: dict, cve) -> bool:
     """Create / refresh a Vulnerability node and link it to the exact service
     that produced the CPE match. Returns True if a new HAS_VULN was created.
+
+    Honors the attack-surface compatibility check: if the CVE is classified
+    as HTTP-only and the service speaks SFTP, no edge is created. Same
+    invariant as the NVD-linked path.
     """
+    from cauldron.ai.cve_enricher import (
+        _service_protocols,
+        _surfaces_compatible,
+    )
+
     with get_session() as session:
         session.run(
             """
@@ -395,10 +404,16 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
                 v.exploit_url = $exploit_url,
                 v.in_cisa_kev = $in_cisa_kev,
                 v.cisa_kev_added = $cisa_kev_added,
+                v.attack_surfaces = $attack_surfaces,
                 v.source = 'ai'
             ON MATCH SET
                 v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
-                v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END
+                v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
+                v.attack_surfaces = CASE
+                    WHEN $attack_surfaces IS NOT NULL AND size($attack_surfaces) > 0
+                    THEN $attack_surfaces
+                    ELSE v.attack_surfaces
+                END
             """,
             cve_id=cve.cve_id,
             cvss=cve.cvss,
@@ -409,7 +424,33 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
             exploit_url=cve.exploit_url,
             in_cisa_kev=cve.in_cisa_kev,
             cisa_kev_added=cve.cisa_kev_added,
+            attack_surfaces=getattr(cve, "attack_surfaces", []) or [],
         )
+
+        # Look up the service name for the surface-compat check. We do
+        # this BEFORE MERGE so an HTTP-only CVE never creates an edge
+        # onto an SFTP socket — same invariant as ``_upsert_vulnerability``.
+        row = session.run(
+            """
+            MATCH (s:Service {host_ip: $ip, port: $port, protocol: $proto})
+            RETURN s.name AS name
+            """,
+            ip=coords["ip"],
+            port=coords["port"],
+            proto=coords["protocol"],
+        ).single()
+        if row is None:
+            return False
+        if not _surfaces_compatible(
+            _service_protocols(row.get("name")),
+            getattr(cve, "attack_surfaces", []) or [],
+        ):
+            logger.info(
+                "AI CVE %s skipped for %s:%s — surface mismatch (service=%s, vuln=%s)",
+                cve.cve_id, coords["ip"], coords["port"],
+                row.get("name"), getattr(cve, "attack_surfaces", []),
+            )
+            return False
 
         # Confidence lives on the HAS_VULN relationship so a later upgrade
         # (script confirm, operator verdict) scopes to this specific socket.

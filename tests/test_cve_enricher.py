@@ -16,6 +16,7 @@ from cauldron.ai.cve_enricher import (
     CVECache,
     CVEInfo,
     PRODUCT_CPE_MAP,
+    _classify_attack_surface,
     _cpe22_to_23,
     _cve_applies_to,
     _cve_is_dos_only,
@@ -28,6 +29,8 @@ from cauldron.ai.cve_enricher import (
     _get_cpe_for_service,
     _is_pentester_relevant,
     _parse_cve,
+    _service_protocols,
+    _surfaces_compatible,
     enrich_service,
 )
 
@@ -1674,3 +1677,321 @@ class TestUpsertVulnerabilityLinking:
         a-typed guess."""
         prefixes = self._captured_prefixes("cpe:/o:microsoft:windows_10")
         assert prefixes == []
+
+
+class TestClassifyAttackSurface:
+    """L7 protocol classifier — catches the CrushFTP-SSTI-on-SFTP bug class."""
+
+    def test_ssti_description_tagged_http(self):
+        """CVE-2024-4040 parallel: SSTI in CrushFTP. The word 'HTTP' is
+        NOT in the stored description, but 'template injection' is —
+        classifier must infer HTTP surface from the SSTI signal alone."""
+        desc = (
+            "A server side template injection vulnerability in CrushFTP in all "
+            "versions before 10.7.1 and 11.1.0 on all platforms allows "
+            "unauthenticated remote attackers to read files from the filesystem "
+            "outside of the VFS Sandbox, bypass authentication to gain "
+            "administrative access, and perform remote code execution on the server."
+        )
+        assert _classify_attack_surface(desc) == ["http"]
+
+    def test_explicit_http_keyword(self):
+        desc = "A flaw in mod_proxy allows HTTP request smuggling on crafted URI paths."
+        assert "http" in _classify_attack_surface(desc)
+
+    def test_scp_description_tagged_ssh(self):
+        """CVE-2020-15778 parallel: scp in OpenSSH."""
+        desc = (
+            "scp in OpenSSH through 8.3p1 allows command injection in the scp.c "
+            "toremote function, as demonstrated by backtick characters in the "
+            "destination argument."
+        )
+        surfaces = _classify_attack_surface(desc)
+        assert "ssh" in surfaces
+
+    def test_samba_description_tagged_smb(self):
+        """CVE-2017-7494 parallel: SambaCry."""
+        desc = (
+            "Samba since version 3.5.0 is vulnerable to remote code execution, "
+            "allowing a malicious client to upload a shared library to a "
+            "writable share, and then cause the server to load and execute it."
+        )
+        surfaces = _classify_attack_surface(desc)
+        assert "smb" in surfaces
+
+    def test_cwe_csrf_adds_http(self):
+        """A terse description without keywords but with CWE-352 still
+        resolves to http via the CWE map."""
+        desc = "Authentication bypass in product X."
+        assert _classify_attack_surface(desc, cwe_ids=["CWE-352"]) == ["http"]
+
+    def test_unclassifiable_returns_empty(self):
+        """Terse generic description with no protocol marker → empty
+        list → conservative default (don't block at link time)."""
+        desc = "Stack-based buffer overflow in function foo() allows remote code execution."
+        assert _classify_attack_surface(desc) == []
+
+    def test_ftp_not_confused_with_sftp(self):
+        """'SFTP' in a description must not match the FTP pattern (that
+        would mis-classify SSH-family CVEs as FTP)."""
+        desc = "A vulnerability in the SFTP subsystem allows read access."
+        surfaces = _classify_attack_surface(desc)
+        assert "sftp" in surfaces
+        assert "ftp" not in surfaces
+
+
+class TestServiceProtocols:
+    def test_ssh(self):
+        assert _service_protocols("ssh") == {"ssh"}
+
+    def test_sftp_separate_from_ssh(self):
+        """SFTP product (CrushFTP) is its own protocol tag, not lumped
+        into 'ssh' — otherwise an SSH-only CVE would accidentally link
+        onto a CrushFTP SFTP port."""
+        assert _service_protocols("sftp") == {"sftp"}
+
+    def test_https_is_http(self):
+        assert _service_protocols("https") == {"http"}
+
+    def test_microsoft_ds_is_smb(self):
+        assert _service_protocols("microsoft-ds") == {"smb"}
+
+    def test_postgres_tags_both_specific_and_generic(self):
+        """Database services carry both a product-specific tag and the
+        generic 'database' tag so rules can target either level."""
+        assert _service_protocols("postgres") == {"postgres", "database"}
+
+    def test_unknown_returns_empty(self):
+        assert _service_protocols("some-weird-service") == set()
+
+    def test_none_returns_empty(self):
+        assert _service_protocols(None) == set()
+
+
+class TestSurfacesCompatible:
+    def test_http_cve_on_ssh_service_blocked(self):
+        """CrushFTP case: HTTP-tagged CVE, SFTP service → incompatible."""
+        assert _surfaces_compatible({"sftp"}, ["http"]) is False
+
+    def test_ssh_cve_on_ssh_service_compatible(self):
+        assert _surfaces_compatible({"ssh"}, ["ssh"]) is True
+
+    def test_unknown_vuln_surfaces_does_not_block(self):
+        """Empty vuln surfaces = unclassified → conservative, don't
+        block. Otherwise one missing keyword in our dictionary would
+        silently drop real findings."""
+        assert _surfaces_compatible({"ssh"}, []) is True
+        assert _surfaces_compatible({"ssh"}, None) is True
+
+    def test_unknown_service_does_not_block(self):
+        """Service with no protocol tag (nmap name absent from our
+        map) also degrades to conservative."""
+        assert _surfaces_compatible(set(), ["http"]) is True
+
+    def test_partial_overlap_is_compatible(self):
+        """A CVE attacking multiple surfaces matches any service whose
+        protocol is in the set."""
+        assert _surfaces_compatible({"http"}, ["http", "smb"]) is True
+
+    def test_fully_disjoint_sets_block(self):
+        assert _surfaces_compatible({"smb"}, ["ldap"]) is False
+
+
+@pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
+class TestLinkTimeSurfaceFilter:
+    """Integration: CrushFTP-on-SFTP regression guard. An HTTP-only CVE
+    must NOT end up with a HAS_VULN edge to an SFTP service of the
+    same product, even though product+version match."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_db(self):
+        clear_database()
+        yield
+        clear_database()
+
+    def _seed_service(self, *, name: str, port: int, product: str, version: str):
+        with get_session() as session:
+            session.run(
+                """
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up',
+                               role: 'unknown', role_confidence: 0.0})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: $port,
+                                  protocol: 'tcp', state: 'open',
+                                  name: $name, product: $product,
+                                  version: $version})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                """,
+                name=name, port=port, product=product, version=version,
+            )
+
+    def test_http_only_cve_not_linked_to_sftp_service(self):
+        """CrushFTP regression: port-22 SFTP banner + HTTP-only CVE
+        must NOT produce a HAS_VULN edge."""
+        from cauldron.ai.cve_enricher import _upsert_vulnerability
+
+        self._seed_service(
+            name="sftp", port=22, product="CrushFTP", version="10.5.0",
+        )
+        cve = CVEInfo(
+            cve_id="CVE-2024-4040",
+            cvss=9.8,
+            description="A server side template injection vulnerability in CrushFTP",
+            attack_surfaces=["http"],
+        )
+        with get_session() as session:
+            _upsert_vulnerability(session, "CrushFTP", "10.5.0", [], cve)
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2024-4040'})
+                RETURN count(r) AS c
+                """,
+            ).single()["c"]
+        assert count == 0
+
+    def test_matching_surface_still_links(self):
+        """Control: SSH CVE on SSH service must still attach — we
+        haven't over-applied the filter."""
+        from cauldron.ai.cve_enricher import _upsert_vulnerability
+
+        self._seed_service(
+            name="ssh", port=22, product="OpenSSH", version="8.3p1",
+        )
+        cve = CVEInfo(
+            cve_id="CVE-2020-15778",
+            cvss=7.4,
+            description="scp command injection in OpenSSH",
+            attack_surfaces=["ssh"],
+        )
+        with get_session() as session:
+            _upsert_vulnerability(session, "OpenSSH", "8.3p1", [], cve)
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2020-15778'})
+                RETURN count(r) AS c
+                """,
+            ).single()["c"]
+        assert count == 1
+
+    def test_unclassified_cve_still_links(self):
+        """CVE with empty attack_surfaces (classifier gave up) must NOT
+        be blocked — conservative default protects real findings."""
+        from cauldron.ai.cve_enricher import _upsert_vulnerability
+
+        self._seed_service(
+            name="sftp", port=22, product="CrushFTP", version="10.5.0",
+        )
+        cve = CVEInfo(
+            cve_id="CVE-9999-0000",
+            cvss=7.0,
+            description="Stack buffer overflow in function foo()",
+            attack_surfaces=[],
+        )
+        with get_session() as session:
+            _upsert_vulnerability(session, "CrushFTP", "10.5.0", [], cve)
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-9999-0000'})
+                RETURN count(r) AS c
+                """,
+            ).single()["c"]
+        assert count == 1
+
+
+@pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
+class TestMigrateAttackSurfaces:
+    """The boil-time sweep: classify old nodes, drop incompatible edges,
+    but NEVER touch edges an operator already ruled on."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_db(self):
+        clear_database()
+        yield
+        clear_database()
+
+    def test_drops_incompatible_edge_when_operator_silent(self):
+        """Pre-fix graph: HAS_VULN exists linking an HTTP-CVE to a
+        SFTP service. After migration, edge must be gone."""
+        from cauldron.ai.cve_enricher import migrate_attack_surfaces_from_graph
+
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: 22,
+                                  protocol: 'tcp', name: 'sftp',
+                                  product: 'CrushFTP', version: '10.5.0'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                CREATE (v:Vulnerability {
+                    cve_id: 'CVE-2024-4040', cvss: 9.8, source: 'nvd',
+                    description: 'server side template injection vulnerability in CrushFTP'
+                })
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(v)
+            """)
+
+        stats = migrate_attack_surfaces_from_graph()
+        assert stats["classified"] >= 1
+        assert stats["edges_dropped"] >= 1
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2024-4040'})
+                RETURN count(r) AS c
+                """,
+            ).single()["c"]
+        assert count == 0
+
+    def test_preserves_operator_verdict_edges(self):
+        """If the operator marked the edge as 'exploited' or
+        'false_positive', migration must NOT touch it — their verdict
+        overrides automatic classification."""
+        from cauldron.ai.cve_enricher import migrate_attack_surfaces_from_graph
+
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: 22,
+                                  protocol: 'tcp', name: 'sftp',
+                                  product: 'CrushFTP', version: '10.5.0'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                CREATE (v:Vulnerability {
+                    cve_id: 'CVE-2024-4040', cvss: 9.8, source: 'nvd',
+                    description: 'server side template injection vulnerability in CrushFTP'
+                })
+                CREATE (s)-[:HAS_VULN {confidence: 'confirmed',
+                                      checked_status: 'exploited'}]->(v)
+            """)
+
+        migrate_attack_surfaces_from_graph()
+
+        with get_session() as session:
+            count = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2024-4040'})
+                RETURN count(r) AS c
+                """,
+            ).single()["c"]
+        assert count == 1  # preserved
+
+    def test_idempotent(self):
+        """Running twice is safe — second run finds nothing to do."""
+        from cauldron.ai.cve_enricher import migrate_attack_surfaces_from_graph
+
+        with get_session() as session:
+            session.run("""
+                CREATE (v:Vulnerability {
+                    cve_id: 'CVE-2020-15778', cvss: 7.4, source: 'nvd',
+                    description: 'scp command injection in OpenSSH'
+                })
+            """)
+
+        first = migrate_attack_surfaces_from_graph()
+        second = migrate_attack_surfaces_from_graph()
+        assert first["classified"] == 1
+        assert second["classified"] == 0
+        assert second["edges_dropped"] == 0
