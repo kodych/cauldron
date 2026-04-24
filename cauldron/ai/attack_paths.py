@@ -141,15 +141,13 @@ def discover_attack_paths(
     for path in paths:
         path.score = _score_path(path)
 
-    # Deduplicate by target IP — same vuln host from different sources = noise
-    # Keep the highest scoring path to each target
-    seen: dict[str, AttackPath] = {}
-    for path in paths:
-        key = path.target_ip
-        if key not in seen or path.score > seen[key].score:
-            seen[key] = path
-
-    paths = list(seen.values())
+    # No dedup pass. Direct queries return one row per (src, h); pivot
+    # queries use DISTINCT (src_ext, pivot, src_int) outside with unique
+    # targets inside — no chain can be produced twice. A historical
+    # dedup pass collapsed by target_ip and was the reason a target
+    # reachable from two scan positions only showed one red edge on the
+    # canvas. Every path reaching this line is a legitimate cartography
+    # signal; keep all of them.
     paths.sort(key=lambda p: p.score, reverse=True)
     return paths
 

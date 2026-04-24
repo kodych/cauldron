@@ -451,6 +451,46 @@ class TestDiscoverDirectPaths:
         assert all(p.target_role == "database" for p in paths)
         assert len(paths) >= 1
 
+    def test_multi_source_target_keeps_both_paths(self):
+        """Two ScanSources that both see the same vulnerable host → two
+        paths in the output, not one. The graph canvas draws a red edge
+        per path, so collapsing them hides the second scan position from
+        the cartography and makes the engagement look thinner than it
+        actually is."""
+        with get_session() as session:
+            session.run("CREATE (:ScanSource {name: '192.168.1.100'})")
+            session.run("CREATE (:ScanSource {name: '10.0.5.5'})")
+            session.run("""
+                CREATE (h:Host {ip: '10.0.2.20', state: 'up', role: 'web_server',
+                               role_confidence: 0.9})
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: '192.168.1.100'}),
+                      (h:Host {ip: '10.0.2.20'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            session.run("""
+                MATCH (src:ScanSource {name: '10.0.5.5'}),
+                      (h:Host {ip: '10.0.2.20'})
+                CREATE (src)-[:SCANNED_FROM]->(h)
+            """)
+            session.run("""
+                MATCH (h:Host {ip: '10.0.2.20'})
+                CREATE (h)-[:HAS_SERVICE]->(s:Service {host_ip: '10.0.2.20',
+                       port: 80, protocol: 'tcp', state: 'open'})
+                CREATE (s)-[:HAS_VULN]->(:Vulnerability {
+                    cve_id: 'CVE-2021-41773', cvss: 7.5, has_exploit: true,
+                    enables_pivot: true, description: 'Apache RCE'
+                })
+            """)
+
+        paths = discover_attack_paths(target_ip="10.0.2.20")
+
+        assert len(paths) == 2
+        sources = sorted(p.source_ip for p in paths)
+        assert sources == ["10.0.5.5", "192.168.1.100"]
+        assert all(p.target_ip == "10.0.2.20" for p in paths)
+
     def test_smb_relay_creates_path(self):
         """SMB signing disabled = valid attack path (relay target)."""
         with get_session() as session:
