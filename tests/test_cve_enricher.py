@@ -1555,3 +1555,54 @@ def urllib_403_error():
     import urllib.error
     for _ in range(4):
         yield urllib.error.HTTPError("https://nvd.nist.gov", 403, "Forbidden", {}, None)
+
+
+class TestUpsertVulnerabilityLinking:
+    """Regression guards around the CPE prefix used to link Vulnerability
+    nodes to matching Services. The bug this class pins down: the linker
+    used to hardcode ``cpe:/a:`` regardless of CPE part type, so every
+    OS-typed CPE (ESXi, Cisco IOS, MikroTik RouterOS, PAN-OS, FortiOS)
+    silently missed the STARTS-WITH link pass and could only be caught
+    by product+version literal equality."""
+
+    def _captured_prefixes(self, cpe_in: str) -> list[str]:
+        """Run ``_upsert_vulnerability`` against a MagicMock session and
+        collect every ``prefix`` kwarg it would have sent to Cypher."""
+        from unittest.mock import MagicMock
+
+        from cauldron.ai.cve_enricher import CVEInfo, _upsert_vulnerability
+
+        session = MagicMock()
+        _upsert_vulnerability(
+            session,
+            product="",
+            version="",
+            cpe_list=[cpe_in],
+            cve=CVEInfo(cve_id="CVE-9999-0001", cvss=7.5),
+        )
+        prefixes: list[str] = []
+        for call in session.run.call_args_list:
+            kwargs = call.kwargs
+            if "prefix" in kwargs:
+                prefixes.append(kwargs["prefix"])
+        return prefixes
+
+    def test_os_typed_cpe_links_via_o_prefix(self):
+        """ESXi sits on Services as ``cpe:/o:vmware:esxi:7.0.3``; the
+        linker must build an ``cpe:/o:`` prefix so STARTS WITH matches."""
+        prefixes = self._captured_prefixes("cpe:/o:vmware:esxi:7.0.3")
+        assert prefixes == ["cpe:/o:vmware:esxi:7.0.3"]
+
+    def test_application_cpe_still_uses_a_prefix(self):
+        """Application CPEs must keep the ``cpe:/a:`` prefix — the fix
+        must not flip the default."""
+        prefixes = self._captured_prefixes("cpe:/a:apache:http_server:2.4.49")
+        assert prefixes == ["cpe:/a:apache:http_server:2.4.49"]
+
+    def test_os_cpe_not_in_allowlist_is_dropped_not_misprefixed(self):
+        """``_cpe22_to_23`` only emits OS CPEs for high-value products
+        (ESXi, Cisco IOS, etc.). Other o-types return None — so the
+        linker must not emit *any* prefix rather than fall back to an
+        a-typed guess."""
+        prefixes = self._captured_prefixes("cpe:/o:microsoft:windows_10")
+        assert prefixes == []

@@ -1615,20 +1615,28 @@ def _upsert_vulnerability(
         )
 
     # Also link by CPE (catches services where product name differs but CPE matches)
-    # Must include version to avoid cross-version pollution
+    # Must include version to avoid cross-version pollution.
+    #
+    # The part type (a/o/h) must come from the converted CPE 2.3 — NOT
+    # hardcoded. ``cpe:/o:vmware:esxi:7.0.3`` stays on the Service as a
+    # ``cpe:/o:...`` URI, so building a ``cpe:/a:...`` linking prefix
+    # would silently skip every OS-typed host (ESXi, Cisco IOS,
+    # RouterOS, PAN-OS, FortiOS). ``_cpe22_to_23`` already emits the
+    # right part type for both the gated OS products and applications,
+    # so we echo it straight back into the prefix.
     for cpe in cpe_list:
         cpe23 = _cpe22_to_23(cpe)
         if cpe23:
             parts = cpe23.split(":")
             if len(parts) >= 6:
+                cpe_part = parts[2]  # 'a', 'o', or 'h' — preserved from input
                 cpe_vendor = parts[3]
                 cpe_product = parts[4]
                 cpe_version = parts[5]
-                # Build prefix with version if available
                 if cpe_version and cpe_version != "*":
-                    cpe_prefix = f"cpe:/a:{cpe_vendor}:{cpe_product}:{cpe_version}"
+                    cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}:{cpe_version}"
                 else:
-                    cpe_prefix = f"cpe:/a:{cpe_vendor}:{cpe_product}"
+                    cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}"
                 session.run(
                     """
                     MATCH (s:Service)
