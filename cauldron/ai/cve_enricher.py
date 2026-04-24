@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -73,8 +74,13 @@ CACHE_FILE = CACHE_DIR / "cve_cache.json"
 # upstream refresh cadence without pointlessly re-fetching on every boil.
 EPSS_CACHE_FILE = CACHE_DIR / "epss_cache.json"
 
-# Rate limiting: track last request time
+# Rate limiting: track last request time. Protected by ``_rate_limit_lock``
+# because the AI analyzer calls NVD concurrently from a ThreadPoolExecutor
+# during Phase 1 (AI CPE extraction → NVD lookup). Without a lock, parallel
+# threads read the same ``_last_request_time``, each sleep the same delta,
+# and the burst briefly exceeds NVD's RPS budget.
 _last_request_time: float = 0.0
+_rate_limit_lock = threading.Lock()
 
 # Fallback: nmap product name -> CPE "vendor:product" for services without
 # nmap-provided CPE. Keys are matched lowercased, exact first then prefix —
@@ -287,13 +293,14 @@ class EPSSCache:
 
 
 def _rate_limit() -> None:
-    """Enforce NVD API rate limits."""
+    """Enforce NVD API rate limits. Thread-safe (see ``_rate_limit_lock``)."""
     global _last_request_time
     delay = 0.7 if settings.nvd_api_key else 6.5
-    elapsed = time.time() - _last_request_time
-    if elapsed < delay:
-        time.sleep(delay - elapsed)
-    _last_request_time = time.time()
+    with _rate_limit_lock:
+        elapsed = time.time() - _last_request_time
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+        _last_request_time = time.time()
 
 
 # --- CPE helpers ---

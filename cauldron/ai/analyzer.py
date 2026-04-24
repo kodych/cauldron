@@ -25,12 +25,43 @@ import ipaddress
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from cauldron.config import settings
 from cauldron.graph.connection import get_session
 
 logger = logging.getLogger(__name__)
+
+# Concurrency cap for parallel Claude API calls within a single analysis
+# phase. Five concurrent requests stay well inside Anthropic's Tier-1 RPM
+# (50/min for Sonnet) while turning the Phase-3 wall clock from O(N×latency)
+# into ~O(N×latency/5). Each worker opens its own short-lived Neo4j session
+# on write; the driver's connection pool handles that fan-out natively.
+_AI_MAX_WORKERS = 5
+
+
+def _gather_batches(fns_and_args: list, max_workers: int = _AI_MAX_WORKERS) -> list:
+    """Run batch callables concurrently, preserving ``ClaudeAuthError``
+    short-circuit semantics. On the first auth failure, pending futures
+    are cancelled and running ones drain; the exception propagates to
+    the caller so ``analyze_graph`` can stamp ``auth_error`` on the result.
+
+    ``fns_and_args`` is a list of ``(callable, args_tuple)`` pairs.
+    """
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(fn, *args) for fn, args in fns_and_args]
+        try:
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        except ClaudeAuthError:
+            # Stop accepting more work. Running Claude calls will raise
+            # the same AuthError and their results are simply discarded.
+            for f in futures:
+                f.cancel()
+            raise
+    return results
 
 
 class ClaudeAuthError(Exception):
@@ -211,13 +242,15 @@ def _ai_extract_cpes() -> tuple[int, int]:
         by_host[c["ip"]].append(c)
     hosts_list = list(by_host.items())
 
-    total_vulns = 0
-    services_enriched = 0
-    for i in range(0, len(hosts_list), _HOSTS_PER_AI_BATCH):
-        batch = hosts_list[i : i + _HOSTS_PER_AI_BATCH]
+    def _process_batch(batch: list[tuple[str, list[dict]]]) -> tuple[int, int]:
+        """Run one AI extraction + per-CPE NVD lookup + link. Returns
+        ``(vulns_linked, services_enriched)`` for this batch only, so the
+        outer pool can sum across all futures without shared state."""
         extracted = _ai_cpes_for_batch(batch)
         if not extracted:
-            continue
+            return 0, 0
+        batch_vulns = 0
+        batch_services = 0
         for entry in extracted:
             linked_here = 0
             for cpe23 in entry.get("cpes", []):
@@ -234,10 +267,18 @@ def _ai_extract_cpes() -> tuple[int, int]:
                 for cve in cves:
                     if _link_ai_cve_to_service(entry, cve):
                         linked_here += 1
-                        total_vulns += 1
+                        batch_vulns += 1
             if linked_here:
-                services_enriched += 1
+                batch_services += 1
+        return batch_vulns, batch_services
 
+    batches = [
+        hosts_list[i : i + _HOSTS_PER_AI_BATCH]
+        for i in range(0, len(hosts_list), _HOSTS_PER_AI_BATCH)
+    ]
+    results = _gather_batches([(_process_batch, (b,)) for b in batches])
+    total_vulns = sum(r[0] for r in results)
+    services_enriched = sum(r[1] for r in results)
     return total_vulns, services_enriched
 
 
@@ -436,17 +477,22 @@ def _classify_ambiguous_hosts() -> int:
         total, batch_total, "" if batch_total == 1 else "es",
     )
 
-    total_updated = 0
-    for i in range(0, total, _CLASSIFY_BATCH_SIZE):
-        batch = hosts[i : i + _CLASSIFY_BATCH_SIZE]
-        batch_num = i // _CLASSIFY_BATCH_SIZE + 1
+    batches = [
+        hosts[i : i + _CLASSIFY_BATCH_SIZE]
+        for i in range(0, total, _CLASSIFY_BATCH_SIZE)
+    ]
+
+    def _run_one(batch_num: int, batch: list) -> int:
         logger.info(
             "AI classification batch %d/%d (%d hosts)",
             batch_num, batch_total, len(batch),
         )
-        total_updated += _classify_ambiguous_batch(batch)
+        return _classify_ambiguous_batch(batch)
 
-    return total_updated
+    results = _gather_batches(
+        [(_run_one, (n + 1, b)) for n, b in enumerate(batches)],
+    )
+    return sum(results)
 
 
 def _classify_ambiguous_batch(hosts: list) -> int:
@@ -596,22 +642,24 @@ OWNED HOSTS (we have shell/access): {', '.join(owned_aliases) if owned_aliases e
 TARGET HOSTS (engagement goals): {', '.join(target_lines) if target_lines else 'none'}
 """
 
-    # Batch hosts: 15 per API call
-    total_kept = 0
-    total_dismissed = 0
-    total_targets = 0
+    # Batch hosts: 15 per API call. Batches are independent (disjoint host
+    # sets, read-only ip_map / context, guarded Cypher writes), so we fan
+    # them out across a thread pool. See _AI_MAX_WORKERS for rationale.
+    batches = [hosts[i:i + 15] for i in range(0, len(hosts), 15)]
+    batch_total = len(batches)
 
-    for i in range(0, len(hosts), 15):
-        batch = hosts[i:i + 15]
-        batch_num = i // 15 + 1
-        batch_total = (len(hosts) + 14) // 15
+    def _run_one(batch_num: int, batch: list[dict]) -> tuple[int, int, int]:
         logger.info("AI triage batch %d/%d (%d hosts)", batch_num, batch_total, len(batch))
         k, d, t = _triage_batch(batch, ip_map, reverse_map, context)
         logger.info("AI triage batch %d result: kept=%d, dismissed=%d, targets=%d", batch_num, k, d, t)
-        total_kept += k
-        total_dismissed += d
-        total_targets += t
+        return k, d, t
 
+    results = _gather_batches(
+        [(_run_one, (n + 1, b)) for n, b in enumerate(batches)],
+    )
+    total_kept = sum(r[0] for r in results)
+    total_dismissed = sum(r[1] for r in results)
+    total_targets = sum(r[2] for r in results)
     return total_kept, total_dismissed, total_targets
 
 

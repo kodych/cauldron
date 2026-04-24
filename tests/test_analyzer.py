@@ -219,6 +219,42 @@ class TestAnalyzeGraph:
         assert result.vulns_dismissed == 0
 
 
+class TestGatherBatches:
+    """Parallel batch executor used by all three AI phases.
+
+    Batches were verified order-independent (disjoint host sets, guarded
+    Cypher writes, readonly ip_map/context). The remaining correctness
+    question is how concurrent execution behaves when one batch raises
+    ClaudeAuthError — the whole pipeline must still short-circuit."""
+
+    def test_sums_results_across_parallel_batches(self):
+        from cauldron.ai.analyzer import _gather_batches
+
+        def _work(x: int) -> int:
+            return x * 2
+
+        results = _gather_batches([(_work, (i,)) for i in range(5)])
+        assert sorted(results) == [0, 2, 4, 6, 8]
+
+    def test_auth_error_in_any_batch_propagates(self):
+        """If even one batch returns 401, the whole phase must abort —
+        no silent swallowing, no partial result treated as success."""
+        import pytest
+
+        from cauldron.ai.analyzer import ClaudeAuthError, _gather_batches
+
+        def _ok(x: int) -> int:
+            return x
+
+        def _fail(_x: int) -> int:
+            raise ClaudeAuthError("Invalid Anthropic API key")
+
+        with pytest.raises(ClaudeAuthError, match="Invalid Anthropic API key"):
+            _gather_batches(
+                [(_ok, (1,)), (_fail, (2,)), (_ok, (3,))],
+            )
+
+
 class TestIsValidCpe23:
     """CPE 2.3 format validator — AI may hallucinate strings with wrong
     shape; we reject before spending an NVD API call on them."""
