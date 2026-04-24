@@ -80,13 +80,20 @@ def _parse_xml(content: str) -> ScanResult:
     hosts_map: dict[str, Host] = {}
 
     for host_elem in root.findall("host"):
-        # Get IP
+        # Address: prefer IPv4, fall back to IPv6. Mirrors the nmap
+        # parser so masscan XML scans of v6 ranges don't silently lose
+        # hosts (the JSON path already accepts v6 via the untyped ``ip``
+        # field, so XML-only drops were an asymmetry bug).
         ip = None
+        ipv6 = None
         for addr in host_elem.findall("address"):
-            if addr.get("addrtype") == "ipv4":
+            addr_type = addr.get("addrtype", "")
+            if addr_type == "ipv4":
                 ip = addr.get("addr")
-                break
-
+            elif addr_type == "ipv6" and ipv6 is None:
+                ipv6 = addr.get("addr")
+        if ip is None:
+            ip = ipv6
         if not ip:
             continue
 

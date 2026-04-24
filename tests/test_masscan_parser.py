@@ -309,7 +309,8 @@ def test_many_ports_single_host():
     assert len(ports) == len(set(ports))
 
 
-# 2. Mixed IPv4 + IPv6 — parser should take IPv4 only
+# 2. Mixed IPv4 + IPv6 — parser should accept both (v4 preferred per
+# host, v6 used when a host has no v4 address, mirroring nmap).
 MASSCAN_XML_IPV6_MIXED = """\
 <?xml version="1.0"?>
 <nmaprun scanner="masscan" start="1700000000">
@@ -335,13 +336,56 @@ MASSCAN_XML_IPV6_MIXED = """\
 """
 
 
-def test_ipv6_hosts_skipped():
-    """IPv6 hosts should be skipped — only IPv4 parsed."""
+def test_ipv6_fallback_when_no_ipv4():
+    """IPv6-only hosts should be parsed (nmap parity). Hosts with a v4
+    address use v4; a host with only v6 uses v6."""
     scan = parse_masscan(MASSCAN_XML_IPV6_MIXED)
-    assert len(scan.hosts_up) == 2
+    assert len(scan.hosts_up) == 3
     ips = {h.ip for h in scan.hosts_up}
-    assert ips == {"10.0.0.50", "10.0.0.51"}
-    assert "fe80::1" not in ips
+    assert ips == {"10.0.0.50", "10.0.0.51", "fe80::1"}
+
+
+# A masscan host element that carries BOTH v4 and v6 addresses — v4
+# must win so re-imports of a dual-stack scan land on the same Host
+# node regardless of which address comes first in the XML.
+MASSCAN_XML_DUAL_STACK = """\
+<?xml version="1.0"?>
+<nmaprun scanner="masscan" start="1700000000">
+  <host endtime="1700000001">
+    <address addr="2001:db8::1" addrtype="ipv6"/>
+    <address addr="10.0.0.60" addrtype="ipv4"/>
+    <ports><port protocol="tcp" portid="80">
+      <state state="open" reason="syn-ack"/>
+    </port></ports>
+  </host>
+</nmaprun>
+"""
+
+
+def test_dual_stack_prefers_ipv4():
+    """When a single host has both v4 and v6 addresses, v4 wins so a
+    re-import of the same scan never splits the host into two nodes."""
+    scan = parse_masscan(MASSCAN_XML_DUAL_STACK)
+    assert len(scan.hosts_up) == 1
+    assert scan.hosts_up[0].ip == "10.0.0.60"
+
+
+MASSCAN_JSON_IPV6 = """\
+[
+    {"ip": "fe80::abcd", "timestamp": "1700000000", "ports": [
+        {"port": 443, "proto": "tcp", "status": "open", "service": {"name": "https"}}
+    ]}
+]
+"""
+
+
+def test_json_parses_ipv6():
+    """JSON path already accepts v6 via the untyped ``ip`` field; lock
+    that behavior in so it stays symmetric with XML."""
+    scan = parse_masscan(MASSCAN_JSON_IPV6)
+    assert len(scan.hosts_up) == 1
+    assert scan.hosts_up[0].ip == "fe80::abcd"
+    assert scan.hosts_up[0].services[0].port == 443
 
 
 # 3. Duplicate port+IP entries (rescan overlap)
