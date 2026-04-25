@@ -788,6 +788,18 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     instead KEEP and note in reason "surface mismatch — verify alternative
     port (e.g. WebInterface on 443/9090)". KEV findings are too
     consequential for an automatic dismiss; the operator must confirm.
+12. UNIVERSAL DISMISSAL — when a CVE's precondition is the same on every
+    affected host (Terrapin needs MITM regardless of host context;
+    SCP-injection needs scp-usage regardless of role; user-enumeration
+    needs nothing host-specific), use verdict="dismiss-all" instead of
+    plain "dismiss". This signals Cauldron to mark the CVE as FP across
+    every active edge in the graph, not just this socket — fixing the
+    consistency problem where the same noise gets dismissed on some
+    hosts but kept on others across batches.
+    Use dismiss-all sparingly and only when the precondition is truly
+    host-independent. Forbidden for KEV CVEs (operator must confirm
+    those manually). When in doubt, use plain "dismiss" for the
+    individual host.
 
 CRITICAL: Do NOT dismiss CAULDRON-* IDs just because they are not standard CVEs.
 If unsure, KEEP. Missing a real vuln is worse than keeping noise — except for
@@ -798,13 +810,14 @@ Respond with ONLY JSON:
 [{{"id": "host-N", "suggest_target": true, "vulns": [
   {{"cve_id": "CVE-YYYY-NNNNN", "port": 443, "verdict": "keep"}},
   {{"cve_id": "CAULDRON-042", "port": 6379, "verdict": "keep"}},
-  {{"cve_id": "CVE-YYYY-NNNNN", "port": 22, "verdict": "dismiss", "reason": "Local privesc, host not owned"}}
+  {{"cve_id": "CVE-YYYY-NNNNN", "port": 22, "verdict": "dismiss", "reason": "Local privesc, host not owned"}},
+  {{"cve_id": "CVE-2023-48795", "port": 22, "verdict": "dismiss-all", "reason": "Terrapin requires MITM position — universal precondition"}}
 ]}}]
 
 Rules:
 - "cve_id" field contains the vulnerability ID exactly as shown above (CVE-* or CAULDRON-*)
-- verdict must be "keep" or "dismiss"
-- reason required for dismiss, optional for keep
+- verdict must be "keep", "dismiss", or "dismiss-all"
+- reason required for dismiss / dismiss-all, optional for keep
 - "suggest_target": true — set on hosts that should be priority targets
   (domain controllers, critical databases, mail servers, management interfaces)
   Only suggest targets that are NOT already marked as TARGET
@@ -822,6 +835,13 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
     """Parse triage response and apply dismiss verdicts + target suggestions.
 
     Returns: (kept, dismissed, targets_set)
+
+    Verdict types:
+    - "keep" — leave the edge as-is.
+    - "dismiss" — mark THIS edge (host+port+cve) as FP.
+    - "dismiss-all" — mark every active edge for THIS CVE across the
+      whole graph as FP (operator's "FP to all" mirror). Forbidden for
+      KEV CVEs — Rule 0 still rules; KEV findings need operator review.
     """
     data = _parse_json_response(response)
     if not isinstance(data, list):
@@ -830,6 +850,9 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
     kept = 0
     dismissed = 0
     targets_set = 0
+    # Track CVEs that already received a graph-wide bulk dismiss within
+    # this batch — re-applying is a no-op but logging once is cleaner.
+    bulk_dismissed_cves: set[str] = set()
 
     with get_session() as session:
         for item in data:
@@ -863,7 +886,50 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                 if not cve_id:
                     continue
 
-                if verdict == "dismiss":
+                if verdict == "dismiss-all":
+                    # Mirror of operator's bulk-FP. Skip KEV (Rule 0).
+                    # Skip if we already applied bulk for this CVE in
+                    # the current batch (idempotent).
+                    if cve_id in bulk_dismissed_cves:
+                        continue
+                    reason = v.get("reason", "AI universal dismiss — host-independent precondition")
+                    result = session.run(
+                        """
+                        MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
+                        WHERE r.checked_status IS NULL
+                          AND coalesce(v.in_cisa_kev, false) = false
+                        SET r.checked_status = 'false_positive',
+                            r.ai_fp_reason = $reason,
+                            r.ai_normalized = 'ai_dismiss_all'
+                        RETURN count(r) AS affected
+                        """,
+                        cve_id=cve_id, reason=reason,
+                    )
+                    rec = result.single()
+                    affected = rec["affected"] if rec else 0
+                    if affected > 0:
+                        bulk_dismissed_cves.add(cve_id)
+                        dismissed += affected
+                        logger.info(
+                            "AI dismiss-all: %s — %d edges flipped — %s",
+                            cve_id, affected, reason,
+                        )
+                    else:
+                        # Either no active edges (already done) or KEV-blocked.
+                        # Check whether KEV blocked us so we can log clearly.
+                        kev_check = session.run(
+                            "MATCH (v:Vulnerability {cve_id: $c}) "
+                            "RETURN coalesce(v.in_cisa_kev, false) AS kev",
+                            c=cve_id,
+                        ).single()
+                        if kev_check and kev_check["kev"]:
+                            logger.info(
+                                "AI dismiss-all blocked by KEV exception: %s — kept on %s",
+                                cve_id, real_ip,
+                            )
+                            # Treat as plain keep on this host
+                            kept += 1
+                elif verdict == "dismiss":
                     reason = v.get("reason", "AI triage: not exploitable in engagement context")
                     if isinstance(port, int) and port > 0:
                         result = session.run(

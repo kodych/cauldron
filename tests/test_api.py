@@ -500,6 +500,91 @@ class TestVulnStatus:
         assert resp.status_code == 400
 
 
+class TestVulnBulkStatus:
+    """Bulk-FP endpoint — operator's 'mark this CVE as FP everywhere it's
+    attached' shortcut. Critical that already-decided edges (operator
+    or AI verdicts) stay sacred, only active edges get touched."""
+
+    def test_bulk_marks_all_active_edges_as_fp(self, client):
+        _setup_test_network()
+        # WEB01 has CVE-2021-41773 active. Bulk-mark all such edges.
+        resp = client.patch(
+            "/api/v1/vulns/CVE-2021-41773/bulk-status",
+            json={"status": "false_positive", "reason": "Out of scope"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["affected"] >= 1
+
+        # Verify it's actually FP-marked now
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["checked_status"] == "false_positive"
+                assert v["ai_fp_reason"] == "Out of scope"
+
+    def test_bulk_skips_already_decided_edges(self, client):
+        """Pre-marked exploited edges must not be flipped by a bulk FP.
+        Operator's individual verdict overrides bulk."""
+        _setup_test_network()
+        # First mark this specific instance as exploited
+        client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "exploited"},
+        )
+        # Then bulk-FP — should NOT touch the exploited one
+        resp = client.patch(
+            "/api/v1/vulns/CVE-2021-41773/bulk-status",
+            json={"status": "false_positive", "reason": "noise"},
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                # Stays exploited — bulk respected the prior verdict
+                assert v["checked_status"] == "exploited"
+
+    def test_bulk_rejects_non_fp_status(self, client):
+        """Bulk endpoint is FP-only — exploited/mitigated would almost
+        always be wrong globally. Reject explicitly."""
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/vulns/CVE-2021-41773/bulk-status",
+            json={"status": "exploited", "reason": "nope"},
+        )
+        assert resp.status_code == 400
+
+    def test_bulk_default_reason_when_missing(self, client):
+        """Reason is optional — endpoint provides a sane default so the
+        FP-marker still has explanatory text."""
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/vulns/CVE-2021-41773/bulk-status",
+            json={"status": "false_positive"},
+        )
+        assert resp.status_code == 200
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["ai_fp_reason"]  # not empty
+
+    def test_bulk_unknown_cve_returns_zero_affected(self, client):
+        """Bulk on a CVE that isn't in the graph isn't an error — just
+        zero affected edges. Operator gets a no-op result, not 404."""
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/vulns/CVE-9999-9999/bulk-status",
+            json={"status": "false_positive", "reason": "test"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["affected"] == 0
+
+
 class TestBruteforceable:
     def test_toggle_bruteforceable(self, client):
         _setup_test_network()

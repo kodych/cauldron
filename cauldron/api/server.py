@@ -212,6 +212,19 @@ class VulnStatusUpdate(BaseModel):
     port: int | None = None  # port to scope status to (same CVE on different ports = independent)
 
 
+class VulnBulkStatusUpdate(BaseModel):
+    """Bulk verdict for a CVE across the whole graph.
+
+    Used by the FP-to-all UX: operator sees a CVE that's noise on every
+    host where it's attached, types one reason, applies once. Touches
+    only edges where ``checked_status IS NULL`` — already-decided edges
+    (operator-confirmed exploited / mitigated / FP-with-reason) stay
+    sacred.
+    """
+    status: str | None = None  # currently only 'false_positive' supported
+    reason: str | None = None  # required for false_positive
+
+
 class HostMarkerUpdate(BaseModel):
     value: bool
 
@@ -1261,6 +1274,47 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
             raise HTTPException(status_code=404, detail=f"Vulnerability {vuln_id} not found on host {ip}")
 
     return {"ok": True}
+
+
+@app.patch("/api/v1/vulns/{vuln_id}/bulk-status")
+def bulk_update_vuln_status(vuln_id: str, body: VulnBulkStatusUpdate):
+    """Apply a verdict to every active edge of this CVE across the graph.
+
+    Operator UX: one click marks a noise CVE as FP on all hosts at once.
+    Only touches edges where ``checked_status IS NULL`` so prior verdicts
+    (exploited / mitigated / per-host FP with reason) are preserved.
+
+    Currently scoped to ``status = 'false_positive'`` — bulk-marking a
+    CVE as exploited/mitigated globally would almost always be wrong
+    (those verdicts are inherently per-instance). Operator can still do
+    individual verdicts via the per-host endpoint.
+    """
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    if body.status != "false_positive":
+        raise HTTPException(
+            status_code=400,
+            detail="Bulk endpoint currently supports only 'false_positive' status",
+        )
+    reason = (body.reason or "").strip() or "Operator bulk dismiss"
+
+    with get_session() as session:
+        result = session.run(
+            """
+            MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
+            WHERE r.checked_status IS NULL
+            SET r.checked_status = 'false_positive',
+                r.ai_fp_reason = $reason
+            RETURN count(r) AS affected
+            """,
+            vuln_id=vuln_id,
+            reason=reason,
+        )
+        record = result.single()
+        affected = record["affected"] if record else 0
+
+    return {"ok": True, "cve_id": vuln_id, "affected": affected}
 
 
 class BruteforceableUpdate(BaseModel):

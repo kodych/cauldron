@@ -161,6 +161,18 @@ export const api = {
   updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus, port?: number | null) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status, port }),
 
+  // Bulk-FP a CVE across every active edge in the graph. Operator's
+  // shortcut for "this CVE is noise everywhere it's attached" — one
+  // confirm, then all matching active edges flip to false_positive
+  // with the supplied reason. Already-decided edges (exploited /
+  // mitigated / per-host FP) are preserved; only `checked_status IS NULL`
+  // is touched.
+  bulkUpdateVulnStatus: (vulnId: string, reason: string) =>
+    patch<{ ok: boolean; cve_id: string; affected: number }>(
+      `/vulns/${encodeURIComponent(vulnId)}/bulk-status`,
+      { status: 'false_positive', reason },
+    ),
+
   updateServiceBruteforceable: (ip: string, port: number, bruteforceable: boolean) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/services/${port}/bruteforceable`, { bruteforceable }),
 

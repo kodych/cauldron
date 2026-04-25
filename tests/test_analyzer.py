@@ -707,3 +707,135 @@ class TestParseClassificationAnonymized:
         assert result[0]["ip"] == "10.0.0.1"
 
 
+@pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
+class TestApplyTriageDismissAll:
+    """Verdict ``dismiss-all`` mirrors the operator's bulk-FP shortcut —
+    one AI verdict marks every active edge for the CVE as FP. KEV CVEs
+    are protected (Rule 0 — operator must confirm)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_db(self):
+        clear_database()
+        yield
+        clear_database()
+
+    def _seed_multihost_cve(self, cve_id: str, *, kev: bool = False, hosts: int = 5):
+        """Create N hosts each with a Service hosting the same vuln."""
+        with get_session() as session:
+            session.run(
+                "CREATE (v:Vulnerability {cve_id: $c, cvss: 7.5, source: 'nvd', "
+                "description: 'test', in_cisa_kev: $kev})",
+                c=cve_id, kev=kev,
+            )
+            for i in range(hosts):
+                session.run(
+                    """
+                    CREATE (h:Host {ip: $ip, state: 'up', role: 'web_server',
+                                    role_confidence: 0.9})
+                    CREATE (s:Service {host_ip: $ip, port: 22, protocol: 'tcp',
+                                       state: 'open', name: 'ssh',
+                                       product: 'OpenSSH', version: '8.0'})
+                    CREATE (h)-[:HAS_SERVICE]->(s)
+                    WITH s
+                    MATCH (v:Vulnerability {cve_id: $c})
+                    CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(v)
+                    """,
+                    ip=f"10.0.0.{i + 1}", c=cve_id,
+                )
+
+    def test_dismiss_all_marks_every_edge_fp(self):
+        """AI emits dismiss-all once for a CVE present on 5 hosts.
+        Every active edge must end up FP-marked with the consensus reason."""
+        from cauldron.ai.analyzer import _apply_triage
+
+        self._seed_multihost_cve("CVE-2023-48795", hosts=5)
+
+        # AI response: the SECOND host carries the dismiss-all (only
+        # needs to appear once anywhere — the verdict is graph-wide).
+        response = json.dumps([
+            {"id": "host-1", "vulns": [{"cve_id": "CVE-2023-48795", "port": 22, "verdict": "keep"}]},
+            {"id": "host-2", "vulns": [{
+                "cve_id": "CVE-2023-48795", "port": 22, "verdict": "dismiss-all",
+                "reason": "Terrapin requires MITM — universal precondition",
+            }]},
+            {"id": "host-3", "vulns": [{"cve_id": "CVE-2023-48795", "port": 22, "verdict": "keep"}]},
+        ])
+        reverse = {f"host-{i + 1}": f"10.0.0.{i + 1}" for i in range(5)}
+
+        kept, dismissed, _ = _apply_triage(response, reverse)
+        assert dismissed == 5  # all 5 edges flipped via dismiss-all
+
+        with get_session() as session:
+            r = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2023-48795'})
+                RETURN count(CASE WHEN r.checked_status = 'false_positive' THEN 1 END) AS fp,
+                       count(CASE WHEN r.checked_status IS NULL THEN 1 END) AS active,
+                       collect(DISTINCT r.ai_normalized) AS markers
+                """,
+            ).single()
+        assert r["fp"] == 5
+        assert r["active"] == 0
+        assert "ai_dismiss_all" in r["markers"]
+
+    def test_dismiss_all_blocked_for_kev(self):
+        """KEV CVEs must not be flipped by dismiss-all — Rule 0 protection.
+        AI's ``keep`` verdict on the host where dismiss-all was attempted
+        is preserved (operator can manually decide later)."""
+        from cauldron.ai.analyzer import _apply_triage
+
+        self._seed_multihost_cve("CVE-KEV-9999", kev=True, hosts=3)
+
+        response = json.dumps([
+            {"id": "host-1", "vulns": [{
+                "cve_id": "CVE-KEV-9999", "port": 22, "verdict": "dismiss-all",
+                "reason": "AI thinks universal — should be blocked by KEV exception",
+            }]},
+        ])
+        reverse = {f"host-{i + 1}": f"10.0.0.{i + 1}" for i in range(3)}
+
+        kept, dismissed, _ = _apply_triage(response, reverse)
+        # Host where dismiss-all was attempted should be counted as kept
+        assert kept >= 1
+        assert dismissed == 0  # KEV blocked
+
+        with get_session() as session:
+            r = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-KEV-9999'})
+                RETURN count(CASE WHEN r.checked_status IS NULL THEN 1 END) AS active
+                """,
+            ).single()
+        assert r["active"] == 3, "KEV edges must all stay active"
+
+    def test_dismiss_all_idempotent_within_batch(self):
+        """If multiple hosts in the same batch carry dismiss-all for the
+        same CVE, only the first flips edges; subsequent are no-ops."""
+        from cauldron.ai.analyzer import _apply_triage
+
+        self._seed_multihost_cve("CVE-DUP-9999", hosts=3)
+
+        response = json.dumps([
+            {"id": "host-1", "vulns": [{"cve_id": "CVE-DUP-9999", "port": 22,
+                                        "verdict": "dismiss-all", "reason": "noise"}]},
+            {"id": "host-2", "vulns": [{"cve_id": "CVE-DUP-9999", "port": 22,
+                                        "verdict": "dismiss-all", "reason": "noise"}]},
+            {"id": "host-3", "vulns": [{"cve_id": "CVE-DUP-9999", "port": 22,
+                                        "verdict": "dismiss-all", "reason": "noise"}]},
+        ])
+        reverse = {f"host-{i + 1}": f"10.0.0.{i + 1}" for i in range(3)}
+
+        kept, dismissed, _ = _apply_triage(response, reverse)
+        # Only the first dismiss-all gets credited; the duplicates are no-ops
+        assert dismissed == 3  # 3 edges flipped on first call
+
+        with get_session() as session:
+            r = session.run(
+                """
+                MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-DUP-9999'})
+                RETURN count(CASE WHEN r.checked_status = 'false_positive' THEN 1 END) AS fp
+                """,
+            ).single()
+        assert r["fp"] == 3
+
+
