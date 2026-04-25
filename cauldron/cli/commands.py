@@ -350,16 +350,14 @@ def boil(nvd: bool, ai: bool, run_all: bool):
         with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
             epss_stats = enrich_epss_from_graph()
 
-        # Classify attack surfaces on new CVEs and drop edges where the
-        # service's L7 protocol is provably incompatible with the CVE.
-        # Idempotent — the sweep only re-touches vulns/edges that haven't
-        # been resolved yet.
+        # Classify L7 attack surfaces (http/ssh/smb/...) on new CVEs.
+        # Metadata only — surfaces feed the UI badge and the AI triage
+        # hint, they do NOT delete edges. Idempotent, safe per boil.
         with console.status("[bold green]Classifying attack surfaces..."):
             surface_stats = migrate_attack_surfaces_from_graph()
-        if surface_stats["classified"] or surface_stats["edges_dropped"]:
+        if surface_stats["classified"]:
             console.print(
-                f"  [green]+[/green] Attack surfaces: classified {surface_stats['classified']}, "
-                f"dropped {surface_stats['edges_dropped']} incompatible links",
+                f"  [green]+[/green] Attack surfaces: tagged {surface_stats['classified']} CVEs",
             )
 
         if epss_stats["checked"]:

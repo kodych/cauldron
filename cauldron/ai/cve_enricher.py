@@ -1704,31 +1704,27 @@ def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
 
 def migrate_attack_surfaces_from_graph() -> dict:
     """Backfill ``v.attack_surfaces`` on existing NVD/AI-sourced Vulnerability
-    nodes and drop HAS_VULN edges where the service's protocol is provably
-    incompatible with the vuln's surface.
+    nodes that don't have it yet. Idempotent, safe to run every boil.
 
-    Two-phase sweep, idempotent, safe to run every boil:
-
-    1. Classify any Vulnerability that lacks ``attack_surfaces``, using the
-       stored ``description``. CWE is not stored on the node, so precision
-       is a touch lower than parse-time — acceptable, conservative.
-    2. For every HAS_VULN edge whose CVE has classified surfaces AND whose
-       service has a known protocol that doesn't intersect, drop the edge
-       — but ONLY when ``r.checked_status IS NULL``. Operator-touched
-       edges (exploited / mitigated / FP verdicts) are sacred and stay.
+    Classification is metadata only — surfaces feed the UI badge and the
+    AI triage prompt as a hint, but they do NOT gate edge creation or
+    delete existing edges. An earlier iteration of this function used to
+    drop "incompatible" HAS_VULN edges; that mode silently lost
+    CVE-2024-37085 (ESXi KEV) on 7 hypervisor hosts because
+    description-based classification mis-tagged it as ldap. Pentester
+    tooling must err on the false-positive side — operator (or AI triage
+    with full context) decides.
 
     Exploit-DB rules (``source = 'exploit_db'``, CAULDRON-* IDs) are
-    port-scoped by their own ``port_match`` definitions; we skip them.
+    port-scoped by their own ``port_match`` definitions and have no need
+    for surface tags; we skip them.
 
     Returns stats for the CLI / API boil progress feedback.
     """
     from cauldron.graph.connection import get_session
 
-    stats = {"classified": 0, "edges_dropped": 0, "already_done": 0}
+    stats = {"classified": 0}
 
-    # Phase 1 — classify vulns missing the property. Source filter keeps
-    # us out of CAULDRON-* rules where the port scope already lives on
-    # the rule itself.
     with get_session() as session:
         rows = list(session.run(
             """
@@ -1754,50 +1750,9 @@ def migrate_attack_surfaces_from_graph() -> dict:
             )
             stats["classified"] += 1
 
-    # Phase 2 — drop incompatible edges where operator hasn't weighed in.
-    # Done in Python to reuse the same compatibility logic as link-time.
-    with get_session() as session:
-        edges = list(session.run(
-            """
-            MATCH (s:Service)-[r:HAS_VULN]->(v:Vulnerability)
-            WHERE r.checked_status IS NULL
-              AND v.attack_surfaces IS NOT NULL
-              AND size(v.attack_surfaces) > 0
-              AND s.name IS NOT NULL
-            RETURN s.host_ip AS host_ip, s.port AS port, s.protocol AS protocol,
-                   s.name AS name, v.cve_id AS cve_id,
-                   v.attack_surfaces AS surfaces
-            """,
-        ))
-
-        for edge in edges:
-            if _surfaces_compatible(
-                _service_protocols(edge["name"]),
-                list(edge["surfaces"] or []),
-            ):
-                continue
-            session.run(
-                """
-                MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
-                      -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
-                WHERE r.checked_status IS NULL
-                DELETE r
-                """,
-                host_ip=edge["host_ip"],
-                port=edge["port"],
-                protocol=edge["protocol"],
-                cve_id=edge["cve_id"],
-            )
-            stats["edges_dropped"] += 1
-            logger.info(
-                "Dropped HAS_VULN %s on %s:%s — surface mismatch (service=%s, vuln=%s)",
-                edge["cve_id"], edge["host_ip"], edge["port"],
-                edge["name"], list(edge["surfaces"] or []),
-            )
-
     logger.info(
-        "Attack-surface migration: classified=%d, edges_dropped=%d",
-        stats["classified"], stats["edges_dropped"],
+        "Attack-surface classification: %d vulns tagged",
+        stats["classified"],
     )
     return stats
 
@@ -1943,45 +1898,29 @@ def _upsert_vulnerability(
         attack_surfaces=cve.attack_surfaces,
     )
 
-    # Link by product+version, but filtered through the attack-surface
-    # compatibility check — CVE-2024-4040 (SSTI, surfaces=['http']) no
-    # longer attaches to an SFTP service on port 22 of the same product.
-    # Fetch candidates with their service name, filter in Python, then
-    # MERGE only the survivors.
+    # Link to matching services by product+version. ``v.attack_surfaces``
+    # is exposed as metadata on the node and consumed by the UI badge /
+    # AI triage prompt, but it deliberately does NOT block the link —
+    # description-based classification has too many edge cases to be
+    # used as a destructive filter (an "Active Directory" mention on the
+    # CVE-2024-37085 ESXi KEV got mis-tagged as ldap and silently dropped
+    # the edge from 7 hypervisor hosts). Pentester tooling must err on
+    # the false-positive side; let the operator decide.
     if product and version:
-        candidates = list(session.run(
+        session.run(
             """
             MATCH (s:Service)
             WHERE s.product = $product AND s.version = $version
-            RETURN s.host_ip AS host_ip, s.port AS port, s.protocol AS protocol,
-                   s.name AS name
+            MATCH (v:Vulnerability {cve_id: $cve_id})
+            MERGE (s)-[rel:HAS_VULN]->(v)
+            ON CREATE SET rel.confidence = 'check'
             """,
             product=product,
             version=version,
-        ))
-        for row in candidates:
-            if not _surfaces_compatible(
-                _service_protocols(row.get("name")),
-                cve.attack_surfaces,
-            ):
-                continue
-            session.run(
-                """
-                MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
-                MATCH (v:Vulnerability {cve_id: $cve_id})
-                MERGE (s)-[rel:HAS_VULN]->(v)
-                ON CREATE SET rel.confidence = 'check'
-                """,
-                host_ip=row["host_ip"],
-                port=row["port"],
-                protocol=row["protocol"],
-                cve_id=cve.cve_id,
-            )
+            cve_id=cve.cve_id,
+        )
 
-    # Also link by CPE (catches services where product name differs but
-    # CPE matches). Same surface-compatibility filter as the product+version
-    # path — an HTTP-tagged CVE must not attach to an SFTP service even if
-    # the CPE matches.
+    # Also link by CPE (catches services where product name differs but CPE matches).
     #
     # The part type (a/o/h) must come from the converted CPE 2.3 — NOT
     # hardcoded. ``cpe:/o:vmware:esxi:7.0.3`` stays on the Service as a
@@ -2003,31 +1942,15 @@ def _upsert_vulnerability(
                     cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}:{cpe_version}"
                 else:
                     cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}"
-                candidates = list(session.run(
+                session.run(
                     """
                     MATCH (s:Service)
                     WHERE s.cpe STARTS WITH $prefix OR s.cpe CONTAINS $contains
-                    RETURN s.host_ip AS host_ip, s.port AS port,
-                           s.protocol AS protocol, s.name AS name
+                    MATCH (v:Vulnerability {cve_id: $cve_id})
+                    MERGE (s)-[rel:HAS_VULN]->(v)
+                    ON CREATE SET rel.confidence = 'check'
                     """,
                     prefix=cpe_prefix,
                     contains=f";{cpe_prefix}",
-                ))
-                for row in candidates:
-                    if not _surfaces_compatible(
-                        _service_protocols(row.get("name")),
-                        cve.attack_surfaces,
-                    ):
-                        continue
-                    session.run(
-                        """
-                        MATCH (s:Service {host_ip: $host_ip, port: $port, protocol: $protocol})
-                        MATCH (v:Vulnerability {cve_id: $cve_id})
-                        MERGE (s)-[rel:HAS_VULN]->(v)
-                        ON CREATE SET rel.confidence = 'check'
-                        """,
-                        host_ip=row["host_ip"],
-                        port=row["port"],
-                        protocol=row["protocol"],
-                        cve_id=cve.cve_id,
-                    )
+                    cve_id=cve.cve_id,
+                )

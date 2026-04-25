@@ -382,15 +382,11 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
     """Create / refresh a Vulnerability node and link it to the exact service
     that produced the CPE match. Returns True if a new HAS_VULN was created.
 
-    Honors the attack-surface compatibility check: if the CVE is classified
-    as HTTP-only and the service speaks SFTP, no edge is created. Same
-    invariant as the NVD-linked path.
+    ``attack_surfaces`` is stored on the node as metadata (consumed by the
+    UI badge and the AI triage prompt) but does NOT gate edge creation.
+    Description-based classification is too brittle to use as a destructive
+    filter; the operator (or AI triage with full context) decides.
     """
-    from cauldron.ai.cve_enricher import (
-        _service_protocols,
-        _surfaces_compatible,
-    )
-
     with get_session() as session:
         session.run(
             """
@@ -426,31 +422,6 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
             cisa_kev_added=cve.cisa_kev_added,
             attack_surfaces=getattr(cve, "attack_surfaces", []) or [],
         )
-
-        # Look up the service name for the surface-compat check. We do
-        # this BEFORE MERGE so an HTTP-only CVE never creates an edge
-        # onto an SFTP socket — same invariant as ``_upsert_vulnerability``.
-        row = session.run(
-            """
-            MATCH (s:Service {host_ip: $ip, port: $port, protocol: $proto})
-            RETURN s.name AS name
-            """,
-            ip=coords["ip"],
-            port=coords["port"],
-            proto=coords["protocol"],
-        ).single()
-        if row is None:
-            return False
-        if not _surfaces_compatible(
-            _service_protocols(row.get("name")),
-            getattr(cve, "attack_surfaces", []) or [],
-        ):
-            logger.info(
-                "AI CVE %s skipped for %s:%s — surface mismatch (service=%s, vuln=%s)",
-                cve.cve_id, coords["ip"], coords["port"],
-                row.get("name"), getattr(cve, "attack_surfaces", []),
-            )
-            return False
 
         # Confidence lives on the HAS_VULN relationship so a later upgrade
         # (script confirm, operator verdict) scopes to this specific socket.
@@ -613,17 +584,23 @@ def _contextual_vuln_triage() -> tuple[int, int]:
             "MATCH (h:Host) WHERE h.target = true RETURN h.ip AS ip, h.role AS role"
         )]
 
-        # Get all hosts with untriaged vulns
+        # Get all hosts with untriaged vulns. ``s.name`` and
+        # ``v.attack_surfaces`` are pulled so we can stamp a structural
+        # surface-mismatch flag in the prompt — gives AI a deterministic
+        # signal for the CrushFTP-class case (HTTP-only CVE on SFTP port)
+        # without forcing a destructive filter at link time.
         rows = list(session.run("""
             MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability)
             WHERE r.checked_status IS NULL
             RETURN h.ip AS ip, h.os_name AS os_name, h.role AS role,
                    h.owned AS owned, h.target AS target,
                    s.port AS port, s.product AS product, s.version AS version,
+                   s.name AS service_name,
                    v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    v.description AS description, v.source AS source,
                    v.cvss_vector AS cvss_vector,
-                   coalesce(v.in_cisa_kev, false) AS in_cisa_kev
+                   coalesce(v.in_cisa_kev, false) AS in_cisa_kev,
+                   v.attack_surfaces AS attack_surfaces
             ORDER BY h.ip, s.port
         """))
 
@@ -649,17 +626,37 @@ def _contextual_vuln_triage() -> tuple[int, int]:
         if "AV:L" in vec or "AV:P" in vec:
             is_local = True
 
+        # Surface-mismatch flag: structural signal that the CVE attacks
+        # an L7 protocol the service doesn't speak (HTTP-only CVE on an
+        # SFTP service, etc.). Computed in Python so AI gets a boolean,
+        # not a fragile inferred-from-strings judgment.
+        from cauldron.ai.cve_enricher import (
+            _service_protocols,
+            _surfaces_compatible,
+        )
+        vuln_surfaces = list(row.get("attack_surfaces") or [])
+        svc_protocols = _service_protocols(row.get("service_name"))
+        # mismatch = both sides classified, AND disjoint
+        surface_mismatch = bool(
+            vuln_surfaces
+            and svc_protocols
+            and not _surfaces_compatible(svc_protocols, vuln_surfaces)
+        )
+
         host_data[ip]["vulns"].append({
             "port": row["port"],
+            "service_name": row.get("service_name"),
             "product": row["product"],
             "version": row["version"],
             "cve_id": row["cve_id"],
             "cvss": row["cvss"],
             "has_exploit": row["has_exploit"],
-            "description": (row["description"] or "")[:120],
+            "description": (row["description"] or "")[:250],
             "source": row["source"],
             "is_local": is_local,
             "in_cisa_kev": bool(row.get("in_cisa_kev")),
+            "attack_surfaces": vuln_surfaces,
+            "surface_mismatch": surface_mismatch,
         })
 
     hosts = list(host_data.values())
@@ -729,9 +726,18 @@ def _triage_batch(
             # other heuristic (local vector on non-owned, say) would dismiss
             # a normal CVE, KEV entries should almost always stay.
             kev_tag = " KEV" if v.get("in_cisa_kev") else ""
+            # Service protocol + vuln surface metadata. Lets the LLM see
+            # ":22/sftp ... surface=http" and notice the protocol mismatch
+            # for the CrushFTP-class case. The structural ``surface_mismatch``
+            # boolean is the strong signal — keywords are flexible context.
+            svc_name = v.get("service_name") or "?"
+            surfaces = v.get("attack_surfaces") or []
+            surface_str = f" surface={'/'.join(surfaces)}" if surfaces else ""
+            mismatch_tag = " [SURFACE_MISMATCH]" if v.get("surface_mismatch") else ""
             lines.append(
-                f"  :{v['port']} {prod}  {v['cve_id']} "
-                f"CVSS:{v['cvss'] or '?'}{exploit_tag}{kev_tag}{local_tag} [{v['source']}]"
+                f"  :{v['port']}/{svc_name} {prod}  {v['cve_id']} "
+                f"CVSS:{v['cvss'] or '?'}{exploit_tag}{kev_tag}{local_tag}"
+                f"{surface_str}{mismatch_tag} [{v['source']}]"
             )
             if v.get("description"):
                 lines.append(f"    {v['description']}")
@@ -774,6 +780,14 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     but the listed product line shows OpenSSH 7.4), DISMISS with reason "wrong
     version". Prefer the description-stated affected range over an empty/wildcard
     product line — wildcard-CPE NVD matches pull in CVEs for any release.
+11. SURFACE_MISMATCH tag: Cauldron classified the CVE's L7 attack surface
+    (e.g. surface=http) and the service speaks a different protocol
+    (e.g. :22/sftp). This means the CVE almost certainly cannot be reached
+    on this socket — DISMISS with reason like "HTTP-only CVE on SFTP service".
+    EXCEPTION for KEV: if the vuln is also tagged KEV, DO NOT dismiss —
+    instead KEEP and note in reason "surface mismatch — verify alternative
+    port (e.g. WebInterface on 443/9090)". KEV findings are too
+    consequential for an automatic dismiss; the operator must confirm.
 
 CRITICAL: Do NOT dismiss CAULDRON-* IDs just because they are not standard CVEs.
 If unsure, KEEP. Missing a real vuln is worse than keeping noise — except for
