@@ -210,6 +210,12 @@ class AnalyzeResponse(BaseModel):
 class VulnStatusUpdate(BaseModel):
     status: str | None = None  # exploited, false_positive, mitigated, or null to clear
     port: int | None = None  # port to scope status to (same CVE on different ports = independent)
+    # Optional operator-supplied explanation, persisted as ``r.ai_fp_reason``
+    # on the HAS_VULN edge. Mostly meaningful for ``false_positive``;
+    # other statuses ignore it. Clearing the status (status=null) also
+    # clears the reason so a stale "noise" annotation doesn't outlive the
+    # verdict it explained.
+    reason: str | None = None
 
 
 class VulnBulkStatusUpdate(BaseModel):
@@ -1242,6 +1248,11 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
     if body.status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status: {body.status}")
 
+    # Reason is meaningful only for false_positive; other statuses null it
+    # so we don't keep a stale FP-explanation attached to an exploited
+    # edge after the operator changes their mind.
+    reason = (body.reason or "").strip() if body.status == "false_positive" else None
+
     with get_session() as session:
         # Status is stored on the HAS_VULN relationship so the same CVE
         # on different ports can have independent checked status
@@ -1249,25 +1260,29 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
             result = session.run(
                 """
                 MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
-                SET r.checked_status = $status
+                SET r.checked_status = $status,
+                    r.ai_fp_reason = $reason
                 RETURN v.cve_id AS cve_id
                 """,
                 ip=ip,
                 port=body.port,
                 vuln_id=vuln_id,
                 status=body.status,
+                reason=reason,
             )
         else:
             # No port specified — update all relationships for this CVE on this host
             result = session.run(
                 """
                 MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
-                SET r.checked_status = $status
+                SET r.checked_status = $status,
+                    r.ai_fp_reason = $reason
                 RETURN v.cve_id AS cve_id
                 """,
                 ip=ip,
                 vuln_id=vuln_id,
                 status=body.status,
+                reason=reason,
             )
         record = result.single()
         if not record:

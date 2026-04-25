@@ -499,6 +499,62 @@ class TestVulnStatus:
         )
         assert resp.status_code == 400
 
+    def test_per_host_fp_persists_reason(self, client):
+        """The unified FP modal sends a reason alongside the per-host
+        verdict; the API must persist it to ``r.ai_fp_reason`` so the
+        FP-section in the report can show why the operator dismissed."""
+        _setup_test_network()
+        resp = client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={
+                "status": "false_positive",
+                "reason": "out of scope for this engagement",
+            },
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["checked_status"] == "false_positive"
+                assert v["ai_fp_reason"] == "out of scope for this engagement"
+
+    def test_clearing_fp_also_clears_reason(self, client):
+        """Toggling FP off must drop the stored reason — a stale 'noise'
+        annotation outliving the verdict it explained would mislead
+        anyone reading the report later."""
+        _setup_test_network()
+        client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "false_positive", "reason": "old reason"},
+        )
+        client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": None},
+        )
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["checked_status"] is None
+                assert v["ai_fp_reason"] is None
+
+    def test_non_fp_status_ignores_reason_field(self, client):
+        """A reason sent with a non-FP status (e.g. exploited) must NOT
+        be persisted — keeps the field semantically scoped to FP."""
+        _setup_test_network()
+        client.patch(
+            "/api/v1/hosts/10.0.1.20/vulns/CVE-2021-41773/status",
+            json={"status": "exploited", "reason": "should be ignored"},
+        )
+        resp = client.get("/api/v1/hosts/10.0.1.20")
+        vulns = resp.json()["vulnerabilities"]
+        for v in vulns:
+            if v["cve_id"] == "CVE-2021-41773":
+                assert v["checked_status"] == "exploited"
+                assert v["ai_fp_reason"] is None
+
 
 class TestVulnBulkStatus:
     """Bulk-FP endpoint — operator's 'mark this CVE as FP everywhere it's

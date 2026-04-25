@@ -315,17 +315,35 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
 function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: number[]; hostIp: string; onUpdated: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const [updating, setUpdating] = useState(false);
-  const [bulkFpOpen, setBulkFpOpen] = useState(false);
-  const [bulkFpReason, setBulkFpReason] = useState('');
-  const [bulkFpBusy, setBulkFpBusy] = useState(false);
-  const [bulkFpError, setBulkFpError] = useState<string | null>(null);
+  // Unified FP modal: click "False Positive" status button → modal asks
+  // for reason + scope (this host vs all hosts). "All hosts" path
+  // requires a second confirmation step before firing the bulk endpoint.
+  const [fpOpen, setFpOpen] = useState(false);
+  const [fpReason, setFpReason] = useState('');
+  const [fpConfirmAll, setFpConfirmAll] = useState(false);
+  const [fpBusy, setFpBusy] = useState(false);
+  const [fpError, setFpError] = useState<string | null>(null);
   const currentStatus = vuln.checked_status || null;
 
+  const closeFpModal = useCallback(() => {
+    if (fpBusy) return;
+    setFpOpen(false);
+    setFpReason('');
+    setFpConfirmAll(false);
+    setFpError(null);
+  }, [fpBusy]);
+
   const handleStatusChange = useCallback(async (status: VulnStatus) => {
+    // FP is a special case — needs a reason and a scope. Open the
+    // modal instead of firing immediately, except when toggling OFF
+    // an already-FP'd edge (un-FP needs no annotation).
+    if (status === 'false_positive' && currentStatus !== 'false_positive') {
+      setFpOpen(true);
+      return;
+    }
     setUpdating(true);
     try {
       const newStatus = status === currentStatus ? null : status;
-      // Apply status to all affected ports
       await Promise.all(
         ports.length > 0
           ? ports.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, p))
@@ -339,26 +357,50 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
     }
   }, [hostIp, vuln.cve_id, vuln.port, ports, currentStatus, onUpdated]);
 
-  const handleBulkFp = useCallback(async () => {
-    if (!bulkFpReason.trim()) {
-      setBulkFpError('Reason is required');
+  const applyFpThisHost = useCallback(async () => {
+    const reason = fpReason.trim();
+    if (!reason) {
+      setFpError('Reason is required');
       return;
     }
-    setBulkFpBusy(true);
-    setBulkFpError(null);
+    setFpBusy(true);
+    setFpError(null);
     try {
-      const result = await api.bulkUpdateVulnStatus(vuln.cve_id, bulkFpReason.trim());
+      await Promise.all(
+        ports.length > 0
+          ? ports.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, 'false_positive', p, reason))
+          : [api.updateVulnStatus(hostIp, vuln.cve_id, 'false_positive', vuln.port, reason)]
+      );
+      onUpdated();
+      closeFpModal();
+    } catch (e) {
+      console.error('FP apply failed:', e);
+      setFpError('Server error. Try again.');
+    } finally {
+      setFpBusy(false);
+    }
+  }, [hostIp, vuln.cve_id, vuln.port, ports, fpReason, onUpdated, closeFpModal]);
+
+  const applyFpAllHosts = useCallback(async () => {
+    const reason = fpReason.trim();
+    if (!reason) {
+      setFpError('Reason is required');
+      return;
+    }
+    setFpBusy(true);
+    setFpError(null);
+    try {
+      const result = await api.bulkUpdateVulnStatus(vuln.cve_id, reason);
       console.info(`Bulk FP applied to ${result.affected} edges for ${vuln.cve_id}`);
       onUpdated();
-      setBulkFpOpen(false);
-      setBulkFpReason('');
+      closeFpModal();
     } catch (e) {
       console.error('Bulk FP failed:', e);
-      setBulkFpError('Server error. Try again.');
+      setFpError('Server error. Try again.');
     } finally {
-      setBulkFpBusy(false);
+      setFpBusy(false);
     }
-  }, [vuln.cve_id, bulkFpReason, onUpdated]);
+  }, [vuln.cve_id, fpReason, onUpdated, closeFpModal]);
 
   return (
     <div className={`rounded bg-gray-800/30 ${currentStatus === 'false_positive' ? 'opacity-50' : ''}`}>
@@ -504,7 +546,10 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           {/* Exploit Commands */}
           <ExploitCommands hostIp={hostIp} port={ports[0] || vuln.port || 0} vulnId={vuln.cve_id} />
 
-          {/* Status buttons */}
+          {/* Status buttons — uniform style. False Positive opens a
+              modal asking for reason + scope (this host / all hosts);
+              the other two apply on click. Click on an active status
+              clears it (no modal). */}
           <div className="flex items-center gap-1 pt-1 border-t border-gray-700/50 flex-wrap">
             <span className="text-xs text-gray-600 mr-1">Status:</span>
             {STATUS_OPTIONS.map((opt) => (
@@ -527,70 +572,89 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
                 {opt.label}
               </button>
             ))}
-            {/* Bulk FP-all — operator confirms once, every active edge for
-                this CVE across the graph flips to false_positive. Useful
-                when a CVE is universally noise (e.g. Terrapin requires
-                MITM, host context doesn't matter). */}
-            <button
-              disabled={bulkFpBusy}
-              onClick={(e) => { e.stopPropagation(); setBulkFpOpen(true); }}
-              className="ml-auto flex items-center gap-0.5 rounded border border-gray-700 px-1.5 py-0.5 text-xs text-gray-400 hover:bg-gray-800 hover:text-gray-200"
-              title="Mark this CVE as false positive on every host where it's currently active"
-            >
-              <X size={10} /> FP all hosts
-            </button>
           </div>
         </div>
       )}
-      {bulkFpOpen && (
+      {fpOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-          onClick={(e) => { e.stopPropagation(); if (!bulkFpBusy) setBulkFpOpen(false); }}
+          onClick={(e) => { e.stopPropagation(); closeFpModal(); }}
         >
           <div
             className="w-full max-w-md rounded border border-gray-700 bg-gray-900 p-4 shadow-lg"
             onClick={(e) => e.stopPropagation()}
           >
             <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-200">
-              <AlertCircle size={14} className="text-yellow-500" />
-              Mark FP across every host?
+              <X size={14} className="text-gray-400" />
+              Mark <span className="font-mono">{vuln.cve_id}</span> as False Positive
             </h3>
-            <p className="mb-3 text-xs text-gray-400">
-              <span className="font-mono text-gray-300">{vuln.cve_id}</span> will be marked as
-              <span className="text-gray-300"> false positive</span> on every host where it's currently active.
-              Already-decided edges (exploited / mitigated / per-host FP) are preserved.
-            </p>
             <label className="block text-xs text-gray-500 mb-1">
               Reason (required):
             </label>
             <textarea
-              value={bulkFpReason}
-              onChange={(e) => { setBulkFpReason(e.target.value); setBulkFpError(null); }}
+              value={fpReason}
+              onChange={(e) => { setFpReason(e.target.value); setFpError(null); setFpConfirmAll(false); }}
               placeholder="e.g. Terrapin requires MITM, out of scope for this engagement"
               rows={2}
-              disabled={bulkFpBusy}
-              className="mb-2 w-full rounded border border-gray-700 bg-gray-950 px-2 py-1 text-xs text-gray-200 focus:border-gray-500 focus:outline-none"
+              disabled={fpBusy}
+              className="mb-3 w-full rounded border border-gray-700 bg-gray-950 px-2 py-1 text-xs text-gray-200 focus:border-gray-500 focus:outline-none"
               autoFocus
             />
-            {bulkFpError && (
-              <p className="mb-2 text-xs text-red-400">{bulkFpError}</p>
+            {fpError && (
+              <p className="mb-2 text-xs text-red-400">{fpError}</p>
             )}
-            <div className="flex justify-end gap-2">
-              <button
-                disabled={bulkFpBusy}
-                onClick={() => setBulkFpOpen(false)}
-                className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-300 hover:bg-gray-700"
-              >
-                Cancel
-              </button>
-              <button
-                disabled={bulkFpBusy || !bulkFpReason.trim()}
-                onClick={handleBulkFp}
-                className="rounded bg-red-900/60 px-3 py-1 text-xs font-semibold text-red-200 hover:bg-red-900 disabled:opacity-50"
-              >
-                {bulkFpBusy ? 'Applying...' : 'Confirm — FP all'}
-              </button>
-            </div>
+            {fpConfirmAll ? (
+              <div className="rounded border border-yellow-700/50 bg-yellow-950/30 p-2 mb-2">
+                <p className="mb-2 flex items-start gap-1.5 text-xs text-yellow-200">
+                  <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                  <span>
+                    This will mark <span className="font-mono">{vuln.cve_id}</span> as false
+                    positive on <strong>every host where it's currently active</strong>.
+                    Already-decided edges (exploited / mitigated) are preserved.
+                  </span>
+                </p>
+                <div className="flex justify-end gap-2">
+                  <button
+                    disabled={fpBusy}
+                    onClick={() => setFpConfirmAll(false)}
+                    className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-300 hover:bg-gray-700"
+                  >
+                    Back
+                  </button>
+                  <button
+                    disabled={fpBusy}
+                    onClick={applyFpAllHosts}
+                    className="rounded bg-red-900/60 px-3 py-1 text-xs font-semibold text-red-200 hover:bg-red-900"
+                  >
+                    {fpBusy ? 'Applying...' : 'Yes — apply to all hosts'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex justify-end gap-2">
+                <button
+                  disabled={fpBusy}
+                  onClick={closeFpModal}
+                  className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-300 hover:bg-gray-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={fpBusy || !fpReason.trim()}
+                  onClick={applyFpThisHost}
+                  className="rounded bg-gray-700 px-3 py-1 text-xs text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+                >
+                  {fpBusy ? 'Applying...' : 'Apply to this host'}
+                </button>
+                <button
+                  disabled={fpBusy || !fpReason.trim()}
+                  onClick={() => { setFpError(null); setFpConfirmAll(true); }}
+                  className="rounded bg-red-900/40 px-3 py-1 text-xs font-semibold text-red-200 hover:bg-red-900/60 disabled:opacity-50"
+                >
+                  Apply to all hosts
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

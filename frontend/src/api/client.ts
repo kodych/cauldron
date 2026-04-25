@@ -158,8 +158,17 @@ export const api = {
       `/hosts/${ip}/services/${port}/default-creds`,
     ),
 
-  updateVulnStatus: (ip: string, vulnId: string, status: VulnStatus, port?: number | null) =>
-    patch<{ ok: boolean }>(`/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`, { status, port }),
+  updateVulnStatus: (
+    ip: string,
+    vulnId: string,
+    status: VulnStatus,
+    port?: number | null,
+    reason?: string | null,
+  ) =>
+    patch<{ ok: boolean }>(
+      `/hosts/${ip}/vulns/${encodeURIComponent(vulnId)}/status`,
+      { status, port, reason },
+    ),
 
   // Bulk-FP a CVE across every active edge in the graph. Operator's
   // shortcut for "this CVE is noise everywhere it's attached" — one
