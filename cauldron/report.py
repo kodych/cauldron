@@ -146,7 +146,6 @@ def _query_findings_grouped() -> list[dict]:
                    v.exploit_module AS exploit_module,
                    v.epss AS epss,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
-                   v.attack_surfaces AS attack_surfaces,
                    size(hosts) AS host_count, hosts
             ORDER BY
                 CASE WHEN coalesce(v.in_cisa_kev, false) THEN 0 ELSE 1 END,
@@ -438,12 +437,6 @@ def generate_markdown(top: int = 0, include_notes: bool = False) -> str:
             epss = f_.get("epss")
             if epss is not None and epss >= 0.1:
                 badges.append(f"**EPSS {round(epss * 100)}%**")
-            # Show attack surface when classified — helps the operator
-            # skim the report and recognize when a CVE is HTTP-only,
-            # SMB-only, etc. Skip when empty (unclassified CVEs stay clean).
-            surfaces = f_.get("attack_surfaces")
-            if surfaces:
-                badges.append(f"surface: {'/'.join(sorted(surfaces))}")
             # Version-unconfirmed marker — when the CVE was attached to
             # services whose version was unknown at link time, the
             # report shouldn't read "🔥 KEV · EXPLOIT" with confident

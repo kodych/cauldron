@@ -520,16 +520,6 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             </Badge>
           </span>
         )}
-        {vuln.attack_surfaces && vuln.attack_surfaces.length > 0 && (
-          <span className="shrink-0">
-            <Badge
-              tone="gray"
-              title={`Attack surface(s): ${vuln.attack_surfaces.join(', ')}. Cauldron links this CVE only to services of a matching L7 protocol.`}
-            >
-              {vuln.attack_surfaces.join('/')}
-            </Badge>
-          </span>
-        )}
         {/* version_unconfirmed is shown at the SERVICE level (see
             ServicesList) to avoid repeating the same warning on every
             CVE row. It's still on VulnOut for aggregate views (Vulns

@@ -332,7 +332,6 @@ def boil(nvd: bool, ai: bool, run_all: bool):
         from cauldron.ai.cve_enricher import (
             enrich_epss_from_graph,
             enrich_services_from_graph,
-            migrate_attack_surfaces_from_graph,
         )
 
         with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
@@ -349,16 +348,6 @@ def boil(nvd: bool, ai: bool, run_all: bool):
 
         with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
             epss_stats = enrich_epss_from_graph()
-
-        # Classify L7 attack surfaces (http/ssh/smb/...) on new CVEs.
-        # Metadata only — surfaces feed the UI badge and the AI triage
-        # hint, they do NOT delete edges. Idempotent, safe per boil.
-        with console.status("[bold green]Classifying attack surfaces..."):
-            surface_stats = migrate_attack_surfaces_from_graph()
-        if surface_stats["classified"]:
-            console.print(
-                f"  [green]+[/green] Attack surfaces: tagged {surface_stats['classified']} CVEs",
-            )
 
         if epss_stats["checked"]:
             console.print(

@@ -41,10 +41,6 @@ export interface VulnOut {
   epss: number | null;
   in_cisa_kev: boolean;
   cisa_kev_added: string | null;
-  // L7 attack surface(s) — e.g. ['http'] for SSTI-style web bugs, ['ssh']
-  // for scp command injection. Empty = unclassified. Used by the UI to
-  // surface why a CVE did or didn't attach to a service.
-  attack_surfaces: string[];
   // True when the matched service had no concrete version at link
   // time — CVE attached via wildcard CPE prefix. The CVE may not
   // actually apply to this specific service. Surfaced as a
@@ -164,7 +160,6 @@ export interface VulnListItem {
   epss: number | null;
   in_cisa_kev: boolean;
   cisa_kev_added: string | null;
-  attack_surfaces: string[];
   version_unconfirmed: boolean;
   host_count: number;
   targets: Array<{ ip: string; port: number }>;
