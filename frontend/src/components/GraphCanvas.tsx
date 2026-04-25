@@ -734,7 +734,11 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     );
   }, [tooltipData, tooltipPos]);
 
-  if (loading) {
+  // Splash screen only on the very first load. Background refetches
+  // (after a context-menu Owned/Target toggle or refreshKey bump)
+  // keep the rendered graph in place so the operator's pan/zoom and
+  // node-selection state survive the round-trip.
+  if (loading && !data) {
     return (
       <div className="flex h-full items-center justify-center bg-gray-950">
         <div className="flex flex-col items-center gap-3 text-center">

@@ -19,7 +19,11 @@ export function HostList({ onSelectHost, selectedHost, refreshKey = 0 }: Props) 
     [refreshKey],
   );
 
-  if (loading) {
+  // Skeleton only on the initial load. Background refetches (when
+  // the parent bumps refreshKey after a graph mutation) keep the
+  // current list visible so the operator's selection / scroll
+  // position isn't disturbed by a flash of placeholders.
+  if (loading && !data) {
     return (
       <div className="p-3 space-y-2">
         {[...Array(8)].map((_, i) => (

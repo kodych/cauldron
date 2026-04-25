@@ -86,7 +86,10 @@ export function AttackPaths({ onSelectPath, onSelectHost, refreshKey = 0 }: Atta
     };
   }, [data, matchesFilter]);
 
-  if (loading) {
+  // Skeleton only on initial load — background refetches keep the
+  // existing list on screen so user-initiated refreshes don't flash
+  // the UI off and back.
+  if (loading && !data) {
     return (
       <div className="p-3 space-y-2">
         {[...Array(5)].map((_, i) => (

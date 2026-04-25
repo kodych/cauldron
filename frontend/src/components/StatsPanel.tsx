@@ -6,7 +6,10 @@ import type { StatsResponse } from '../types';
 export function StatsPanel({ refreshKey = 0 }: { refreshKey?: number }) {
   const { data: stats, loading, error } = useApi<StatsResponse>(() => api.getStats(), [refreshKey]);
 
-  if (loading) {
+  // Skeleton only on initial load. Background refetches (after import
+  // / analysis bump refreshKey) keep the previous numbers visible so
+  // the dashboard doesn't blank out mid-action.
+  if (loading && !stats) {
     return <LoadingState />;
   }
 

@@ -116,7 +116,15 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
     }
   }, [ip, data, refetch, onDataChanged]);
 
-  if (loading) {
+  // Skeleton only on the INITIAL load when there's nothing to show.
+  // Once we have ``data`` cached, a background refetch (triggered by
+  // notes save, owned/target toggle, status change, etc.) keeps the
+  // current UI on screen instead of unmounting it. Without this guard
+  // every refetch flashed the skeleton, which unmounted ServicesList
+  // and lost its local state — so typing a single character into a
+  // service-notes textarea (which auto-saves and refetches after 500ms)
+  // collapsed the notes panel right under the operator's cursor.
+  if (loading && !data) {
     return (
       <div className="p-3 space-y-2">
         <button onClick={onBack} className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 mb-2">
