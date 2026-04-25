@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { Search, ChevronDown, ChevronUp, X, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getRoleColor, getCvssColor, getConfidenceColor } from '../utils/colors';
+import { getRoleColor, getCvssColor, getConfidenceColor, osFamilyTone, osFamilyLabel } from '../utils/colors';
 import type { HostListResponse, HostOut } from '../types';
 import { Badge } from './Badge';
 
@@ -145,6 +145,19 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
           {host.is_stale && <Badge tone="gray">GONE</Badge>}
           {!host.is_new && !host.is_stale && host.has_changes && (
             <Badge tone="yellow">CHANGED</Badge>
+          )}
+          {/* OS-family badge — only shown when nmap classified the
+              host with high confidence (osclass accuracy ≥ 85, or any
+              service-ostype hint). Tooltip carries the full os_name. */}
+          {host.os_family && (host.os_accuracy == null || host.os_accuracy >= 85) && (
+            <Badge
+              tone={osFamilyTone(host.os_family) ?? 'gray'}
+              title={host.os_name
+                ? `${host.os_name}${host.os_accuracy ? ` (nmap ${host.os_accuracy}%)` : ''}`
+                : undefined}
+            >
+              {osFamilyLabel(host.os_family)}
+            </Badge>
           )}
           {/* When KEV is present it implies a real exploit exists; the
               separate EXPLOIT badge would be redundant. Collapse to one. */}

@@ -55,6 +55,14 @@ export interface HostOut {
   role: string;
   role_confidence: number;
   os_name: string | null;
+  // Structured OS classification from nmap. Family is the enumerated
+  // value used by the UI badge (Windows / Linux / IOS / embedded /
+  // Mac OS X / BSD); vendor and gen add the "Microsoft / 11" subtitle
+  // when available. Empty for hosts where nmap couldn't classify.
+  os_family: string | null;
+  os_vendor: string | null;
+  os_gen: string | null;
+  os_accuracy: number | null;
   segment: string | null;
   is_new: boolean;
   is_stale: boolean;

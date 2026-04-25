@@ -85,6 +85,84 @@ def test_parse_host_with_os_detection():
     assert host.mac_vendor == "Dell"
 
 
+def test_parse_osclass_extracts_family_vendor_gen():
+    """osclass child of osmatch carries the structured family/vendor/gen
+    triple — UI uses this for the platform badge instead of parsing the
+    free-form name string."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.50" addrtype="ipv4"/>
+            <os>
+                <osmatch name="Microsoft Windows 11 21H2" accuracy="95">
+                    <osclass type="general purpose" vendor="Microsoft"
+                             osfamily="Windows" osgen="11" accuracy="95"/>
+                </osmatch>
+            </os>
+        </host>
+    </nmaprun>
+    """
+    host = parse_nmap_xml(xml).hosts_up[0]
+    assert host.os_family == "Windows"
+    assert host.os_vendor == "Microsoft"
+    assert host.os_gen == "11"
+    assert host.os_accuracy == 95
+
+
+def test_parse_service_ostype_fallback_when_no_osclass():
+    """Scans without ``-O`` have no <os> element. ``-sV`` sometimes
+    populates ``ostype`` on individual services from banner inference;
+    we fall back to that so the UI still gets a family label."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.51" addrtype="ipv4"/>
+            <ports>
+                <port protocol="tcp" portid="135">
+                    <state state="open"/>
+                    <service name="msrpc" ostype="Windows"/>
+                </port>
+            </ports>
+        </host>
+    </nmaprun>
+    """
+    host = parse_nmap_xml(xml).hosts_up[0]
+    assert host.os_family == "Windows"
+    # No osclass => no vendor / gen / explicit accuracy
+    assert host.os_vendor is None
+    assert host.os_gen is None
+
+
+def test_parse_osclass_wins_over_service_ostype():
+    """When both sources are present, the structured osclass values are
+    canonical. Service ostype fallback must NOT override them."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.52" addrtype="ipv4"/>
+            <os>
+                <osmatch name="Linux 5.4" accuracy="92">
+                    <osclass type="general purpose" vendor="Linux"
+                             osfamily="Linux" osgen="5.X" accuracy="92"/>
+                </osmatch>
+            </os>
+            <ports>
+                <port protocol="tcp" portid="22">
+                    <state state="open"/>
+                    <service name="ssh" ostype="Solaris"/>
+                </port>
+            </ports>
+        </host>
+    </nmaprun>
+    """
+    host = parse_nmap_xml(xml).hosts_up[0]
+    assert host.os_family == "Linux"  # not "Solaris"
+    assert host.os_vendor == "Linux"
+
+
 def test_parse_filtered_ports_included():
     """Filtered ports should be included (they indicate a firewall)."""
     xml = """<?xml version="1.0"?>

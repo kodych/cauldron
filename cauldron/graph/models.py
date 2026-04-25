@@ -93,6 +93,14 @@ class Host:
     mac_vendor: str | None = None
     os_name: str | None = None
     os_accuracy: int | None = None
+    # Structured OS metadata pulled from nmap's ``<osclass>`` element
+    # (``-O`` output) or, as a fallback, the per-service ``ostype``
+    # attribute that ``-sV`` sometimes populates from banners.
+    # ``os_family`` carries the enumerated value the UI uses to colour
+    # the host badge ("Windows" / "Linux" / "IOS" / "embedded" / etc.).
+    os_family: str | None = None
+    os_vendor: str | None = None
+    os_gen: str | None = None
     ttl: int | None = None
     services: list[Service] = field(default_factory=list)
     traceroute: list[TracerouteHop] = field(default_factory=list)

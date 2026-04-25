@@ -94,7 +94,17 @@ def _parse_host(elem: ET.Element) -> Host | None:
     if hostname_elem is not None:
         host.hostname = hostname_elem.get("name")
 
-    # OS detection
+    # OS detection. Two sources, ranked by quality:
+    #
+    # 1. ``<os><osmatch><osclass>`` — the structured classification from
+    #    ``nmap -O``. ``osfamily`` is an enumerated value (Windows /
+    #    Linux / IOS / embedded / Mac OS X / BSD), so we don't have to
+    #    parse the free-form ``osmatch.name`` string for family detection.
+    #    ``vendor`` / ``osgen`` give the supplementary "Microsoft / 11"
+    #    breakdown the UI uses for the role badge.
+    # 2. ``<service ostype="Windows">`` — set by ``-sV`` when a service
+    #    banner reveals the host OS (msrpc on Windows, ssh on Cisco IOS).
+    #    Fallback for scans without ``-O``.
     osmatch_elem = elem.find("os/osmatch")
     if osmatch_elem is not None:
         host.os_name = osmatch_elem.get("name")
@@ -102,12 +112,28 @@ def _parse_host(elem: ET.Element) -> Host | None:
             host.os_accuracy = int(osmatch_elem.get("accuracy", "0"))
         except (ValueError, TypeError):
             host.os_accuracy = None
+        osclass_elem = osmatch_elem.find("osclass")
+        if osclass_elem is not None:
+            host.os_family = osclass_elem.get("osfamily") or None
+            host.os_vendor = osclass_elem.get("vendor") or None
+            host.os_gen = osclass_elem.get("osgen") or None
 
     # Ports & Services
     for port_elem in elem.findall("ports/port"):
         service = _parse_port(port_elem)
         if service is not None:
             host.services.append(service)
+
+    # Service-ostype fallback — only fills os_family when -O didn't run.
+    # First non-empty ``ostype`` from any service wins; the value is
+    # already canonical (``Windows`` / ``IOS`` / ``Linux``) so we use it
+    # as-is. Doesn't override an already-set ``os_family`` from osclass.
+    if not host.os_family:
+        for svc_elem in elem.findall("ports/port/service"):
+            ostype = svc_elem.get("ostype")
+            if ostype:
+                host.os_family = ostype
+                break
 
     # Traceroute
     for hop_elem in elem.findall("trace/hop"):

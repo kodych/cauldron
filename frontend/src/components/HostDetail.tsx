@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getRoleColor, getCvssColor, cvssSeverity } from '../utils/colors';
+import { getRoleColor, getCvssColor, cvssSeverity, osFamilyTone, osFamilyLabel } from '../utils/colors';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
 import { Badge } from './Badge';
 import { ExploitCommands } from './ExploitCommands';
@@ -180,9 +180,42 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
           {!data.is_new && !data.is_stale && data.has_changes && (
             <Badge tone="yellow">CHANGED</Badge>
           )}
-          {data.os_name && (
-            <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
-          )}
+          {/* OS family badge — coloured by platform when nmap classified
+              with high enough confidence (>= 85% from osclass, or any
+              service-ostype hint which has no scoring but is binary).
+              Tooltip carries the full ``os_name`` plus accuracy so the
+              operator can sanity-check the call. ``os_name`` raw text
+              is the fallback when family is null or low-confidence. */}
+          {(() => {
+            const fam = data.os_family;
+            const acc = data.os_accuracy;
+            const showBadge = fam && (acc == null || acc >= 85);
+            const detail = data.os_name
+              ? `${data.os_name}${acc ? ` (nmap ${acc}% confidence)` : ''}`
+              : undefined;
+            if (showBadge) {
+              const tone = osFamilyTone(fam) ?? 'gray';
+              const label = osFamilyLabel(fam);
+              const subtitle = data.os_gen && !label.includes(data.os_gen)
+                ? ` ${data.os_gen}` : '';
+              return (
+                <Badge tone={tone} title={detail}>
+                  {label}{subtitle}
+                </Badge>
+              );
+            }
+            if (data.os_name) {
+              return (
+                <span
+                  className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400"
+                  title={acc != null ? `nmap accuracy ${acc}%` : 'OS not confidently classified'}
+                >
+                  {data.os_name}
+                </span>
+              );
+            }
+            return null;
+          })()}
         </div>
         {/* Visual divider between identity (IP / role / OS / scan-state)
             and engagement-actions (Owned / Target / Notes). They were

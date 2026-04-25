@@ -66,3 +66,35 @@ export function cvssSeverity(cvss: number): string {
   if (cvss > 0) return 'LOW';
   return 'NONE';
 }
+
+// nmap ``osfamily`` values seen in the wild → ``<Badge>``-compatible
+// tone. The pentester scans the host card and immediately knows the
+// platform (Windows = blue, Linux = green, etc.) without parsing the
+// long ``os_name`` string. Returns ``null`` when the family is one we
+// haven't styled — caller falls back to the neutral gray badge.
+export function osFamilyTone(family: string | null | undefined):
+  'red' | 'orange' | 'yellow' | 'green' | 'blue' | 'purple' | 'gray' | null {
+  if (!family) return null;
+  const f = family.toLowerCase();
+  if (f.includes('windows')) return 'blue';
+  if (f.includes('linux')) return 'green';
+  if (f === 'ios' || f.includes('cisco')) return 'orange';
+  if (f.includes('embedded')) return 'purple';
+  if (f.includes('mac os') || f.includes('macos') || f === 'darwin') return 'gray';
+  if (f.includes('bsd')) return 'yellow';
+  return null;
+}
+
+// Compact label for the OS-family badge. Long XML values like
+// ``Mac OS X`` get shortened so the badge stays consistent in size.
+export function osFamilyLabel(family: string | null | undefined): string {
+  if (!family) return '';
+  const f = family.toLowerCase();
+  if (f.includes('windows')) return 'Windows';
+  if (f.includes('linux')) return 'Linux';
+  if (f === 'ios' || f.includes('cisco')) return 'IOS';
+  if (f.includes('embedded')) return 'Embedded';
+  if (f.includes('mac os') || f.includes('macos')) return 'macOS';
+  if (f.includes('bsd')) return 'BSD';
+  return family;
+}

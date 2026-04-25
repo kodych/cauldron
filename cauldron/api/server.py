@@ -117,6 +117,14 @@ class HostOut(BaseModel):
     role: str = "unknown"
     role_confidence: float = 0.0
     os_name: str | None = None
+    # Structured OS info from nmap. ``os_family`` is the enumerated
+    # value (Windows / Linux / IOS / embedded / Mac OS X / BSD) used by
+    # the UI for the host badge — set either by ``-O``'s osclass or as
+    # a fallback from per-service ``ostype`` attributes.
+    os_family: str | None = None
+    os_vendor: str | None = None
+    os_gen: str | None = None
+    os_accuracy: int | None = None
     segment: str | None = None
     is_new: bool = False
     is_stale: bool = False
@@ -467,6 +475,8 @@ def list_hosts(
             OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
+                   h.os_family AS os_family, h.os_vendor AS os_vendor,
+                   h.os_gen AS os_gen, h.os_accuracy AS os_accuracy,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
                    h.owned AS owned, h.target AS target, h.notes AS notes,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
@@ -518,6 +528,10 @@ def list_hosts(
                 role=record["role"] or "unknown",
                 role_confidence=record["role_confidence"] or 0.0,
                 os_name=record["os_name"],
+                os_family=record.get("os_family"),
+                os_vendor=record.get("os_vendor"),
+                os_gen=record.get("os_gen"),
+                os_accuracy=record.get("os_accuracy"),
                 segment=record["segment"],
                 is_new=h_is_new,
                 is_stale=h_is_stale,
@@ -553,6 +567,8 @@ def get_host(ip: str):
             OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
+                   h.os_family AS os_family, h.os_vendor AS os_vendor,
+                   h.os_gen AS os_gen, h.os_accuracy AS os_accuracy,
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
                    h.owned AS owned, h.target AS target, h.notes AS notes,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
@@ -603,6 +619,10 @@ def get_host(ip: str):
             role=record["role"] or "unknown",
             role_confidence=record["role_confidence"] or 0.0,
             os_name=record["os_name"],
+            os_family=record.get("os_family"),
+            os_vendor=record.get("os_vendor"),
+            os_gen=record.get("os_gen"),
+            os_accuracy=record.get("os_accuracy"),
             segment=record["segment"],
             is_new=h_is_new,
             is_stale=h_is_stale,
