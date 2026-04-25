@@ -56,3 +56,13 @@ export function getCvssColor(cvss: number): string {
   if (cvss >= 4.0) return '#eab308';
   return '#22c55e';
 }
+
+// Human-readable severity tier for tooltips. CVSS-3.x tiers per FIRST.
+// 0 means "not scored"; we don't show severity in that case.
+export function cvssSeverity(cvss: number): string {
+  if (cvss >= 9.0) return 'CRITICAL';
+  if (cvss >= 7.0) return 'HIGH';
+  if (cvss >= 4.0) return 'MEDIUM';
+  if (cvss > 0) return 'LOW';
+  return 'NONE';
+}

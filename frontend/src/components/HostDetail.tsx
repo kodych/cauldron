@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, ExternalLink, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle, Flame } from 'lucide-react';
+import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, Key, MessageSquare, StickyNote, Clipboard, Target, Unlock, AlertCircle, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getRoleColor, getConfidenceColor, getCvssColor } from '../utils/colors';
+import { getRoleColor, getCvssColor, cvssSeverity } from '../utils/colors';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
 import { Badge } from './Badge';
 import { ExploitCommands } from './ExploitCommands';
@@ -14,9 +14,9 @@ interface Props {
 }
 
 const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: React.ReactNode }[] = [
-  { value: 'exploited', label: 'Exploited', color: '#22c55e', icon: <Check size={10} /> },
-  { value: 'false_positive', label: 'False Positive', color: '#6b7280', icon: <X size={10} /> },
-  { value: 'mitigated', label: 'Mitigated', color: '#3b82f6', icon: <Shield size={10} /> },
+  { value: 'exploited', label: 'Exploited', color: '#22c55e', icon: <Check size={13} strokeWidth={2.5} /> },
+  { value: 'false_positive', label: 'False Positive', color: '#9ca3af', icon: <X size={13} strokeWidth={2.5} /> },
+  { value: 'mitigated', label: 'Mitigated', color: '#3b82f6', icon: <Shield size={12} strokeWidth={2.5} /> },
 ];
 
 export function HostDetail({ ip, onBack, onDataChanged }: Props) {
@@ -169,8 +169,14 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
             <span className="rounded bg-gray-800 px-1.5 py-0.5 text-gray-400">{data.os_name}</span>
           )}
         </div>
+        {/* Visual divider between identity (IP / role / OS / scan-state)
+            and engagement-actions (Owned / Target / Notes). They were
+            stacked as if equal weight before; the operator's eye now
+            knows which line is "what is this host" and which is "what
+            do I want to do with it". */}
+        <div className="my-2 border-t border-gray-800/70" />
         {/* Owned / Target toggles */}
-        <div className="flex items-center gap-1.5 mt-2">
+        <div className="flex items-center gap-1.5">
           <button
             onClick={handleToggleOwned}
             disabled={toggleBusy}
@@ -198,8 +204,9 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
             {data.target ? 'Target' : 'Mark Target'}
           </button>
         </div>
-        {/* Host Notes */}
-        <div className="mt-2">
+        {/* Host Notes — same row-rhythm as the Owned/Target toggles
+            since they're the same kind of engagement-state action. */}
+        <div className="mt-1.5">
           <button
             onClick={handleToggleHostNotes}
             className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-xs transition-colors ${
@@ -280,25 +287,29 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
     return [...map.values()];
   }, [vulns]);
 
+  // Header counts: explicit "active vs dismissed" so the visible row
+  // count never disagrees with the header. Earlier we showed only
+  // ``activeGroups.length`` and the operator saw e.g. "(1)" with 4 rows
+  // visible (3 of them FP-marked) — cognitive dissonance.
+  const headerLabel = (() => {
+    const total = grouped.length;
+    if (total === 0) return 'Vulnerabilities';
+    const active = grouped.filter(g => g.vuln.checked_status !== 'false_positive').length;
+    const dismissed = total - active;
+    const portCount = new Set(
+      vulns.map(v => v.port).filter((p): p is number => p != null),
+    ).size;
+    const portSuffix = portCount > 1 ? ` · ${portCount} ports` : '';
+    if (dismissed === 0) return `Vulnerabilities · ${active}${portSuffix}`;
+    if (active === 0) return `Vulnerabilities · ${dismissed} dismissed${portSuffix}`;
+    return `Vulnerabilities · ${active} active, ${dismissed} dismissed${portSuffix}`;
+  })();
+
   return (
     <div>
       <div className="flex items-center gap-1.5 px-3 py-2">
         <Bug size={13} className="text-red-400" />
-        <span className="text-xs font-medium text-gray-400">
-          {(() => {
-            const active = vulns.filter(v => v.checked_status !== 'false_positive');
-            const activeGroups = grouped.filter(g => g.vuln.checked_status !== 'false_positive');
-            // Distinct ports that carry at least one active finding — the
-            // earlier denominator used ``active.length`` (one entry per
-            // CVE×port pairing), so 5 CVEs each present on 2 ports read as
-            // "5 on 10 ports" instead of "5 on 2 ports".
-            const portCount = new Set(
-              active.map(v => v.port).filter((p): p is number => p != null),
-            ).size;
-            const suffix = portCount > 1 ? ` on ${portCount} ports` : '';
-            return `Vulnerabilities (${activeGroups.length}${suffix})`;
-          })()}
-        </span>
+        <span className="text-xs font-medium text-gray-400">{headerLabel}</span>
       </div>
       <div className="px-3 pb-2 space-y-1">
         {grouped.map(({ vuln, ports }) => (
@@ -323,7 +334,14 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
   const [fpConfirmAll, setFpConfirmAll] = useState(false);
   const [fpBusy, setFpBusy] = useState(false);
   const [fpError, setFpError] = useState<string | null>(null);
+  const [cveCopied, setCveCopied] = useState(false);
   const currentStatus = vuln.checked_status || null;
+
+  const handleCopyCve = useCallback(async () => {
+    await navigator.clipboard.writeText(vuln.cve_id);
+    setCveCopied(true);
+    setTimeout(() => setCveCopied(false), 1500);
+  }, [vuln.cve_id]);
 
   const closeFpModal = useCallback(() => {
     if (fpBusy) return;
@@ -417,37 +435,38 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           <span
             className="font-mono text-xs shrink-0"
             style={{ color: getCvssColor(vuln.cvss) }}
+            title={`CVSS ${vuln.cvss.toFixed(1)} — ${cvssSeverity(vuln.cvss)} severity`}
           >
             {vuln.cvss.toFixed(1)}
           </span>
         )}
         <span className="text-xs text-gray-300 truncate flex-1 flex items-center gap-1">
-          <span
-            className="truncate hover:text-white cursor-pointer"
-            title="Click to copy"
-            onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(vuln.cve_id); }}
-          >
-            {vuln.cve_id}
-          </span>
-          {vuln.cve_id.startsWith('CVE-') && (
+          {vuln.cve_id.startsWith('CVE-') ? (
             <a
               href={`https://nvd.nist.gov/vuln/detail/${vuln.cve_id}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="shrink-0 text-gray-600 hover:text-blue-400"
+              className="truncate hover:text-blue-400 hover:underline"
               title="Open in NVD"
               onClick={(e) => e.stopPropagation()}
             >
-              <ExternalLink size={10} />
+              {vuln.cve_id}
             </a>
+          ) : (
+            <span className="truncate">{vuln.cve_id}</span>
           )}
+          <button
+            onClick={(e) => { e.stopPropagation(); handleCopyCve(); }}
+            title={cveCopied ? 'Copied!' : 'Copy CVE ID'}
+            className="shrink-0 rounded p-0.5 text-gray-500 hover:bg-gray-800 hover:text-gray-200"
+          >
+            {cveCopied
+              ? <Check size={11} className="text-green-400" />
+              : <Clipboard size={11} />}
+          </button>
         </span>
-        <span
-          className="text-xs shrink-0"
-          style={{ color: getConfidenceColor(vuln.confidence) }}
-        >
-          {vuln.confidence}
-        </span>
+        {/* Primary signals — loud colors, only the most important
+            information is allowed to compete for attention here. */}
         {vuln.in_cisa_kev && (
           <span className="shrink-0">
             <Badge
@@ -475,6 +494,18 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             </Badge>
           </span>
         )}
+        {/* Secondary metadata — same muted style for confidence /
+            attack surface / source, so they read as "reference info"
+            rather than competing with the primary signals above. The
+            ``check`` confidence is the default and carries no signal,
+            so we render confidence only when it differs. */}
+        {vuln.confidence && vuln.confidence !== 'check' && (
+          <span className="shrink-0">
+            <Badge tone="gray" title={`AI/script confidence: ${vuln.confidence}`}>
+              {vuln.confidence}
+            </Badge>
+          </span>
+        )}
         {vuln.attack_surfaces && vuln.attack_surfaces.length > 0 && (
           <span className="shrink-0">
             <Badge
@@ -486,25 +517,45 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           </span>
         )}
         {vuln.source && (
-          <span className={`text-xs shrink-0 rounded px-1 py-0 ${
-            vuln.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :
-            vuln.source === 'exploit_db' ? 'bg-amber-900/30 text-amber-400' :
-            vuln.source === 'nvd' ? 'bg-cyan-900/30 text-cyan-400' :
-            'bg-gray-700 text-gray-400'
-          }`}>
-            {vuln.source === 'ai' ? 'AI' : vuln.source === 'exploit_db' ? 'DB' : vuln.source === 'nvd' ? 'NVD' : vuln.source}
+          <span className="shrink-0">
+            <Badge tone="gray" title={`Source: ${vuln.source.toUpperCase()}`}>
+              {vuln.source === 'ai' ? 'AI' : vuln.source === 'exploit_db' ? 'DB' : vuln.source === 'nvd' ? 'NVD' : vuln.source}
+            </Badge>
           </span>
         )}
-        {currentStatus && (
-          <span className="text-xs shrink-0" style={{
-            color: currentStatus === 'exploited' ? '#22c55e' :
-                   currentStatus === 'mitigated' ? '#3b82f6' : '#6b7280'
-          }}>
-            {currentStatus === 'exploited' && <Check size={12} />}
-            {currentStatus === 'false_positive' && <X size={12} />}
-            {currentStatus === 'mitigated' && <Shield size={12} />}
-          </span>
-        )}
+        {/* Inline status quick-picker — primary triage action, must be
+            visibly affordant as a button group, not a row of three
+            naked icons that newcomers can't recognize. Implemented as a
+            segmented control: bordered container, divided cells, active
+            cell tinted in its own colour, inactive cells with a clear
+            hover state. Tooltip carries the full action name. */}
+        <span
+          className="flex items-stretch shrink-0 ml-2 rounded border border-gray-700 overflow-hidden divide-x divide-gray-700"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {STATUS_OPTIONS.map((opt) => {
+            const isActive = currentStatus === opt.value;
+            return (
+              <button
+                key={opt.value}
+                disabled={updating}
+                onClick={() => handleStatusChange(opt.value)}
+                title={isActive ? `Clear ${opt.label}` : `Mark as ${opt.label}`}
+                aria-label={isActive ? `Clear ${opt.label}` : `Mark as ${opt.label}`}
+                className={`flex items-center px-1.5 py-0.5 transition-colors ${
+                  isActive
+                    ? 'font-semibold'
+                    : 'text-gray-400 hover:bg-gray-800 hover:text-gray-100'
+                }`}
+                style={isActive
+                  ? { color: opt.color, backgroundColor: opt.color + '22' }
+                  : undefined}
+              >
+                {opt.icon}
+              </button>
+            );
+          })}
+        </span>
         {expanded ? <ChevronUp size={12} className="text-gray-600" /> : <ChevronDown size={12} className="text-gray-600" />}
       </button>
 
@@ -545,34 +596,9 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           )}
           {/* Exploit Commands */}
           <ExploitCommands hostIp={hostIp} port={ports[0] || vuln.port || 0} vulnId={vuln.cve_id} />
-
-          {/* Status buttons — uniform style. False Positive opens a
-              modal asking for reason + scope (this host / all hosts);
-              the other two apply on click. Click on an active status
-              clears it (no modal). */}
-          <div className="flex items-center gap-1 pt-1 border-t border-gray-700/50 flex-wrap">
-            <span className="text-xs text-gray-600 mr-1">Status:</span>
-            {STATUS_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                disabled={updating}
-                onClick={(e) => { e.stopPropagation(); handleStatusChange(opt.value); }}
-                className={`flex items-center gap-0.5 rounded px-1.5 py-0.5 text-xs transition-colors ${
-                  currentStatus === opt.value
-                    ? 'ring-1 ring-offset-1 ring-offset-gray-900'
-                    : 'opacity-60 hover:opacity-100'
-                }`}
-                style={{
-                  color: opt.color,
-                  backgroundColor: opt.color + '18',
-                  ...(currentStatus === opt.value ? { ringColor: opt.color } : {}),
-                }}
-              >
-                {opt.icon}
-                {opt.label}
-              </button>
-            ))}
-          </div>
+          {/* Status pickers live in the collapsed row now (compact,
+              always visible). The expanded view doesn't duplicate them
+              — the inline icons reach the same handler / modal. */}
         </div>
       )}
       {fpOpen && (
@@ -692,6 +718,18 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
     return map;
   }, [vulns]);
 
+  // Sort services by port number ascending — the backend returns them in
+  // whatever order Cypher matched, which on real scans surfaces as
+  // 5432, 3389, 445, 139, 135, 22 (random-looking from the operator's
+  // perspective). Same protocol comes before different protocol on
+  // identical port number.
+  const sortedServices = useMemo(() => {
+    return [...services].sort((a, b) => {
+      if (a.port !== b.port) return a.port - b.port;
+      return (a.protocol || '').localeCompare(b.protocol || '');
+    });
+  }, [services]);
+
   const handleBruteToggle = useCallback(async (port: number, current: boolean) => {
     try {
       await api.updateServiceBruteforceable(hostIp, port, !current);
@@ -769,7 +807,7 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
         <span className="text-xs font-medium text-gray-400">Services ({services.length})</span>
       </div>
       <div className="px-3 pb-2 space-y-0.5">
-        {services.map((s) => {
+        {sortedServices.map((s) => {
           const maxCvss = portCvssMap.get(s.port) || 0;
           const vCount = portVulnCount.get(s.port) || 0;
           const portColor = maxCvss > 0 ? getCvssColor(maxCvss) : '#60a5fa';
@@ -778,7 +816,7 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
             <div key={`${s.port}/${s.protocol}`}>
               <div className={`flex items-center gap-2 text-xs ${s.is_stale ? 'opacity-40' : ''}`}>
                 <span
-                  className={`font-mono w-14 text-right shrink-0 ${s.is_stale ? 'line-through' : ''}`}
+                  className={`font-mono tabular-nums w-[4.5rem] shrink-0 ${s.is_stale ? 'line-through' : ''}`}
                   style={{ color: portColor }}
                 >
                   {s.port}/{s.protocol}
