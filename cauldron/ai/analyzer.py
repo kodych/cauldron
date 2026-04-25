@@ -779,19 +779,28 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     product line — wildcard-CPE NVD matches pull in CVEs for any release.
 11. Surface compatibility: read the CVE description and compare the
     attack vector it describes against the service this CVE is attached
-    to AND the host's full Services list. Three sub-cases:
-    (a) CVE attacks HTTP/HTTPS/web interface and the attached service is
-        non-HTTP (e.g. CVE-2024-4040 SSTI on a :22/sftp service): check
-        the host's Services list — if the same product runs an HTTP
-        port elsewhere on this host (e.g. :443/https on the same
-        CrushFTP host), KEEP with reason "verify alt-port for HTTP
-        interface". If no HTTP port exists on this host, DISMISS with
-        reason "HTTP-only CVE, no HTTP service on this host".
-    (b) CVE attacks SMB/SSH/FTP/etc. matching the service: KEEP unless
-        another rule applies.
-    (c) Library-level CVE (krb5 in Samba, openssl in any TLS service):
-        the CVE description names a library, the service embeds it →
-        KEEP. Don't be fooled by the protocol mismatch in this case.
+    to AND the host's full Services list.
+    (a) Surface mismatch — CVE attacks HTTP/HTTPS/web but the attached
+        service is non-HTTP (e.g. CVE-2024-4040 SSTI on a :22/sftp
+        service): scan the host's Services list. Decision depends on
+        whether an alt-port has a CONFIRMED product match — the
+        Services line shows ``product=`` only when nmap fingerprinted
+        it; entries like ``:443/https`` (bare service name, no product
+        word) mean the running software is unknown.
+          - alt-port runs the SAME product as the affected service
+            (e.g. :443/https CrushFTP next to :22/sftp CrushFTP) →
+            KEEP with reason "verify alt-port :443 for HTTP interface"
+          - HTTP port exists but its product is UNKNOWN or different
+            (e.g. :443/https with no product fingerprint) → DISMISS,
+            reason "HTTP-only CVE, alt-port not confirmed as same
+            product — re-run nmap --version-intensity 9 to verify"
+          - no HTTP port at all → DISMISS, reason "HTTP-only CVE,
+            no HTTP service on this host"
+    (b) Surface match — CVE protocol matches service protocol: KEEP
+        unless another rule applies.
+    (c) Library-level CVE (krb5 in Samba, openssl in TLS services):
+        the description names a library, the service embeds it → KEEP.
+        Don't be fooled by the protocol mismatch in this case.
     EXCEPTION for KEV throughout: never auto-DISMISS a KEV. Mark KEEP
     and note the concern in the reason for operator review.
 12. UNIVERSAL DISMISSAL — when a CVE's precondition is the same on every
