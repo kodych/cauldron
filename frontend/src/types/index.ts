@@ -45,6 +45,12 @@ export interface VulnOut {
   // for scp command injection. Empty = unclassified. Used by the UI to
   // surface why a CVE did or didn't attach to a service.
   attack_surfaces: string[];
+  // True when the matched service had no concrete version at link
+  // time — CVE attached via wildcard CPE prefix. The CVE may not
+  // actually apply to this specific service. Surfaced as a
+  // "VERSION UNCONFIRMED" badge so the operator verifies before
+  // acting on the finding.
+  version_unconfirmed: boolean;
 }
 
 export interface HostOut {
@@ -159,6 +165,7 @@ export interface VulnListItem {
   in_cisa_kev: boolean;
   cisa_kev_added: string | null;
   attack_surfaces: string[];
+  version_unconfirmed: boolean;
   host_count: number;
   targets: Array<{ ip: string; port: number }>;
   ips: string[];

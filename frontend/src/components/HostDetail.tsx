@@ -464,6 +464,20 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
               ? <Check size={11} className="text-green-400" />
               : <Clipboard size={11} />}
           </button>
+          {/* Subtle "?" marker when this CVE's matched service had no
+              concrete version. The service row already carries the same
+              hint after the product name; the per-vuln marker preserves
+              context when the operator scrolls deep into the vulns
+              section and the service line is off-screen. */}
+          {vuln.version_unconfirmed && (
+            <span
+              className="shrink-0 text-yellow-500/70 cursor-help"
+              title="Service version was unknown when this CVE was linked. The CVE applies to *some* versions of this product but we can't confirm it covers the build actually running here — verify before acting on this finding."
+              onClick={(e) => e.stopPropagation()}
+            >
+              ?
+            </span>
+          )}
         </span>
         {/* Primary signals — loud colors, only the most important
             information is allowed to compete for attention here. */}
@@ -516,6 +530,10 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             </Badge>
           </span>
         )}
+        {/* version_unconfirmed is shown at the SERVICE level (see
+            ServicesList) to avoid repeating the same warning on every
+            CVE row. It's still on VulnOut for aggregate views (Vulns
+            tab, report) where service context isn't visible. */}
         {vuln.source && (
           <span className="shrink-0">
             <Badge tone="gray" title={`Source: ${vuln.source.toUpperCase()}`}>
@@ -823,6 +841,20 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                 </span>
                 <span className={`text-gray-400 truncate ${s.is_stale ? 'line-through' : ''}`}>
                   {s.name}{s.product && ` — ${s.product}`}{s.version && ` ${s.version}`}
+                  {/* Subtle "?" after the product name when version
+                      is unknown. nmap couldn't pin a specific version,
+                      so CVE-linkage relies on a wildcard NVD match —
+                      the linked CVEs may or may not apply to the
+                      actual build. Hover-tooltip explains; no badge
+                      box, just a dim character. */}
+                  {s.product && (!s.version || s.version === '*') && (
+                    <span
+                      className="ml-0.5 text-yellow-500/70 cursor-help"
+                      title="Version not detected by nmap. CVEs were attached via wildcard CPE match — they apply to *some* versions of this product, but we can't confirm whether they cover the actual build running here. Verify with deeper version detection or the vendor admin panel."
+                    >
+                      ?
+                    </span>
+                  )}
                 </span>
                 {s.is_new && <span className="shrink-0"><Badge tone="green">NEW</Badge></span>}
                 {s.is_stale && <span className="shrink-0"><Badge tone="gray">GONE</Badge></span>}

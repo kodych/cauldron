@@ -107,6 +107,12 @@ class VulnOut(BaseModel):
     # Empty list = unclassified. UI badge helps the operator see why a
     # CVE did or didn't attach where they might have expected.
     attack_surfaces: list[str] = []
+    # True when the matched service had no concrete version at link
+    # time — the CVE was attached via wildcard-CPE prefix, so we can't
+    # confirm it actually applies to this specific service. Surfaces as
+    # a "VERSION UNCONFIRMED" badge in UI / report so the operator
+    # knows to verify before chasing the finding.
+    version_unconfirmed: bool = False
 
 
 class HostOut(BaseModel):
@@ -298,6 +304,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         in_cisa_kev=bool(v.get("in_cisa_kev")),
         cisa_kev_added=v.get("cisa_kev_added"),
         attack_surfaces=list(v.get("attack_surfaces") or []),
+        version_unconfirmed=bool(v.get("version_unconfirmed")),
     )
 
 
@@ -481,7 +488,8 @@ def list_hosts(
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
-                       attack_surfaces: v.attack_surfaces
+                       attack_surfaces: v.attack_surfaces,
+                       version_unconfirmed: (s.version IS NULL OR s.version = '' OR s.version = '*')
                    }}) AS vulns
             """,
             **params,
@@ -566,7 +574,9 @@ def get_host(ip: str):
                        confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
-                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added
+                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
+                       attack_surfaces: v.attack_surfaces,
+                       version_unconfirmed: (s.version IS NULL OR s.version = '' OR s.version = '*')
                    }) AS vulns
             """,
             ip=ip,
@@ -1411,7 +1421,15 @@ def list_vulns():
                  END AS conf_tier
             WITH v, max(conf_tier) AS max_tier,
                  count(DISTINCT h.ip) AS host_count,
-                 collect(DISTINCT {ip: h.ip, port: s.port}) AS targets
+                 collect(DISTINCT {ip: h.ip, port: s.port}) AS targets,
+                 // Aggregate "did EVERY matched service lack a concrete
+                 // version?" Per the audit: only flag the CVE if the
+                 // wildcard-CPE concern applies uniformly. If at least
+                 // one host has a known version that does match the CVE,
+                 // the finding has a real anchor and we don't badge.
+                 all(svc IN collect(DISTINCT s)
+                     WHERE svc.version IS NULL OR svc.version = ''
+                        OR svc.version = '*') AS version_unconfirmed
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    CASE max_tier
                        WHEN 3 THEN 'confirmed'
@@ -1423,6 +1441,7 @@ def list_vulns():
                    v.epss AS epss,
                    v.in_cisa_kev AS in_cisa_kev, v.cisa_kev_added AS cisa_kev_added,
                    v.attack_surfaces AS attack_surfaces,
+                   version_unconfirmed,
                    host_count, targets
             ORDER BY coalesce(v.in_cisa_kev, false) DESC,
                      coalesce(v.epss, 0) DESC,
@@ -1446,6 +1465,7 @@ def list_vulns():
             "in_cisa_kev": bool(r.get("in_cisa_kev")),
             "cisa_kev_added": r.get("cisa_kev_added"),
             "attack_surfaces": list(r.get("attack_surfaces") or []),
+            "version_unconfirmed": bool(r.get("version_unconfirmed")),
             "host_count": r["host_count"],
             "targets": targets,
             "ips": sorted(set(t["ip"] for t in targets)),

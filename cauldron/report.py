@@ -154,7 +154,18 @@ def _query_findings_grouped() -> list[dict]:
                 coalesce(v.epss, 0) DESC,
                 COALESCE(v.cvss, 0) DESC
         """))
-    return [dict(r) for r in rows]
+    findings = [dict(r) for r in rows]
+    # Derive ``version_unconfirmed`` from the per-host ``version`` field
+    # already collected in ``hosts``. The CVE is flagged only when EVERY
+    # affected host had no concrete version at link time — partial
+    # coverage (some hosts with versions, some without) lets the
+    # finding stand on its anchored edges. Aligns with the audit spec.
+    for f in findings:
+        host_versions = [h.get("version") for h in (f.get("hosts") or [])]
+        f["version_unconfirmed"] = bool(host_versions) and all(
+            v is None or v == "" or v == "*" for v in host_versions
+        )
+    return findings
 
 
 def _query_vuln_stats() -> dict:
@@ -433,6 +444,13 @@ def generate_markdown(top: int = 0, include_notes: bool = False) -> str:
             surfaces = f_.get("attack_surfaces")
             if surfaces:
                 badges.append(f"surface: {'/'.join(sorted(surfaces))}")
+            # Version-unconfirmed marker — when the CVE was attached to
+            # services whose version was unknown at link time, the
+            # report shouldn't read "🔥 KEV · EXPLOIT" with confident
+            # vibes. The badge tells the operator "verify version before
+            # acting on this finding."
+            if f_.get("version_unconfirmed"):
+                badges.append("⚠ **VERSION UNCONFIRMED**")
             badge_str = (" · " + " · ".join(badges)) if badges else ""
 
             w(f"### {i}. {cve} — CVSS {cvss}{badge_str}")

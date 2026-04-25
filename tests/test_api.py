@@ -641,6 +641,105 @@ class TestVulnBulkStatus:
         assert resp.json()["affected"] == 0
 
 
+class TestVersionUnconfirmed:
+    """Audit #2: when a CVE attaches via wildcard CPE (service version
+    unknown at link time), the report / UI must surface that uncertainty
+    instead of reading "🔥 KEV · EXPLOIT" as if it were confirmed."""
+
+    def _seed_versionless_apache(self):
+        """One Apache host with no version, plus an Apache CVE linked
+        via the CPE-prefix path that ignores version."""
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.50', state: 'up',
+                                role: 'web_server', role_confidence: 0.9})
+                CREATE (s:Service {host_ip: '10.0.0.50', port: 80,
+                                  protocol: 'tcp', state: 'open',
+                                  name: 'http', product: 'Apache httpd'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                CREATE (v:Vulnerability {
+                    cve_id: 'CVE-2021-40438', cvss: 9.0,
+                    has_exploit: true, in_cisa_kev: true, source: 'nvd',
+                    description: 'Apache mod_proxy SSRF.'
+                })
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(v)
+            """)
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # Inherits clean_db autouse fixture; just need a fresh seed
+        # before each test.
+        pass
+
+    def test_per_host_endpoint_flags_unconfirmed_when_no_version(self, client):
+        """Service with no version → vuln record carries
+        ``version_unconfirmed: true``."""
+        self._seed_versionless_apache()
+        resp = client.get("/api/v1/hosts/10.0.0.50")
+        assert resp.status_code == 200
+        vulns = resp.json()["vulnerabilities"]
+        assert len(vulns) == 1
+        assert vulns[0]["cve_id"] == "CVE-2021-40438"
+        assert vulns[0]["version_unconfirmed"] is True
+
+    def test_per_host_endpoint_clear_when_version_known(self, client):
+        """Control: same Apache CVE on a service WITH a version → flag
+        is false. Operator-confidence (`check` here) doesn't change
+        either way — they're separate axes."""
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.51', state: 'up',
+                                role: 'web_server', role_confidence: 0.9})
+                CREATE (s:Service {host_ip: '10.0.0.51', port: 80,
+                                  protocol: 'tcp', state: 'open',
+                                  name: 'http', product: 'Apache httpd',
+                                  version: '2.4.49'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                CREATE (v:Vulnerability {
+                    cve_id: 'CVE-2021-40438', cvss: 9.0, source: 'nvd'
+                })
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(v)
+            """)
+        resp = client.get("/api/v1/hosts/10.0.0.51")
+        vulns = resp.json()["vulnerabilities"]
+        assert vulns[0]["version_unconfirmed"] is False
+
+    def test_vuln_list_aggregates_unconfirmed(self, client):
+        """Vulns list: a CVE attached only to versionless services is
+        flagged unconfirmed in the aggregate row."""
+        self._seed_versionless_apache()
+        resp = client.get("/api/v1/vulns")
+        vulns = resp.json()["vulns"]
+        target = next(v for v in vulns if v["cve_id"] == "CVE-2021-40438")
+        assert target["version_unconfirmed"] is True
+
+    def test_vuln_list_partial_coverage_not_flagged(self, client):
+        """If at least ONE host has a known version, the aggregate
+        should NOT flag — the finding has a real anchor and the badge
+        would be misleading."""
+        # Versionless host
+        self._seed_versionless_apache()
+        # Plus a versioned host on the same CVE
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.51', state: 'up',
+                                role: 'web_server', role_confidence: 0.9})
+                CREATE (s:Service {host_ip: '10.0.0.51', port: 80,
+                                  protocol: 'tcp', state: 'open',
+                                  name: 'http', product: 'Apache httpd',
+                                  version: '2.4.49'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                WITH s
+                MATCH (v:Vulnerability {cve_id: 'CVE-2021-40438'})
+                CREATE (s)-[:HAS_VULN {confidence: 'check'}]->(v)
+            """)
+        resp = client.get("/api/v1/vulns")
+        vulns = resp.json()["vulns"]
+        target = next(v for v in vulns if v["cve_id"] == "CVE-2021-40438")
+        assert target["version_unconfirmed"] is False
+        assert target["host_count"] == 2
+
+
 class TestBruteforceable:
     def test_toggle_bruteforceable(self, client):
         _setup_test_network()
