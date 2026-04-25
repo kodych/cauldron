@@ -72,6 +72,13 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
         await api.updateHostNotes(ip, value || null);
         setHostNotesStatus('saved');
         hostNotesClearRef.current = setTimeout(() => setHostNotesStatus('idle'), 1500);
+        // Refetch the host so ``data.notes`` reflects what we just
+        // saved. Without this, the next time the operator closes and
+        // reopens the notes panel, ``handleToggleHostNotes`` resets
+        // the textarea from the stale prop and the just-typed text
+        // appears to vanish (it's actually safely stored in the DB —
+        // a refresh confirms it).
+        refetch();
       } catch (e) {
         console.error('Failed to save host notes:', e);
         setHostNotesStatus('error');
@@ -801,12 +808,18 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
         await api.updateServiceNotes(hostIp, notesPort!, value || null);
         setNotesStatus('saved');
         savedClearRef.current = setTimeout(() => setNotesStatus('idle'), 1500);
+        // Refetch the host so ``s.notes`` on the matching service
+        // reflects what we just saved. Without this, the next time
+        // the operator closes and reopens the notes panel for the
+        // same port, ``handleToggleNotes`` resets the textarea from
+        // the stale prop and the saved text appears to vanish.
+        onUpdated();
       } catch (e) {
         console.error('Failed to save notes:', e);
         setNotesStatus('error');
       }
     }, 500);
-  }, [hostIp, notesPort]);
+  }, [hostIp, notesPort, onUpdated]);
 
   return (
     <div className="border-b border-gray-800">
