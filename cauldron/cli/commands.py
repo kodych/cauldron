@@ -697,7 +697,7 @@ def collect(filter_name: str | None, port: int | None, role: str | None,
 
     # Output
     if output:
-        with open(output, "w") as f:
+        with open(output, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         console.print(f"[green]+[/green] {result.total} hosts written to {output}")
     else:

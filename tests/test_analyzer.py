@@ -119,7 +119,7 @@ class TestCallClaude:
 
         with patch("cauldron.ai.analyzer.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test"
-            mock_settings.ai_model = "claude-sonnet-4-20250514"
+            mock_settings.ai_model = "claude-sonnet-4-6"
             with patch("anthropic.Anthropic") as mock_anthropic:
                 mock_client = MagicMock()
                 mock_client.messages.create.return_value = mock_message
@@ -140,7 +140,7 @@ class TestCallClaude:
 
         with patch("cauldron.ai.analyzer.settings") as mock_settings:
             mock_settings.anthropic_api_key = "bad-key"
-            mock_settings.ai_model = "claude-sonnet-4-20250514"
+            mock_settings.ai_model = "claude-sonnet-4-6"
             with patch("anthropic.Anthropic") as mock_anthropic:
                 mock_client = MagicMock()
                 mock_client.messages.create.side_effect = anthropic.AuthenticationError(
@@ -158,7 +158,7 @@ class TestCallClaude:
 
         with patch("cauldron.ai.analyzer.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test"
-            mock_settings.ai_model = "claude-sonnet-4-20250514"
+            mock_settings.ai_model = "claude-sonnet-4-6"
             with patch("anthropic.Anthropic") as mock_anthropic:
                 mock_client = MagicMock()
                 mock_client.messages.create.side_effect = anthropic.RateLimitError(

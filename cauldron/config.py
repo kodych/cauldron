@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # AI (Anthropic Claude)
     anthropic_api_key: str = ""
-    ai_model: str = "claude-sonnet-4-20250514"
+    ai_model: str = "claude-sonnet-4-6"
 
     # NVD API (optional, for higher rate limits)
     nvd_api_key: str = ""
