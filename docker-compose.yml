@@ -20,12 +20,14 @@ services:
       retries: 5
 
   cauldron:
-    # Build locally during development; switch to ``image:`` once a tagged
-    # image is published to GHCR (release pipeline does this on tag push).
+    # Pinned to a specific release so operators reading this file know
+    # exactly which version is running. Bump on every published tag.
+    # If no image is in the registry yet, ``build:`` produces one
+    # locally with the same tag.
+    image: ghcr.io/kodych/cauldron:0.1.0
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/kodych/cauldron:latest
     container_name: cauldron
     ports:
       - "8000:8000"

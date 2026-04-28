@@ -67,52 +67,54 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ## Quick start
 
-You'll need [Docker](https://www.docker.com/), Python 3.11+, and an
+You'll need [Docker](https://www.docker.com/) and an
 [Anthropic API key](https://console.anthropic.com/) for the AI features.
+Pick one of the two paths.
 
-### 1. Clone and configure
+### Path A: full stack via Docker Compose (recommended for users)
+
+Brings up Neo4j and the Cauldron container together. No Python install needed.
 
 ```bash
 git clone https://github.com/kodych/cauldron.git
 cd cauldron
 cp .env.example .env
-$EDITOR .env   # set CAULDRON_ANTHROPIC_API_KEY
+$EDITOR .env                   # set CAULDRON_ANTHROPIC_API_KEY
+
+docker compose up -d           # neo4j + cauldron
+docker compose exec cauldron \
+  cauldron brew /app/data/samples/corporate_network.xml
+docker compose exec cauldron cauldron boil --nvd --ai
 ```
 
-### 2. Start Neo4j
+Then open http://localhost:8000 — the API serves the web UI from the
+same container. Neo4j browser stays at http://localhost:7474.
+
+### Path B: native install (recommended for developers)
+
+Compose starts Neo4j only; `cauldron` runs from your local checkout
+with hot reload. Needs Python 3.11+.
 
 ```bash
-docker compose up -d
-```
+git clone https://github.com/kodych/cauldron.git
+cd cauldron
+cp .env.example .env
+$EDITOR .env
 
-Browser UI at http://localhost:7474, default credentials `neo4j` /
-`cauldron`.
-
-### 3. Install Cauldron
-
-```bash
+docker compose up -d neo4j     # Neo4j only
 pip install -e ".[all]"
-```
 
-### 4. Brew your first scan
-
-```bash
 cauldron brew data/samples/corporate_network.xml
 cauldron taste                 # graph stats
 cauldron boil --nvd --ai       # enrich with CVEs + AI triage
 cauldron paths                 # top attack paths
-```
+cauldron serve                 # API on http://127.0.0.1:8000
 
-### 5. Open the UI
-
-```bash
-cauldron serve                 # starts the API on http://127.0.0.1:8000
-
-# in another terminal:
+# in another terminal — Vite dev server with HMR
 cd frontend && npm install && npm run dev
 ```
 
-The web UI runs at http://localhost:3000.
+The web UI runs at http://localhost:3000 in dev mode.
 
 ## CLI reference
 
