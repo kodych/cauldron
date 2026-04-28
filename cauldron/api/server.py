@@ -387,15 +387,20 @@ def _parse_service_record(s: dict, host_first_seen: str | None = None,
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/")
-def root():
-    """API root — health check and links."""
+@app.get("/api/v1/health")
+def health():
+    """API health-check and version metadata.
+
+    The path under /api/v1/ keeps the route stable when ``/`` is taken
+    over by the bundled frontend in single-container deployments.
+    """
     return {
         "name": "Cauldron API",
         "version": "0.1.0",
         "docs": "/docs",
         "api": "/api/v1/stats",
     }
+
 
 @app.get("/api/v1/stats", response_model=StatsResponse)
 def get_stats():
@@ -1509,3 +1514,32 @@ def reset_database():
 
     clear_database()
     return {"ok": True, "message": "Database cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (single-container deployments)
+# ---------------------------------------------------------------------------
+#
+# When the React bundle has been built (Docker images do this in a separate
+# stage), serve it from ``/`` so one container ships UI + API. The mount is
+# conditional: in dev nobody runs ``npm run build`` before hitting the API,
+# the Vite dev server on :3000 handles the UI, and ``/`` returning 404 is
+# the desired behaviour.
+#
+# ``html=True`` makes StaticFiles serve ``index.html`` for any path it
+# can't resolve to a file, which is what an SPA router needs for deep
+# links (``/hosts/10.0.1.10`` → ``index.html`` → React Router).
+
+# CAULDRON_FRONTEND_DIST overrides the lookup for tests / non-default
+# layouts. Default location matches the Dockerfile COPY target.
+_frontend_dist_env = os.environ.get("CAULDRON_FRONTEND_DIST", "").strip()
+_frontend_dist = (
+    Path(_frontend_dist_env)
+    if _frontend_dist_env
+    else Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+)
+if _frontend_dist.is_dir() and (_frontend_dist / "index.html").is_file():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+    logger.info("Mounted frontend bundle at / from %s", _frontend_dist)

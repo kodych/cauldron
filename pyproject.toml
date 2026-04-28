@@ -9,6 +9,34 @@ description = "Network Attack Path Discovery — BloodHound for the network laye
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
+authors = [
+    {name = "Kostiantyn Demydenko"},
+]
+keywords = [
+    "pentesting",
+    "security",
+    "attack-graph",
+    "nmap",
+    "masscan",
+    "vulnerability-scanner",
+    "neo4j",
+    "bloodhound",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "neo4j>=5.0",
     "click>=8.0",
@@ -18,6 +46,12 @@ dependencies = [
     "pyyaml>=6.0",
     "packaging>=23.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kodych/cauldron"
+Repository = "https://github.com/kodych/cauldron"
+Issues = "https://github.com/kodych/cauldron/issues"
+Changelog = "https://github.com/kodych/cauldron/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 api = [
