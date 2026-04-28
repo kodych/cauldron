@@ -1526,9 +1526,12 @@ def reset_database():
 # the Vite dev server on :3000 handles the UI, and ``/`` returning 404 is
 # the desired behaviour.
 #
-# ``html=True`` makes StaticFiles serve ``index.html`` for any path it
-# can't resolve to a file, which is what an SPA router needs for deep
-# links (``/hosts/10.0.1.10`` → ``index.html`` → React Router).
+# ``StaticFiles(html=True)`` only handles the ``GET /`` → ``index.html``
+# bounce. For React Router deep-links (``GET /hosts/10.0.1.10`` after a
+# refresh) we override ``get_response`` so any 404 within the mounted
+# tree falls back to ``index.html``. The router on the client then takes
+# over and renders the right view. The explicit @app.get routes still
+# win because FastAPI's matcher checks them before reaching the mount.
 
 # CAULDRON_FRONTEND_DIST overrides the lookup for tests / non-default
 # layouts. Default location matches the Dockerfile COPY target.
@@ -1540,6 +1543,32 @@ _frontend_dist = (
 )
 if _frontend_dist.is_dir() and (_frontend_dist / "index.html").is_file():
     from fastapi.staticfiles import StaticFiles
+    from starlette.exceptions import HTTPException as StarletteHTTPException
 
-    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+    class SPAStaticFiles(StaticFiles):
+        """StaticFiles that falls back to index.html on missing paths.
+
+        Standard ``html=True`` only redirects bare directories. For client-
+        side routing to survive a hard refresh on a deep link, every 404
+        within the mount has to render the SPA shell — except under
+        ``api/``: misnamed API routes must keep returning JSON 404 so
+        callers can tell a missing endpoint apart from a valid SPA route.
+        """
+
+        async def get_response(self, path: str, scope):
+            try:
+                return await super().get_response(path, scope)
+            except StarletteHTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                # ``path`` is mount-relative and uses os.sep, so on Windows
+                # we get backslashes here. Normalize before the prefix
+                # check so the rule works the same in dev and in the
+                # Linux container.
+                normalized = path.replace("\\", "/")
+                if normalized.startswith("api/"):
+                    raise
+                return await super().get_response("index.html", scope)
+
+    app.mount("/", SPAStaticFiles(directory=_frontend_dist, html=True), name="frontend")
     logger.info("Mounted frontend bundle at / from %s", _frontend_dist)
