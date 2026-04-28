@@ -19,6 +19,29 @@ services:
       timeout: 5s
       retries: 5
 
+  cauldron:
+    # Build locally during development; switch to ``image:`` once a tagged
+    # image is published to GHCR (release pipeline does this on tag push).
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/kodych/cauldron:latest
+    container_name: cauldron
+    ports:
+      - "8000:8000"
+    environment:
+      # Talk to the neo4j service via its compose-network DNS name.
+      - CAULDRON_NEO4J_URI=bolt://neo4j:7687
+      - CAULDRON_NEO4J_USER=neo4j
+      - CAULDRON_NEO4J_PASSWORD=cauldron
+      # Pull AI / NVD keys from the host environment if set; otherwise the
+      # AI phases just skip gracefully.
+      - CAULDRON_ANTHROPIC_API_KEY=${CAULDRON_ANTHROPIC_API_KEY:-}
+      - CAULDRON_NVD_API_KEY=${CAULDRON_NVD_API_KEY:-}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
 volumes:
   neo4j_data:
   neo4j_logs:

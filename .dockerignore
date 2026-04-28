@@ -1,0 +1,55 @@
+# Caches and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Virtualenvs (should stay outside the image regardless)
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local Neo4j data
+neo4j_data/
+neo4j_logs/
+
+# Local secrets and operator notes
+.env
+.env.*
+!.env.example
+CLAUDE.md
+.claude/
+
+# Test fixtures that should never leave the box
+tests/private/
+data/scans/
+
+# The Dockerfile builds the frontend itself; ship neither node_modules
+# nor a stale dist into the build context.
+frontend/node_modules/
+frontend/dist/
+
+# Operator-local helper scripts
+scripts/
+tools/
+tmp_*
+
+# Git internals
+.git/
+.gitignore
+.github/
