@@ -38,9 +38,6 @@ data/scans/
 *.xml
 !data/samples/*.xml
 
-# Documentation — public docs are tracked, the operator-private PROJECT_BIBLE is not
-docs/PROJECT_BIBLE.md
-
 # Claude
 CLAUDE.md
 .claude/
