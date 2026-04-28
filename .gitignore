@@ -6,8 +6,10 @@ dist/
 build/
 .eggs/
 
-# Environment
-.env*
+# Environment — actual secrets stay out, the example template is tracked
+.env
+.env.*
+!.env.example
 .venv/
 venv/
 
@@ -36,8 +38,8 @@ data/scans/
 *.xml
 !data/samples/*.xml
 
-# Documentation (not published yet)
-docs/
+# Documentation — public docs are tracked, the operator-private PROJECT_BIBLE is not
+docs/PROJECT_BIBLE.md
 
 # Claude
 CLAUDE.md

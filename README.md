@@ -1,132 +1,218 @@
-# 🜄 Cauldron
+<div align="center">
 
-**Network Attack Path Discovery**
+<img src="frontend/public/brand/cauldron-512.png" alt="Cauldron logo" width="180" />
 
-> Throw your scans in. Get attack paths out.
+# Cauldron
 
-```  
-              ) (
-           ) (   ) (
-          ( o  O  o )
-         .~~~~~~~~~~~.
-        /    °    °   \
-       |   CAULDRON    |       Cauldron 🜄
-       |   ~~~ 🜄 ~~~   |       Network Attack Path Discovery
-        \    °    °   /        v0.1.0
-         .___________.
-           |||||||||
-         ^^^^^^^^^^^^
-         )  )  )  )  )
-        (__(__(__(__(__
+**Network Attack Path Discovery — BloodHound for the network layer.**
 
-```
+Throw your scans in. Get attack paths out.
 
-Cauldron is a **BloodHound for the network layer** — it builds attack graphs from Nmap/Masscan scan results, enriches them with AI-powered analysis (CVE lookup, host classification, attack chain reasoning), and visualizes attack paths through an interactive web UI.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/kodych/cauldron/actions/workflows/test.yml/badge.svg)](https://github.com/kodych/cauldron/actions/workflows/test.yml)
+[![Release](https://img.shields.io/github/v/release/kodych/cauldron?include_prereleases&sort=semver)](https://github.com/kodych/cauldron/releases)
 
-## The Problem
+</div>
 
-Every pentester on every engagement does the same thing manually:
-- Stares at thousands of lines of Nmap XML output
-- Mentally classifies hosts by their open port patterns
-- Manually searches for CVEs matching each service version
-- Keeps attack paths in their head, missing non-obvious chains
-- Spends **days** on analysis that could take **minutes**
+---
 
-## The Solution
+## What it is
 
-Cauldron automates the analytical work. Import your scans, and the system:
+Cauldron turns Nmap and Masscan output into an **interactive attack graph**.
+It classifies every host by role, enriches services with CVEs and known
+exploits, ranks paths to high-value targets by exploitability, and ships
+every finding into a Neo4j-backed UI you can pivot in.
 
-1. **Parses** Nmap/Masscan output into a graph database (Neo4j)
-2. **Classifies** hosts by role (Domain Controller, web server, database, printer...)
-3. **Enriches** with CVE data and known exploit availability
-4. **Discovers** attack paths using graph algorithms + AI reasoning
-5. **Visualizes** everything in an interactive graph UI
+Each new scan from a different network position adds to the same graph —
+like throwing more ingredients into a cauldron.
 
-Each new scan from a different network position **enriches the graph further** — like throwing more ingredients into a cauldron.
+## Why
 
-## Quick Start
+Every pentester runs the same loop on every engagement:
+
+- Stare at thousands of lines of Nmap XML.
+- Mentally classify hosts by their open-port patterns.
+- Manually search for CVEs against each service version.
+- Keep attack paths in their head, missing non-obvious chains.
+- Spend **days** on analysis that should take **minutes**.
+
+Cauldron automates the analytical work so you can spend your engagement
+hours on actually exploiting things.
+
+## What's in v0.1.0
+
+- **Ingestion** — Nmap XML and Masscan (XML + JSON), with NEW / GONE /
+  CHANGED diffing across re-imports from different network positions.
+- **Classification** — rule-based role classifier (DC, web, DB, printer,
+  hypervisor, SIEM, CI/CD, VPN gateway, backup, …) with AI fallback for
+  edge cases.
+- **CVE enrichment** — NVD CPE-matched, with EPSS scores and the CISA KEV
+  flag end-to-end. CVSS v4.0 → v3.1 → v3.0 → v2 preference chain.
+- **Local exploit DB** — ~70 curated rules, ready-to-copy commands per
+  finding, default-credentials lookup.
+- **AI triage** — Anthropic Claude verifies CVEs against NVD, dismisses
+  false positives based on full host context, never auto-dismisses KEVs.
+  All host data is anonymized before leaving the box.
+- **Attack paths** — direct exploitable paths and pivot paths, ranked by
+  score, false-positives excluded by default.
+- **Engagement workflow** — owned / target / target-blocked markers,
+  per-host and per-service notes, bulk-FP across hosts that share a
+  product:port.
+- **UI** — React 19 + Sigma.js graph, drag-resizable sidebar, host detail
+  with KEV / EPSS / exploit-availability badges.
+- **Reports** — full-detail Markdown, JSON, and HTML exports.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
+## Quick start
+
+You'll need [Docker](https://www.docker.com/), Python 3.11+, and an
+[Anthropic API key](https://console.anthropic.com/) for the AI features.
+
+### 1. Clone and configure
 
 ```bash
-# Start Neo4j
-docker compose up -d
-
-# Install Cauldron
-pip install -e ".[all]"
-
-# Import your first scan
-cauldron brew path/to/scan.xml
-
-# See what's brewing
-cauldron taste
+git clone https://github.com/kodych/cauldron.git
+cd cauldron
+cp .env.example .env
+$EDITOR .env   # set CAULDRON_ANTHROPIC_API_KEY
 ```
 
-## CLI Commands
+### 2. Start Neo4j
 
-| Command | Description |
-|---------|-------------|
-| `cauldron brew <file>` | Import Nmap XML scan |
-| `cauldron brew --source "pivot-box" <file>` | Import with scan source |
-| `cauldron boil` | Run AI analysis |
-| `cauldron taste` | Show graph statistics |
-| `cauldron paths` | Show top attack paths |
-| `cauldron pour --format pdf` | Export report |
-| `cauldron reset` | Clear all data |
+```bash
+docker compose up -d
+```
+
+Browser UI at http://localhost:7474, default credentials `neo4j` /
+`cauldron`.
+
+### 3. Install Cauldron
+
+```bash
+pip install -e ".[all]"
+```
+
+### 4. Brew your first scan
+
+```bash
+cauldron brew data/samples/corporate_network.xml
+cauldron taste                 # graph stats
+cauldron boil --nvd --ai       # enrich with CVEs + AI triage
+cauldron paths                 # top attack paths
+```
+
+### 5. Open the UI
+
+```bash
+cauldron serve                 # starts the API on http://127.0.0.1:8000
+
+# in another terminal:
+cd frontend && npm install && npm run dev
+```
+
+The web UI runs at http://localhost:3000.
+
+## CLI reference
+
+| Command | Purpose |
+|---|---|
+| `cauldron brew <file>` | Import an Nmap or Masscan scan |
+| `cauldron brew --source <name> <file>` | Tag the scan with the network position it was run from |
+| `cauldron boil [--nvd] [--ai]` | Enrich with CVEs (NVD) and AI triage |
+| `cauldron taste` | Graph statistics |
+| `cauldron paths` | Top attack paths with exploit detail |
+| `cauldron condiments` | Per-host quick reference of guaranteed exploits |
+| `cauldron collect` | Extract host lists for downstream tools (Hydra, etc.) |
+| `cauldron serve` | Start the REST API for the web UI |
+| `cauldron pour --format md\|json\|html` | Export an engagement report |
+| `cauldron reset` | Wipe the graph |
+
+Run any command with `--help` for full options. By default, `serve` binds
+to `127.0.0.1` only — pass `-h 0.0.0.0` to expose the API on the local
+network (the API ships **without authentication**, so do this only
+deliberately).
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  Nmap XML   │────▶│    Parser    │────▶│   Neo4j     │
-│  Masscan    │     │              │     │   Graph DB  │
-└─────────────┘     └──────────────┘     └──────┬──────┘
-                                                │
-                    ┌──────────────┐             │
-                    │   Claude AI  │◀────────────┤
-                    │  - Classify  │             │
-                    │  - CVE Match │─────────────┤
-                    │  - Paths     │             │
-                    └──────────────┘             │
-                                                │
-                    ┌──────────────┐             │
-                    │   Web UI     │◀────────────┘
-                    │  React +     │
+┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
+│  Nmap XML   │────▶│   Parsers    │────▶│   Neo4j graph    │
+│  Masscan    │     │  + ingestion │     │   Host / Svc /   │
+└─────────────┘     └──────────────┘     │   Vuln / Path    │
+                                          └────────┬─────────┘
+                    ┌──────────────┐               │
+                    │  NVD / KEV / │◀──────────────┤
+                    │  EPSS / NSE  │     enrichment
+                    └──────────────┘               │
+                    ┌──────────────┐               │
+                    │  Claude AI   │◀──────────────┤
+                    │  triage +    │   anonymized
+                    │  attack chains│  context
+                    └──────────────┘               │
+                                                   │
+                    ┌──────────────┐               │
+                    │  Web UI      │◀──────────────┘
+                    │  React +     │       FastAPI
                     │  Sigma.js    │
                     └──────────────┘
 ```
 
-## Requirements
+For deeper detail, see [docs/architecture.md](docs/architecture.md).
 
-- Python 3.11+
-- Docker & Docker Compose (for Neo4j)
-- Anthropic API key (for AI features)
+## Configuration
+
+All settings are environment variables prefixed with `CAULDRON_`. See
+[.env.example](.env.example) for the full list. The most important ones:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CAULDRON_NEO4J_URI` | `bolt://localhost:7687` | Where Neo4j lives |
+| `CAULDRON_NEO4J_USER` | `neo4j` | |
+| `CAULDRON_NEO4J_PASSWORD` | `cauldron` | **change for production** |
+| `CAULDRON_ANTHROPIC_API_KEY` | _empty_ | Required for `boil --ai` |
+| `CAULDRON_AI_MODEL` | `claude-sonnet-4-6` | Override to swap models |
+| `CAULDRON_NVD_API_KEY` | _empty_ | Optional, lifts NVD rate limit |
+| `CAULDRON_SEGMENT_PREFIX_LEN` | `24` | Default subnet width for segmentation |
+| `CAULDRON_CORS_ORIGINS` | _local dev_ | Override allowed CORS origins |
 
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Install with dev tooling
+pip install -e ".[all]"
 
-# Run tests
-pytest
+# Backend
+ruff check cauldron/
+pytest tests/                  # 466 unit tests; DB-backed tests skip without Neo4j
 
-# Lint
-ruff check .
+# Frontend
+cd frontend
+npm install
+npm run dev                    # vite dev server with HMR
+npm run build                  # type-check + production bundle
 ```
 
-## Status
+See [docs/contributing.md](docs/contributing.md) for the full setup,
+testing, and PR workflow.
 
-🚧 **Under active development** — this is a master's thesis project.
+## Documentation
 
-- [x] Nmap XML parser
-- [x] Neo4j graph ingestion
-- [x] CLI interface
-- [x] Host role classification
-- [x] CVE enrichment
-- [x] AI attack path analysis
-- [x] REST API
-- [x] Web UI with graph visualization
-- [ ] Report generation
+- [docs/architecture.md](docs/architecture.md) — system overview, data flow, Neo4j schema
+- [docs/cli.md](docs/cli.md) — full CLI reference
+- [docs/api.md](docs/api.md) — REST API endpoints (Swagger UI at `/docs`)
+- [docs/ai-triage.md](docs/ai-triage.md) — how Claude is used for CVE triage
+- [docs/contributing.md](docs/contributing.md) — development and PR process
+
+## Acknowledgements
+
+- [Neo4j](https://neo4j.com/) for the graph database
+- [Anthropic Claude](https://www.anthropic.com/) for the AI triage
+- [Sigma.js](https://www.sigmajs.org/) for the WebGL graph rendering
+- [NVD](https://nvd.nist.gov/), [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog), and [FIRST EPSS](https://www.first.org/epss/) for the public vulnerability feeds
+- [Nmap](https://nmap.org/) and [Masscan](https://github.com/robertdavidgraham/masscan) for the scanners we ingest from
 
 ## License
 
-MIT
+[MIT](LICENSE).
