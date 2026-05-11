@@ -1171,19 +1171,31 @@ class TestCVEAppliesTo:
         """Apache httpd with no version: CVE pinned to 1.0.3 must drop."""
         assert _cve_applies_to(self.ANCIENT_CVE, "http_server", None) is False
 
-    def test_versionless_keeps_range_bounded_cve(self):
-        """Versionless service: range-bounded CVEs are kept because they
-        came from NVD with an explicit applicability window — the modern
-        vendor-CVE pattern. Ancient phantom CVEs pin a bare version with
-        no range (see `test_versionless_drops_pinned_ancient_cve`).
+    def test_versionless_drops_range_bounded_cve(self):
+        """Versionless service: range-bounded CVEs are dropped because we
+        cannot prove the unknown version falls inside the range.
 
-        Regression guard for the bug where CVE-2024-4040 (CrushFTP, range
-        10.0.0–10.7.1) and CVE-2024-37085 (ESXi) were being eaten by the
-        previous "unconstrained only" rule when the service had no known
-        version or the CPE was relaxed to a wildcard on retry. Recency
-        and severity are handled downstream by `_cve_is_gold`.
+        Policy reversal: the previous rule kept range-bounded CVEs on
+        versionless services because the operator might be running a
+        modern vendor product where nmap missed the version. That rule
+        produced unacceptable noise on legacy gear (Kioptrix-class boxes
+        where Samba 2.2.x without a detected version got attached to
+        every modern Samba 3.5+/4.x CVE).
+
+        Recovery path for the rarer modern-product-no-version case: the
+        operator re-runs nmap with stronger version detection
+        (``--script smb-version,smb-os-discovery`` / ``-sV
+        --version-intensity 9``) so the service gets a real version,
+        then re-enriches. With a real version the versioned branch
+        handles range comparison correctly. The wildcard-retry path
+        inside ``_query_nvd_cpe`` already threads the original service
+        version through ``service_version_override``, so CrushFTP /
+        ESXi-style vendor CVEs on services where nmap reported a patch
+        level that NVD didn't pin (the original reason for the looser
+        rule) still flow through the versioned branch — only services
+        with no version at all are affected.
         """
-        assert _cve_applies_to(self.RANGED_CVE, "http_server", None) is True
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", None) is False
 
     def test_versionless_keeps_unconstrained_cve(self):
         """CVE with wildcard CPE applies to any version — keep."""
@@ -1218,13 +1230,11 @@ class TestCVEAppliesTo:
     # --- Edge cases ---
 
     def test_unparseable_version_treated_as_versionless(self):
-        """A version string nmap couldn't parse behaves like "no version" —
-        range-bounded and unconstrained CVEs both pass, because with no
-        anchor we cannot verify the range but the range is a real
-        applicability window we trust. Recency and severity are enforced
-        downstream by `_cve_is_gold`.
+        """A version string nmap couldn't parse behaves like "no version".
+        Under the strict policy: range-bounded CVEs drop (we cannot
+        verify), unconstrained CVEs pass (apply regardless of version).
         """
-        assert _cve_applies_to(self.RANGED_CVE, "http_server", "unknown-build-xyz") is True
+        assert _cve_applies_to(self.RANGED_CVE, "http_server", "unknown-build-xyz") is False
         assert _cve_applies_to(self.UNCONSTRAINED_CVE, "http_server", "unknown-build-xyz") is True
 
     def test_other_product_ignored(self):
@@ -1254,13 +1264,19 @@ class TestCVEAppliesTo:
         # 6.5 deploy — no 6.5 entry in this CVE, must drop.
         assert _cve_applies_to(esxi_pinned_cve, "esxi", "6.5.0") is False
 
-    def test_range_bounded_cve_kept_for_unknown_version(self):
-        """CrushFTP services rarely expose a version — nmap reports
-        ``CrushFTP sftpd`` with no version field. The wildcard CPE query
-        returns range-bounded CVEs like CVE-2024-4040
-        (``versionStartIncluding=10.0.0 versionEndExcluding=10.7.1``).
-        Those must survive the applicability filter so flagship KEV CVEs
-        land on the service even without a version anchor.
+    def test_range_bounded_cve_dropped_for_unknown_version(self):
+        """The previous policy kept range-bounded CVEs on versionless
+        services to catch modern-vendor CVEs like CVE-2024-4040
+        (CrushFTP, range 10.0.0-10.7.1) even when nmap missed the
+        version. New policy reverses that: we cannot prove an unknown
+        version falls inside the range, and the same loose rule was
+        producing massive noise on legacy gear (Samba 2.2.x getting
+        every modern Samba 3.5+/4.x CVE attached).
+
+        Operator recovery path for the modern-vendor case: rescan with
+        stronger version detection (``-sV --version-intensity 9``,
+        product-specific NSE scripts) so the service ends up versioned
+        and the range comparison can actually run.
         """
         crushftp_ranged_cve = {
             "configurations": [{
@@ -1273,10 +1289,38 @@ class TestCVEAppliesTo:
                 }]
             }]
         }
-        assert _cve_applies_to(crushftp_ranged_cve, "crushftp", None) is True
-        # And when we DO know the version, range matching still works.
+        # Versionless: dropped, we cannot prove applicability.
+        assert _cve_applies_to(crushftp_ranged_cve, "crushftp", None) is False
+        # With a version inside the range -- kept.
         assert _cve_applies_to(crushftp_ranged_cve, "crushftp", "10.3.0") is True
+        # With a version outside the range -- dropped.
         assert _cve_applies_to(crushftp_ranged_cve, "crushftp", "10.7.1") is False
+
+    def test_kioptrix_samba_modern_cve_dropped_when_versionless(self):
+        """Regression test for the operator's Kioptrix critique: Samba
+        smbd is detected (product known) but nmap could not extract a
+        version on this old SMB1-only stack. A modern Samba CVE with
+        range 3.5.0-4.6.4 (CVE-2017-7494 shape) must drop on a
+        versionless service, because the host could equally be Samba
+        2.2.x (out of range) or modern Samba (in range), and the modern
+        case is recoverable by rescanning with ``--script smb-version``.
+        """
+        samba_modern_cve = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [{
+                        "criteria": "cpe:2.3:a:samba:samba:*:*:*:*:*:*:*:*",
+                        "versionStartIncluding": "3.5.0",
+                        "versionEndExcluding": "4.6.4",
+                    }]
+                }]
+            }]
+        }
+        assert _cve_applies_to(samba_modern_cve, "samba", None) is False
+        # Versioned with a Samba 2.2.x — out of range, dropped.
+        assert _cve_applies_to(samba_modern_cve, "samba", "2.2.1a") is False
+        # Versioned with a Samba 4.0 — in range, kept.
+        assert _cve_applies_to(samba_modern_cve, "samba", "4.0.0") is True
 
     def test_na_marker_treated_as_unverifiable(self):
         """NVD sometimes tags CVEs with CPE version = '-' (Not Applicable).

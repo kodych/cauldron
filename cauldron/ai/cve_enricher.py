@@ -1271,24 +1271,29 @@ def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> 
 
     versionless = not version or _extract_version(version) == "*"
     if versionless:
-        # Keep the CVE if at least one CPE entry is either:
-        #   (a) truly unconstrained (version=``*`` with no range), OR
-        #   (b) an explicit version range (versionStart/End*).
+        # Without a service version we cannot prove a range-bound CVE
+        # applies. The old rule kept CVEs whose CPE config had ANY
+        # range (versionStart/End*), assuming "range = legitimate
+        # modern-vendor CVE." But this lets modern Samba CVEs (range
+        # 3.5.0-4.6.4) land on a versionless Samba service that could
+        # equally be Samba 2.2.x running on Kioptrix — and the
+        # operator can't tell the false positives from the real
+        # findings without manually cross-referencing every CPE
+        # config.
         #
-        # Entries pinned to a bare specific version (``apache:1.0.3``) with
-        # no range are the phantom-CVE pattern we want to drop — they cannot
-        # be verified against an unknown service version and almost always
-        # represent 1990s CVEs that NVD still indexes under the product.
-        # Modern vendor CVEs (ESXi, CrushFTP, Apache 2.4) carry proper
-        # ranges; those we keep and let the gold filter enforce recency.
-        def _applicable(m: dict) -> bool:
-            if not _cpe_entry_has_version_constraint(m):
-                return True  # unconstrained — always applicable
-            return any(m.get(k) for k in (
-                "versionStartIncluding", "versionStartExcluding",
-                "versionEndIncluding", "versionEndExcluding",
-            ))
-        return any(_applicable(m) for m in matches)
+        # New rule: keep only when at least one CPE entry is truly
+        # unconstrained (version=``*`` with no range markers).
+        # Unconstrained = "this CVE affects every version of the
+        # product" — that claim holds regardless of which version
+        # is actually running. Range-bound CVEs (we don't know if
+        # our version is in or out of the range) get dropped here.
+        #
+        # FN recovery path: the operator re-scans with
+        # ``--script smb-version,smb-os-discovery`` (or similar) to
+        # upgrade the service to versioned, then re-enriches.
+        # Versioned services skip this branch entirely and use the
+        # range-comparison logic below.
+        return any(not _cpe_entry_has_version_constraint(m) for m in matches)
 
     # Versioned: require the service version to fall inside at least one
     # entry's range (or to match a pinned version at major.minor).
