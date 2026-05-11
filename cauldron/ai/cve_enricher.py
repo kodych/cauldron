@@ -448,6 +448,197 @@ def _get_cpe_for_service(cpe_list: list[str], product: str | None, version: str 
     return None
 
 
+# --- Banner-token CPE resolver ---
+#
+# nmap's -sV often emits sub-product info that doesn't make it into the
+# structured product/version fields:
+#   - compound product string  : "Apache/1.3.20 (Unix) mod_ssl/2.8.4 OpenSSL/0.9.6b"
+#   - extrainfo attribute      : "(Unix) (Red-Hat/Linux) mod_ssl/2.8.4 OpenSSL/0.9.6b"
+#   - NSE script outputs       : http-server-header echoing the same banner
+#
+# NVD frequently registers CVEs against the sub-product CPE (mod_ssl:mod_ssl:2.8.4)
+# rather than the parent (apache:http_server:1.3.20). To surface those we
+# tokenize banner sources into (name, version) pairs and resolve each one to a
+# canonical CPE via NVD's CPE Dictionary -- the dictionary IS the lookup, so
+# we don't maintain a static name->vendor:product mapping that drifts. Tokens
+# that don't correspond to real NVD entries (e.g. "Red-Hat/Linux") self-filter
+# by returning zero matches.
+
+NVD_CPE_BASE = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
+
+# (name, "/", version). The name allows letters/digits/underscores/dashes/dots
+# but must start with a letter so we don't pick up "1.2.3/4.5.6". A 2-character
+# minimum drops single-letter false positives. Version must start with a digit
+# so we don't match "foo/bar".
+_BANNER_TOKEN_RE = re.compile(r"\b([A-Za-z][\w.-]{1,})/(\d[\w.-]*)")
+
+# Session-scoped cache. Key = (name.lower(), version).
+# Value = canonical CPE 2.3 string, or "" sentinel meaning "queried, NVD has
+# no record" -- both avoid repeat lookups within a single boil --nvd run.
+_cpe_resolution_cache: dict[tuple[str, str], str] = {}
+
+
+def _extract_banner_tokens(*sources: str | None) -> list[tuple[str, str]]:
+    """Find (name, version) pairs in one or more banner-shaped strings.
+
+    Used to detect sub-products inside compound nmap banners and script
+    outputs. Returns deduplicated pairs preserving first-seen order. Junk
+    tokens are not filtered here -- ``_resolve_banner_token`` rejects them
+    via the NVD dictionary returning zero hits.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for src in sources:
+        if not src:
+            continue
+        for m in _BANNER_TOKEN_RE.finditer(src):
+            name, version = m.group(1), m.group(2)
+            key = (name.lower(), version)
+            if key not in seen:
+                seen.add(key)
+                out.append((name, version))
+    return out
+
+
+def _resolve_banner_token(name: str, version: str) -> str | None:
+    """Look up the canonical NVD CPE 2.3 for a (name, version) banner token.
+
+    Asks NVD's CPE Dictionary with version pinned and vendor wildcarded:
+    ``cpe:2.3:a:*:<name>:<version>:*:*:*:*:*:*:*``. NVD returns the real
+    canonical CPE(s) matching that shape. When NVD has no record (the token
+    was garbage like 'Red-Hat/Linux'), we cache a sentinel and skip retries.
+
+    Returns the canonical CPE string, or None when no match exists.
+
+    Honors the existing ``_rate_limit()`` (0.7 s/req with key, 6.5 s without).
+    On HTTP 429 we back off 6 s / 12 s and retry up to twice -- NVD's "soft"
+    throttling lives outside the documented 50/30 s window, so the resolver
+    stays safe even when the global rate-limit constant is calibrated to
+    the technical ceiling.
+    """
+    key = (name.lower(), version)
+    cached = _cpe_resolution_cache.get(key)
+    if cached is not None:
+        return cached or None
+
+    cpe_match = f"cpe:2.3:a:*:{name.lower()}:{version}:*:*:*:*:*:*:*"
+    url = f"{NVD_CPE_BASE}?cpeMatchString={urllib.request.quote(cpe_match)}&resultsPerPage=20"
+
+    headers = {"User-Agent": "Cauldron/0.1.0"}
+    if settings.nvd_api_key:
+        headers["apiKey"] = settings.nvd_api_key
+
+    products: list[dict] | None = None
+    for attempt in range(3):
+        _rate_limit()
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                products = json.loads(resp.read()).get("products", [])
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                backoff = 6.0 * (2 ** attempt)  # 6 s, 12 s -- NVD's recommended sleep
+                logger.info(
+                    "NVD 429 on CPE resolve %s/%s, sleeping %.0fs (attempt %d/3)",
+                    name, version, backoff, attempt + 1,
+                )
+                time.sleep(backoff)
+                continue
+            logger.info(
+                "NVD CPE resolve %s/%s returned HTTP %d -- caching as not-found",
+                name, version, e.code,
+            )
+            _cpe_resolution_cache[key] = ""
+            return None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            # Transient -- don't cache. Next caller may succeed.
+            logger.warning("NVD CPE resolve transient failure for %s/%s: %s", name, version, e)
+            return None
+
+    if products is None:
+        return None
+
+    # Keep only application-typed CPEs (we tokenize app banners).
+    app_cpes = [
+        p.get("cpe", {}).get("cpeName", "")
+        for p in products
+    ]
+    app_cpes = [m for m in app_cpes if m and len(m.split(":")) >= 13 and m.split(":")[2] == "a"]
+
+    if not app_cpes:
+        _cpe_resolution_cache[key] = ""
+        return None
+
+    # Return the vendor-wildcarded form, not the canonical vendor:product.
+    # NVD's CPE Dictionary canonicalizes some products under one vendor
+    # (e.g. mod_ssl is filed as modssl:mod_ssl, nginx as nginx:nginx) but
+    # the historic CVE records reference different vendor strings for the
+    # same product (mod_ssl:mod_ssl for the old Slapper CVE-2002-0082;
+    # f5:nginx for every real nginx CVE). A canonical-form CVE query
+    # silently misses those.
+    #
+    # cpeMatchString returning non-empty above is enough proof that NVD
+    # has at least one real entry for this product+version; the wildcard
+    # vendor form lets the downstream _query_nvd_cpe sweep up every CVE
+    # filed under any vendor string for the same product, including
+    # historic ones the dictionary never backfilled.
+    result = f"cpe:2.3:a:*:{name.lower()}:{version}:*:*:*:*:*:*:*"
+    _cpe_resolution_cache[key] = result
+    return result
+
+
+def _build_cpe_candidates(
+    cpe_list: list[str],
+    product: str | None,
+    version: str | None,
+    extra_info: str | None = None,
+    script_outputs: list[str] | None = None,
+) -> list[str]:
+    """All CPE 2.3 candidates for a service, deduplicated.
+
+    Combines three sources, in priority order:
+      1. The primary CPE from ``_get_cpe_for_service`` (nmap-emitted or
+         PRODUCT_CPE_MAP fallback).
+      2. Any other nmap-emitted CPEs from the same service, converted to 2.3.
+      3. Sub-product tokens extracted from ``extra_info``, the ``product``
+         field when it carries a compound banner, and NSE script outputs --
+         each resolved through NVD's CPE Dictionary.
+
+    (1) and (2) are offline / deterministic. (3) may make NVD calls
+    (cached session-wide). Junk tokens self-filter via NVD returning zero
+    hits, so we don't need a static name -> vendor:product map.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(cpe: str | None) -> None:
+        if cpe and cpe not in seen:
+            seen.add(cpe)
+            candidates.append(cpe)
+
+    primary = _get_cpe_for_service(cpe_list, product, version)
+    _add(primary)
+
+    for raw in cpe_list:
+        _add(_cpe22_to_23(raw))
+
+    # Compound-product detection: only tokenize the product field if it
+    # contains multiple Name/Version patterns (i.e. nmap dumped the whole
+    # banner there). For structured products like "Apache httpd" the regex
+    # won't match anyway, so this is just an explicit skip-the-common-case.
+    sources: list[str | None] = [extra_info]
+    if product and sum(1 for _ in _BANNER_TOKEN_RE.finditer(product)) >= 2:
+        sources.append(product)
+    if script_outputs:
+        sources.extend(script_outputs)
+
+    for name, ver in _extract_banner_tokens(*sources):
+        _add(_resolve_banner_token(name, ver))
+
+    return candidates
+
+
 # --- Pentester relevance filter ---
 
 # CWE IDs that are high-impact for red team / pentesting
@@ -1190,7 +1381,18 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         cvss_vector = cvss_data.get("vectorString")
         severity = metrics["cvssMetricV2"][0].get("baseSeverity")
 
-    # Check for known exploits in references
+    # Check for known exploits in references.
+    #
+    # Primary signal: NVD's own "Exploit" tag on a reference. Coverage is
+    # uneven for pre-2010 CVEs (NVD's tagging system was retrofitted), so
+    # we also recognize a few path-scoped URL patterns that are nearly
+    # always PoC hosts -- enough to catch famous old-system vulns (Slapper,
+    # Samba trans2open) that NVD never backfilled with an Exploit tag.
+    #
+    # Path-scoped, not domain-scoped: rapid7.com is mostly marketing, but
+    # /db/modules/exploit/ is the Metasploit-module catalog. Same for
+    # packetstormsecurity.com -- the front page is news, but /files/ is
+    # the upload archive where actual PoCs live.
     has_exploit = False
     exploit_url = None
     for ref in cve_data.get("references", []):
@@ -1200,7 +1402,13 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
             exploit_url = ref.get("url")
             break
         ref_url = ref.get("url", "")
-        if "exploit-db.com" in ref_url or ("github.com" in ref_url and "exploit" in ref_url.lower()):
+        ref_url_l = ref_url.lower()
+        if (
+            "exploit-db.com" in ref_url_l
+            or ("github.com" in ref_url_l and "exploit" in ref_url_l)
+            or "packetstormsecurity.com/files/" in ref_url_l
+            or ("rapid7.com" in ref_url_l and "/db/modules/exploit/" in ref_url_l)
+        ):
             has_exploit = True
             exploit_url = ref_url
             break
@@ -1245,16 +1453,26 @@ def enrich_service(
     version: str,
     cache: CVECache | None = None,
     cpe_list: list[str] | None = None,
+    extra_info: str | None = None,
+    script_outputs: list[str] | None = None,
 ) -> EnrichmentResult:
     """Find CVEs for a specific service.
 
-    Uses CPE-based matching when available, falls back to keyword search.
+    Builds the full set of CPE candidates (nmap-emitted plus sub-product
+    tokens resolved via NVD's CPE Dictionary), queries NVD per candidate,
+    and unions the results. Falls back to keyword search only when no
+    candidate yields anything.
 
     Args:
         product: Software product name (e.g. "OpenSSH", "Apache httpd")
         version: Version string (e.g. "7.4", "2.4.49")
         cache: Optional CVE cache instance.
         cpe_list: CPE URIs from nmap service detection.
+        extra_info: nmap's ``<service extrainfo="...">`` attribute -- often
+            contains sub-product info ("(Unix) mod_ssl/2.8.4 OpenSSL/0.9.6b")
+            that doesn't reach the structured product/version fields.
+        script_outputs: NSE script outputs for this service (e.g.
+            http-server-header), used to extract sub-product tokens.
 
     Returns:
         EnrichmentResult with found CVEs.
@@ -1265,52 +1483,67 @@ def enrich_service(
     if cache is None:
         cache = CVECache()
 
-    # Determine best query strategy
-    cpe23 = _get_cpe_for_service(cpe_list or [], product, version)
+    # Build the full candidate list. Sub-product tokens (mod_ssl, OpenSSL,
+    # log4j) are resolved through NVD's CPE Dictionary on the fly -- see
+    # _resolve_banner_token. Cached session-wide so re-runs are free.
+    candidates = _build_cpe_candidates(
+        cpe_list or [], product, version,
+        extra_info=extra_info, script_outputs=script_outputs,
+    )
 
-    # Cache key: CPE-based if available, else product:version
-    cache_key = cpe23 if cpe23 else f"kw:{product.lower().strip()}:{(version or '').lower().strip()}"
+    # Cache key. Multi-candidate services pin to the full sorted candidate
+    # list so re-runs with the same nmap data hit cache, but a service that
+    # gains an extra sub-product (e.g. operator added http-server-header to
+    # the scan) doesn't read a stale empty list from before.
+    if candidates:
+        cache_key = "+".join(sorted(candidates))
+    else:
+        cache_key = f"kw:{product.lower().strip()}:{(version or '').lower().strip()}"
 
-    # Check cache
     cached = cache.get(cache_key)
     if cached is not None:
         return EnrichmentResult(product=product, version=version or "", cves=cached, from_cache=True)
 
-    # Query NVD. NvdTransientError bubbles up from _execute_nvd_query when
-    # NVD is unreachable after retries — we refuse to cache that outcome
-    # (empty list from a failed query would silently hide real CVEs for a
-    # week). Every other outcome (including a legitimate empty result) is
-    # authoritative and gets cached.
+    # Query NVD per candidate, union by CVE ID. NvdTransientError bubbles
+    # up from _execute_nvd_query when NVD is unreachable after retries --
+    # we refuse to cache that outcome (an empty list from a failed query
+    # would silently hide real CVEs for a week). Every other outcome
+    # (including a legitimate empty result) is authoritative and gets cached.
     cves: list[CVEInfo] = []
     try:
-        if cpe23:
-            cpe_result = _query_nvd_cpe(cpe23)
-            if cpe_result is None:
-                # CPE not recognized by NVD (404) — fall back to keyword search.
-                # Applies the three-rule strategy: if we have a parseable version,
-                # search "product version"; otherwise search by product alone and
-                # let _query_nvd_keyword return top-critical recent entries.
+        if candidates:
+            unioned: dict[str, CVEInfo] = {}
+            for cpe23 in candidates:
+                cpe_result = _query_nvd_cpe(cpe23, service_version_override=version)
+                if cpe_result is None:
+                    # NVD 404 on this CPE -- skip silently. Other candidates
+                    # may still resolve. We try keyword fallback only when
+                    # every candidate came back 404 or empty (handled below).
+                    continue
+                if not cpe_result and _has_specific_version(cpe23):
+                    # Vendor pinned CVEs to major version only (esxi:8.0 vs
+                    # esxi:8.0.3). Retry once with version wildcarded; the
+                    # service_version_override keeps the applicability filter
+                    # honest -- see _query_nvd_cpe docstring.
+                    relaxed = _relax_cpe_version(cpe23)
+                    if relaxed and relaxed != cpe23:
+                        cpe_result = _query_nvd_cpe(relaxed, service_version_override=version) or []
+                for cve in cpe_result:
+                    if cve.cve_id not in unioned:
+                        unioned[cve.cve_id] = cve
+            cves = list(unioned.values())
+
+            # Keyword fallback only when zero candidates produced anything.
+            # When at least one candidate returned CVEs, suppress the noisy
+            # keyword pass -- it would re-find the same gold and add product
+            # noise via keyword matching on the verbose compound product.
+            if not cves:
                 clean_ver = _extract_version(version)
-                logger.info("CPE 404 for %s, falling back to keyword: %s %s", cpe23, product, clean_ver)
+                logger.info(
+                    "All %d CPE candidates returned empty for %s, trying keyword %s %s",
+                    len(candidates), product, product, clean_ver,
+                )
                 cves = _query_nvd_keyword(product, clean_ver)
-            elif not cpe_result and _has_specific_version(cpe23):
-                # Specific-version query returned zero CVEs. Common NVD quirk: a
-                # vendor pins CVEs to major version only (e.g.
-                # vmware:vcenter_server:7.0) but nmap reports a patch level
-                # (7.0.3), so literal match fails. Retry once with the version
-                # wildcarded out — works across vendors (not a product-specific
-                # hack), and preserves the "top-critical CVEs for this service"
-                # principle because _query_nvd_cpe still filters by CVSS.
-                relaxed = _relax_cpe_version(cpe23)
-                if relaxed and relaxed != cpe23:
-                    logger.info("CPE %s returned 0 CVEs, retrying with %s", cpe23, relaxed)
-                    # Thread the original service version so the applicability
-                    # filter can still do range/major.minor matching — without
-                    # this the relaxed CPE falls into the unconstrained-only
-                    # rule and drops every modern vendor CVE.
-                    cves = _query_nvd_cpe(relaxed, service_version_override=version) or []
-            else:
-                cves = cpe_result
         elif version:
             clean_ver = _extract_version(version)
             if clean_ver != "*":
@@ -1318,10 +1551,10 @@ def enrich_service(
             else:
                 return EnrichmentResult(product=product, version=version or "", error="No parseable version")
         else:
-            # No CPE and no version — skip (too noisy)
+            # No CPE and no version -- skip (too noisy)
             return EnrichmentResult(product=product, version="", error="No CPE and no version")
     except NvdTransientError as e:
-        # NVD failed transiently — skip without caching. Next run will
+        # NVD failed transiently -- skip without caching. Next run will
         # retry with a clean slate instead of reading a poisoned empty
         # result out of the 7-day cache.
         logger.warning("NVD transient failure for %s %s: %s", product, version or "", e)
@@ -1374,30 +1607,69 @@ def enrich_services_from_graph(
     with get_session() as session:
         # Get services with CPE or product info that have no NVD CVEs yet.
         # Services with only exploit_db/ai CVEs still get NVD enrichment.
+        #
+        # extra_info and script_* properties are pulled too -- the candidate
+        # builder tokenizes them for sub-product CPE resolution (mod_ssl,
+        # OpenSSL, log4j tucked inside compound banners and script outputs).
+        # Script outputs are stored as svc.script_<id> properties by
+        # _upsert_script_result, so we project them via [k IN keys(s) ...].
+        #
+        # host_ip / port / protocol come along so we can link CVEs back to
+        # the exact services that produced each candidate set -- the
+        # product+version fallback fails for services whose product is a
+        # compound banner and version is null (Apache+mod_ssl+OpenSSL on
+        # :443 in nmap's output).
         result = session.run(
             """
             MATCH (h:Host)-[:HAS_SERVICE]->(s:Service)
             WHERE (s.cpe IS NOT NULL OR s.product IS NOT NULL)
             AND NOT (s)-[:HAS_VULN]->(:Vulnerability {source: 'nvd'})
-            RETURN DISTINCT
+            RETURN
+                h.ip AS host_ip,
+                s.port AS port,
+                s.protocol AS protocol,
                 s.product AS product,
                 s.version AS version,
-                s.cpe AS cpe
+                s.cpe AS cpe,
+                s.extra_info AS extra_info,
+                [k IN keys(s) WHERE k STARTS WITH 'script_' | s[k]] AS script_outputs
             """
         )
 
-        services = [(r["product"], r["version"], r["cpe"]) for r in result]
+        services = [
+            (
+                r["host_ip"], r["port"], r["protocol"],
+                r["product"], r["version"], r["cpe"],
+                r["extra_info"], r["script_outputs"] or [],
+            )
+            for r in result
+        ]
 
-    # Deduplicate by cache key to avoid querying same product twice
-    seen_keys: set[str] = set()
-    unique_services = []
-    for product, version, cpe_str in services:
+    # Group services by their candidate set. Services with identical
+    # candidates share one NVD enrichment pass; the resulting CVEs link to
+    # every endpoint in the group. The key now reflects the full CPE
+    # candidate list (including resolved sub-products), so two services
+    # with the same primary CPE but different sub-products (mod_ssl on
+    # one, not on the other) get separate NVD passes.
+    from collections import defaultdict
+    groups: dict[str, dict] = defaultdict(lambda: {"endpoints": [], "rep": None})
+    for host_ip, port, protocol, product, version, cpe_str, extra_info, script_outputs in services:
         cpe_list = cpe_str.split(";") if cpe_str else []
-        cpe23 = _get_cpe_for_service(cpe_list, product, version)
-        key = cpe23 if cpe23 else f"kw:{(product or '').lower()}:{(version or '').lower()}"
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_services.append((product, version, cpe_list))
+        candidates = _build_cpe_candidates(
+            cpe_list, product, version, extra_info=extra_info, script_outputs=script_outputs,
+        )
+        if candidates:
+            key = "+".join(sorted(candidates))
+        else:
+            key = f"kw:{(product or '').lower()}:{(version or '').lower()}"
+        groups[key]["endpoints"].append((host_ip, port, protocol))
+        if groups[key]["rep"] is None:
+            groups[key]["rep"] = (product, version, cpe_list, extra_info, script_outputs)
+
+    unique_services = [
+        (g["rep"][0], g["rep"][1], g["rep"][2], g["rep"][3], g["rep"][4], g["endpoints"])
+        for g in groups.values()
+    ]
 
     logger.info(
         "Found %d unique services to enrich (%d total before dedup)",
@@ -1406,7 +1678,7 @@ def enrich_services_from_graph(
     )
 
     total = len(unique_services)
-    for idx, (product, version, cpe_list) in enumerate(unique_services, 1):
+    for idx, (product, version, cpe_list, extra_info, script_outputs, endpoints) in enumerate(unique_services, 1):
         stats["services_checked"] += 1
         if progress_callback:
             label = f"{product or '?'}{(' ' + version) if version else ''}"
@@ -1414,7 +1686,10 @@ def enrich_services_from_graph(
                 progress_callback(idx, total, f"NVD: {label}")
             except Exception:  # noqa: BLE001
                 pass
-        enrichment = enrich_service(product or "", version or "", cache, cpe_list)
+        enrichment = enrich_service(
+            product or "", version or "", cache, cpe_list,
+            extra_info=extra_info, script_outputs=script_outputs,
+        )
 
         if enrichment.error:
             # "No CPE and no version" / "Missing product" — not real errors,
@@ -1429,9 +1704,13 @@ def enrich_services_from_graph(
             stats["from_cache"] += 1
         else:
             stats["api_calls"] += 1
-            # Track query type
-            cpe23 = _get_cpe_for_service(cpe_list, product, version)
-            if cpe23:
+            # Track query type. Any resolved candidate counts as a CPE query;
+            # the keyword path only fires when zero candidates produced CVEs.
+            candidates = _build_cpe_candidates(
+                cpe_list, product, version,
+                extra_info=extra_info, script_outputs=script_outputs,
+            )
+            if candidates:
                 stats["cpe_queries"] += 1
             else:
                 stats["keyword_queries"] += 1
@@ -1440,10 +1719,17 @@ def enrich_services_from_graph(
             stats["services_with_cves"] += 1
             stats["total_cves_found"] += len(enrichment.cves)
 
-            # Write CVEs to Neo4j — link to ALL services matching this product+version or CPE
+            # Write CVEs to Neo4j -- link to the exact (host, port) tuples
+            # that produced this candidate set. Direct linking via
+            # target_endpoints because the product+version / CPE-prefix
+            # fallback fails for compound-banner services (Apache+mod_ssl
+            # on :443 in nmap output).
             with get_session() as session:
                 for cve in enrichment.cves:
-                    _upsert_vulnerability(session, product or "", version or "", cpe_list, cve)
+                    _upsert_vulnerability(
+                        session, product or "", version or "", cpe_list, cve,
+                        target_endpoints=endpoints,
+                    )
 
     return stats
 
@@ -1584,6 +1870,7 @@ def _upsert_vulnerability(
     version: str,
     cpe_list: list[str],
     cve: CVEInfo,
+    target_endpoints: list[tuple[str, int, str]] | None = None,
 ) -> None:
     """Create/update Vulnerability node and link to matching services.
 
@@ -1592,6 +1879,15 @@ def _upsert_vulnerability(
     every other host sharing the same CVE ID. Default for NVD-sourced
     findings is 'check'; script_upgrades or AI triage can lift a
     specific edge to 'likely' / 'confirmed' independently.
+
+    Linking strategy:
+      * If ``target_endpoints`` is provided (list of (ip, port, protocol)
+        tuples), link only to those exact services. Used by the multi-CPE
+        candidate enricher, where the caller already knows which services
+        produced each candidate set.
+      * Otherwise fall back to matching services by product+version and by
+        CPE prefix. Kept for backward compatibility with callers that
+        don't have explicit endpoint info.
     """
     session.run(
         """
@@ -1626,7 +1922,22 @@ def _upsert_vulnerability(
         cisa_kev_added=cve.cisa_kev_added,
     )
 
-    # Link to matching services by product+version. The earlier
+    # Direct endpoint linking -- caller knows exactly which services to
+    # attach this CVE to (multi-CPE candidate path).
+    if target_endpoints:
+        for ip, port, protocol in target_endpoints:
+            session.run(
+                """
+                MATCH (s:Service {host_ip: $ip, port: $port, protocol: $protocol})
+                MATCH (v:Vulnerability {cve_id: $cve_id})
+                MERGE (s)-[rel:HAS_VULN]->(v)
+                ON CREATE SET rel.confidence = 'check'
+                """,
+                ip=ip, port=port, protocol=protocol, cve_id=cve.cve_id,
+            )
+        return
+
+    # Legacy fallback: link by product+version. The earlier
     # surface-based pre-filter has been removed — AI triage now reads
     # the CVE description plus the host's full service inventory and
     # makes the keep/dismiss call directly.
