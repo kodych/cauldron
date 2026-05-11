@@ -1441,7 +1441,7 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         cvss=cvss,
         cvss_vector=cvss_vector,
         severity=severity,
-        description=description[:500],
+        description=_truncate_at_word(description, 1000),
         has_exploit=has_exploit,
         exploit_url=exploit_url,
         cwe_ids=cwe_ids,
@@ -1449,6 +1449,28 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         in_cisa_kev=in_cisa_kev,
         cisa_kev_added=cisa_kev_added,
     )
+
+
+def _truncate_at_word(text: str, max_chars: int) -> str:
+    """Cut a long string near max_chars, on a whitespace boundary, with an ellipsis.
+
+    NVD descriptions used to be hard-sliced at 500 characters via ``[:500]``,
+    which routinely cut mid-word ("the specific data depends on many factors
+    incl") -- ugly in the markdown report and made the description harder
+    to read at the breakpoint. This helper:
+
+      - Returns the text unchanged if it's already within budget.
+      - Otherwise rewinds to the previous whitespace and appends ``…``.
+      - Falls back to a hard slice when no whitespace exists in the
+        budget window (defensive — keeps the function total).
+    """
+    if not text or len(text) <= max_chars:
+        return text or ""
+    cut = text[:max_chars]
+    last_space = cut.rfind(" ")
+    if last_space > max_chars * 0.5:  # keep at least half the budget
+        cut = cut[:last_space]
+    return cut.rstrip(" .,;:") + "…"
 
 
 # --- Public API ---

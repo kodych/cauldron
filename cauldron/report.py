@@ -114,6 +114,46 @@ def _query_hosts_with_vulns() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _query_host_services() -> dict[str, list[dict]]:
+    """Per-host service inventory keyed by host IP.
+
+    Pulls each Service node with the fields a pentester wants up-front
+    (port, proto, name, product, version, extras). Used to render an
+    "Services per host" block in the report so the operator sees the
+    actual stack ("Apache 1.3.20 + mod_ssl/2.8.4 + OpenSSL/0.9.6b")
+    before reading the CVE list. The CVE list alone reveals findings
+    but hides context — a finding on ``Apache httpd 1.3.20`` reads
+    completely differently when you can see the host also runs
+    ``OpenSSH 2.9p2`` and SMB without a detected version.
+    """
+    with get_session() as s:
+        rows = list(s.run("""
+            MATCH (h:Host)-[:HAS_SERVICE]->(svc:Service)
+            WHERE svc.state = 'open' AND (svc.is_stale IS NULL OR svc.is_stale = false)
+            RETURN h.ip AS ip,
+                   svc.port AS port,
+                   svc.protocol AS protocol,
+                   svc.name AS name,
+                   svc.product AS product,
+                   svc.version AS version,
+                   svc.extra_info AS extra_info,
+                   svc.bruteforceable AS bruteforceable
+            ORDER BY h.ip, svc.port
+        """))
+    by_ip: dict[str, list[dict]] = {}
+    for r in rows:
+        by_ip.setdefault(r["ip"], []).append({
+            "port": r["port"],
+            "protocol": r["protocol"],
+            "name": r["name"],
+            "product": r["product"],
+            "version": r["version"],
+            "extra_info": r["extra_info"],
+            "bruteforceable": bool(r.get("bruteforceable")),
+        })
+    return by_ip
+
+
 def _query_findings_grouped() -> list[dict]:
     """Get findings grouped by CVE — one CVE with list of affected hosts.
 
@@ -263,6 +303,7 @@ def _collect_report_data(top: int = 0, include_notes: bool = False) -> dict:
     roles = get_host_role_distribution()
     sources = _query_scan_sources()
     hosts = _query_hosts_with_vulns()
+    host_services = _query_host_services()
     findings = _query_findings_grouped()
     vuln_stats = _query_vuln_stats()
     checked = _query_checked_vulns()
@@ -281,6 +322,7 @@ def _collect_report_data(top: int = 0, include_notes: bool = False) -> dict:
         "roles": roles,
         "scan_sources": sources,
         "hosts": hosts,
+        "host_services": host_services,
         "findings": findings_out,
         "vuln_stats": vuln_stats,
         "checked_vulns": checked,
@@ -604,6 +646,52 @@ def generate_markdown(top: int = 0, include_notes: bool = False) -> str:
                 row_cells.append(notes_by_ip.get(ip, "-"))
             w("| " + " | ".join(row_cells) + " |")
         w()
+
+        # Per-host service inventory. The summary table above shows
+        # counts; this block surfaces the actual product / version
+        # stack. A pentester reading CVE-2002-0082 (mod_ssl Slapper) at
+        # the top of the report should be able to see "yes, host runs
+        # Apache 1.3.20 + mod_ssl/2.8.4 + OpenSSL/0.9.6b" right here
+        # without going back to nmap output.
+        host_services = data.get("host_services") or {}
+        if host_services:
+            w("#### Services per vulnerable host")
+            w()
+            for h in vuln_hosts:
+                svcs = host_services.get(h["ip"]) or []
+                if not svcs:
+                    continue
+                hostname_suffix = f" ({h['hostname']})" if h.get("hostname") else ""
+                w(f"**{h['ip']}{hostname_suffix}** — {h.get('role') or 'unknown'}"
+                  f"{(' · ' + (h.get('os') or '')) if h.get('os') else ''}")
+                w()
+                w("| Port | Proto | Service | Product | Version | Extras |")
+                w("|---|---|---|---|---|---|")
+                for s in svcs:
+                    port = str(s.get("port", "?"))
+                    proto = s.get("protocol") or "?"
+                    name = s.get("name") or "-"
+                    product = s.get("product") or "-"
+                    version = s.get("version") or ("_unknown_" if product != "-" else "-")
+                    # Format extras: compact, only useful signals.
+                    extras: list[str] = []
+                    if s.get("bruteforceable"):
+                        extras.append("brute")
+                    if s.get("extra_info"):
+                        ei = s["extra_info"].replace("\n", " ").replace("|", "/")[:60]
+                        extras.append(ei)
+                    extras_cell = "; ".join(extras) if extras else "-"
+                    # Markdown table cells can't contain literal pipes
+                    cells = [
+                        port,
+                        proto,
+                        name.replace("|", "/"),
+                        product.replace("|", "/"),
+                        version.replace("|", "/"),
+                        extras_cell.replace("|", "/"),
+                    ]
+                    w("| " + " | ".join(cells) + " |")
+                w()
 
     if clean_hosts:
         w(f"### Clean Hosts ({len(clean_hosts)})")
