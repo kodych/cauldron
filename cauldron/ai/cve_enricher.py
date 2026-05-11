@@ -174,6 +174,19 @@ class CVEInfo:
     # has_exploit, which only means a PoC exists somewhere).
     in_cisa_kev: bool = False
     cisa_kev_added: str | None = None  # ISO date CISA added it
+    # Whether the CPE this CVE matched on had a pinned version (either
+    # the CPE itself or a service_version_override threaded through the
+    # wildcard-retry path). Set by ``_query_nvd_cpe`` after a query
+    # returns; ``_upsert_vulnerability`` stores the inverse on the
+    # HAS_VULN edge as ``r.version_unconfirmed``.
+    #
+    # The point: a service can lack a primary version (compound banner
+    # at :443 makes ``s.version=None``) yet still have a CVE attached
+    # via a sub-product CPE with a known version (mod_ssl/2.8.4 from
+    # the same banner). The old service-level ``version_unconfirmed``
+    # flagged those edges as uncertain when they were actually
+    # version-anchored. Per-edge flag lets the API/UI report the truth.
+    matched_version_pinned: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -970,6 +983,18 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
     # None = 404 (CPE not in NVD) — signal caller to try keyword fallback
     if cves is None:
         return None
+
+    # Mark each CVE with whether the query had a pinned version anchor.
+    # ``has_version`` is True when the CPE itself carries a non-wildcard
+    # version; even when it's False, a ``service_version_override`` from
+    # the wildcard-retry path can supply a known version. Downstream
+    # ``_upsert_vulnerability`` stores the inverse on the HAS_VULN edge
+    # as ``r.version_unconfirmed`` so per-edge reporting tells the truth
+    # for sub-product matches even when the service has no primary
+    # version (compound banners on Apache+mod_ssl, etc.).
+    version_pinned = has_version or bool(version_hint)
+    for cve in cves:
+        cve.matched_version_pinned = version_pinned
 
     # Coarse pentester filter first (CWE + pattern), then the gold filter
     # requires an actionable public exploit (KEV overrides). Hard rejects
@@ -1949,6 +1974,16 @@ def _upsert_vulnerability(
         cisa_kev_added=cve.cisa_kev_added,
     )
 
+    # Per-edge ``version_unconfirmed`` — True when the CPE that produced
+    # this CVE did NOT carry a pinned version (and no service-version
+    # override was threaded in). For sub-product matches (e.g. mod_ssl
+    # 2.8.4 on an Apache service that itself lacks a version in
+    # ``s.version``), the CPE version IS pinned, so the edge correctly
+    # reports the finding as version-confirmed despite the host-level
+    # ambiguity. Legacy keyword-fallback CVEs and old data without this
+    # property fall back to the service-level check in the API Cypher.
+    version_unconfirmed = not getattr(cve, "matched_version_pinned", False)
+
     # Direct endpoint linking -- caller knows exactly which services to
     # attach this CVE to (multi-CPE candidate path).
     if target_endpoints:
@@ -1959,8 +1994,10 @@ def _upsert_vulnerability(
                 MATCH (v:Vulnerability {cve_id: $cve_id})
                 MERGE (s)-[rel:HAS_VULN]->(v)
                 ON CREATE SET rel.confidence = 'check'
+                SET rel.version_unconfirmed = $version_unconfirmed
                 """,
                 ip=ip, port=port, protocol=protocol, cve_id=cve.cve_id,
+                version_unconfirmed=version_unconfirmed,
             )
         return
 
@@ -1976,10 +2013,12 @@ def _upsert_vulnerability(
             MATCH (v:Vulnerability {cve_id: $cve_id})
             MERGE (s)-[rel:HAS_VULN]->(v)
             ON CREATE SET rel.confidence = 'check'
+            SET rel.version_unconfirmed = $version_unconfirmed
             """,
             product=product,
             version=version,
             cve_id=cve.cve_id,
+            version_unconfirmed=version_unconfirmed,
         )
 
     # Also link by CPE (catches services where product name differs but CPE matches).
@@ -2011,8 +2050,10 @@ def _upsert_vulnerability(
                     MATCH (v:Vulnerability {cve_id: $cve_id})
                     MERGE (s)-[rel:HAS_VULN]->(v)
                     ON CREATE SET rel.confidence = 'check'
+                    SET rel.version_unconfirmed = $version_unconfirmed
                     """,
                     prefix=cpe_prefix,
                     contains=f";{cpe_prefix}",
                     cve_id=cve.cve_id,
+                    version_unconfirmed=version_unconfirmed,
                 )

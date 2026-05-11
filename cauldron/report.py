@@ -167,14 +167,27 @@ def _query_findings_grouped() -> list[dict]:
         rows = list(s.run("""
             MATCH (h:Host)-[:HAS_SERVICE]->(svc:Service)-[r:HAS_VULN]->(v:Vulnerability)
             WHERE r.checked_status IS NULL OR r.checked_status <> 'false_positive'
-            WITH v, r,
+            WITH v, r, h, svc,
                  CASE coalesce(r.confidence, 'check')
                      WHEN 'confirmed' THEN 3
                      WHEN 'likely'    THEN 2
                      ELSE 1
                  END AS conf_tier,
-                 {ip: h.ip, port: svc.port, product: svc.product, version: svc.version} AS host_info
-            WITH v, max(conf_tier) AS max_tier, collect(DISTINCT host_info) AS hosts
+                 // Per-edge version_unconfirmed (set by the enricher from
+                 // the matched CPE's version pin). Carry it forward so the
+                 // CVE-level aggregation respects sub-product anchors
+                 // (mod_ssl/2.8.4 matches even when s.version is null).
+                 coalesce(
+                     r.version_unconfirmed,
+                     svc.version IS NULL OR svc.version = '' OR svc.version = '*'
+                 ) AS edge_unconfirmed
+            WITH v,
+                 max(conf_tier) AS max_tier,
+                 collect(DISTINCT {
+                     ip: h.ip, port: svc.port,
+                     product: svc.product, version: svc.version,
+                     unconfirmed: edge_unconfirmed
+                 }) AS hosts
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    CASE max_tier
                        WHEN 3 THEN 'confirmed'
@@ -194,16 +207,13 @@ def _query_findings_grouped() -> list[dict]:
                 COALESCE(v.cvss, 0) DESC
         """))
     findings = [dict(r) for r in rows]
-    # Derive ``version_unconfirmed`` from the per-host ``version`` field
-    # already collected in ``hosts``. The CVE is flagged only when EVERY
-    # affected host had no concrete version at link time — partial
-    # coverage (some hosts with versions, some without) lets the
-    # finding stand on its anchored edges. Aligns with the audit spec.
+    # Aggregate per-edge ``unconfirmed`` flag: the CVE is flagged only
+    # when EVERY affected edge is unconfirmed. Partial coverage (some
+    # edges anchored by a confirmed CPE version, some not) lets the
+    # finding stand on its anchored edges.
     for f in findings:
-        host_versions = [h.get("version") for h in (f.get("hosts") or [])]
-        f["version_unconfirmed"] = bool(host_versions) and all(
-            v is None or v == "" or v == "*" for v in host_versions
-        )
+        edge_flags = [h.get("unconfirmed") for h in (f.get("hosts") or [])]
+        f["version_unconfirmed"] = bool(edge_flags) and all(edge_flags)
     return findings
 
 

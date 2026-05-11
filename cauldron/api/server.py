@@ -503,7 +503,10 @@ def list_hosts(
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
-                       version_unconfirmed: (s.version IS NULL OR s.version = '' OR s.version = '*')
+                       version_unconfirmed: coalesce(
+                           r.version_unconfirmed,
+                           s.version IS NULL OR s.version = '' OR s.version = '*'
+                       )
                    }}) AS vulns
             """,
             **params,
@@ -595,7 +598,10 @@ def get_host(ip: str):
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
                        in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
-                       version_unconfirmed: (s.version IS NULL OR s.version = '' OR s.version = '*')
+                       version_unconfirmed: coalesce(
+                           r.version_unconfirmed,
+                           s.version IS NULL OR s.version = '' OR s.version = '*'
+                       )
                    }) AS vulns
             """,
             ip=ip,
@@ -1441,14 +1447,23 @@ def list_vulns():
             WITH v, max(conf_tier) AS max_tier,
                  count(DISTINCT h.ip) AS host_count,
                  collect(DISTINCT {ip: h.ip, port: s.port}) AS targets,
-                 // Aggregate "did EVERY matched service lack a concrete
-                 // version?" Per the audit: only flag the CVE if the
-                 // wildcard-CPE concern applies uniformly. If at least
-                 // one host has a known version that does match the CVE,
-                 // the finding has a real anchor and we don't badge.
-                 all(svc IN collect(DISTINCT s)
-                     WHERE svc.version IS NULL OR svc.version = ''
-                        OR svc.version = '*') AS version_unconfirmed
+                 // Aggregate per-edge ``r.version_unconfirmed`` (set at
+                 // enrichment time from the matched CPE's version pin).
+                 // The CVE is flagged uniformly UNCONFIRMED only when
+                 // every edge agrees — a sub-product match with a known
+                 // version (mod_ssl/2.8.4) anchors the finding even when
+                 // ``s.version`` itself is null. Legacy edges without
+                 // the property fall back to the service-level check
+                 // via coalesce.
+                 all(edge IN collect(DISTINCT {
+                       edge_uc: r.version_unconfirmed,
+                       svc_version: s.version
+                     })
+                     WHERE coalesce(
+                       edge.edge_uc,
+                       edge.svc_version IS NULL OR edge.svc_version = ''
+                         OR edge.svc_version = '*'
+                     )) AS version_unconfirmed
             RETURN v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    CASE max_tier
                        WHEN 3 THEN 'confirmed'
