@@ -380,6 +380,41 @@ def _cpe22_to_23(cpe: str) -> str | None:
     return None
 
 
+def _with_version(cpe23: str | None, version: str | None) -> str | None:
+    """Upgrade a versionless CPE 2.3 with a known service version.
+
+    nmap routinely emits ``<service version="3.0.20-Debian">`` alongside a
+    versionless ``<cpe>cpe:/a:samba:samba</cpe>`` — the version slot
+    isn't filled in the CPE tag even when nmap clearly extracted it.
+    Cauldron passing the versionless CPE through to NVD then drops
+    range-bounded CVEs pinned to specific versions (CVE-2007-2447 is
+    filed as ``cpe:2.3:a:samba:samba:3.0.0`` ... ``:3.0.20``; the
+    versionless path can't confirm 3.0.20 is in the set).
+
+    This helper merges the service version into the CPE when:
+      - the CPE itself has a wildcard version slot (``parts[5] == "*"``),
+        i.e. we're not overriding an explicit nmap pin
+      - ``version`` parses to a concrete pin via ``_extract_version`` --
+        ``"3.X - 4.X"`` returns ``"*"`` and is left alone (a real range,
+        not a missing pin), while ``"3.0.20-Debian"`` parses to
+        ``"3.0.20"`` and lands in the CPE.
+
+    Returns the upgraded CPE on a merge, or the original unchanged for
+    any of: empty cpe23, no service version, unparseable version,
+    or a CPE that already has a pinned version.
+    """
+    if not cpe23 or not version:
+        return cpe23
+    parts = cpe23.split(":")
+    if len(parts) < 6 or parts[5] != "*":
+        return cpe23   # already pinned, don't override
+    pinned = _extract_version(version)
+    if not pinned or pinned == "*":
+        return cpe23   # version string didn't yield a clean pin
+    parts[5] = pinned
+    return ":".join(parts)
+
+
 def _build_cpe23(vendor: str, product: str, version: str = "*") -> str:
     """Build a CPE 2.3 string from components.
 
@@ -431,14 +466,20 @@ def _get_cpe_for_service(cpe_list: list[str], product: str | None, version: str 
     """Get best CPE 2.3 string for a service.
 
     Priority:
-    1. Application/OS CPE from nmap (with vendor corrections)
-    2. Fallback mapping from PRODUCT_CPE_MAP
+    1. Application/OS CPE from nmap (with vendor corrections), upgraded
+       with ``service.version`` when nmap emitted a versionless CPE.
+    2. Fallback mapping from PRODUCT_CPE_MAP.
     """
-    # Try nmap's CPE output first
+    # Try nmap's CPE output first. When nmap emitted a versionless CPE
+    # (e.g. ``cpe:/a:samba:samba`` on a service whose version attribute
+    # carries ``3.0.20-Debian``), merge the service version in so NVD
+    # queries can hit version-pinned CVEs (CVE-2007-2447 Samba usermap).
+    # ``_with_version`` is a no-op when the CPE already has a pin or
+    # when ``version`` doesn't parse to a clean value.
     for cpe in cpe_list:
         cpe23 = _cpe22_to_23(cpe)
         if cpe23:
-            return cpe23
+            return _with_version(cpe23, version)
 
     # Fallback: use product name mapping. Try exact match first, then
     # prefix-based match — nmap frequently appends a service suffix to the
@@ -634,7 +675,11 @@ def _build_cpe_candidates(
     _add(primary)
 
     for raw in cpe_list:
-        _add(_cpe22_to_23(raw))
+        # Same versionless-CPE upgrade as ``_get_cpe_for_service`` applies
+        # to the primary: when nmap emitted a CPE without a version slot
+        # but the service has a known version, merge them so the
+        # candidate query can find version-pinned CVEs.
+        _add(_with_version(_cpe22_to_23(raw), version))
 
     # Compound-product detection: only tokenize the product field if it
     # contains multiple Name/Version patterns (i.e. nmap dumped the whole

@@ -380,6 +380,49 @@ class TestGetCPEForService:
         result = _get_cpe_for_service([], "nginx", None)
         assert result == "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*"
 
+    def test_metasploitable_samba_usermap_case(self):
+        """The Metasploitable critique case (CVE-2007-2447):
+
+        nmap on Samba :445 emits ``<service product="Samba smbd"
+        version="3.0.20-Debian">`` AND a versionless ``<cpe>cpe:/a:samba:
+        samba</cpe>``. Cauldron must MERGE the service version into the
+        CPE so NVD queries can hit version-pinned CVEs like the
+        ``samba:samba:3.0.0`` ... ``:3.0.20`` set behind CVE-2007-2447.
+        Before this fix the versionless CPE drove a versionless NVD
+        query and the strict applicability rule from P1 dropped the
+        finding.
+        """
+        cpe_list = ["cpe:/a:samba:samba"]
+        result = _get_cpe_for_service(cpe_list, "Samba smbd", "3.0.20-Debian")
+        assert result == "cpe:2.3:a:samba:samba:3.0.20:*:*:*:*:*:*:*"
+
+    def test_versionless_service_does_not_force_version(self):
+        """Samba :139 reports ``version='3.X - 4.X'`` — a real range, not
+        a missing pin. ``_extract_version`` returns ``"*"`` for this and
+        we must NOT inject ``"3.X"`` into the CPE. The CPE stays
+        versionless so the strict-applicability rule treats it as
+        legitimately unknown.
+        """
+        cpe_list = ["cpe:/a:samba:samba"]
+        result = _get_cpe_for_service(cpe_list, "Samba smbd", "3.X - 4.X")
+        assert result == "cpe:2.3:a:samba:samba:*:*:*:*:*:*:*:*"
+
+    def test_explicit_nmap_cpe_version_not_overridden(self):
+        """When nmap supplies a pinned version in the CPE itself, the
+        service-version-attr merge must NOT override it. Trust nmap's
+        explicit choice over heuristic merging.
+        """
+        cpe_list = ["cpe:/a:apache:http_server:2.4.49"]
+        # Even if service.version disagrees, the CPE pin wins.
+        result = _get_cpe_for_service(cpe_list, "Apache httpd", "2.4.51")
+        assert result == "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"
+
+    def test_no_version_attribute_no_upgrade(self):
+        """Service version=None + versionless nmap CPE → stays versionless."""
+        cpe_list = ["cpe:/a:unrealircd:unrealircd"]
+        result = _get_cpe_for_service(cpe_list, "UnrealIRCd", None)
+        assert result == "cpe:2.3:a:unrealircd:unrealircd:*:*:*:*:*:*:*:*"
+
 
 class TestProductCPEMap:
     def test_map_has_common_products(self):
