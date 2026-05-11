@@ -85,6 +85,12 @@ class AnalysisResult:
     # read this to show a prominent failure message instead of silently
     # reporting "0 insights" across every counter.
     auth_error: str | None = None
+    # Count of AI calls whose response we couldn't parse — typically a
+    # response truncated at ``max_tokens`` because the batch was bigger
+    # than the output budget. Surfaced separately so a "0 dismissals"
+    # result that's actually "0 dismissals AND 5 broken batches" doesn't
+    # look like a green run. CLI / UI render a prominent warning.
+    parse_failures: int = 0
 
 
 def is_ai_available() -> bool:
@@ -127,11 +133,12 @@ def analyze_graph() -> AnalysisResult:
         # Phase 3: Contextual engagement triage
         # AI reviews ALL vulns with engagement context (owned/target/scan sources)
         # and dismisses noise — keeping only gold findings
-        kept, dismissed, targets = _contextual_vuln_triage()
+        kept, dismissed, targets, parse_failures = _contextual_vuln_triage()
         result.vulns_kept = kept
         result.vulns_dismissed = dismissed
         result.false_positives_found = dismissed
         result.targets_set = targets
+        result.parse_failures = parse_failures
     except ClaudeAuthError as e:
         result.auth_error = str(e)
         logger.error(
@@ -355,12 +362,14 @@ Respond with ONLY JSON, no prose, no markdown fences:
   {{"index": 1, "cpes": []}}
 ]"""
 
-    response = _call_claude(prompt, max_tokens=4096)
+    response = _call_claude(prompt, max_tokens=16384)
     if not response:
         return []
 
-    data = _parse_json_response(response)
+    data = _parse_json_response(response.text)
     if not isinstance(data, list):
+        if response.truncated:
+            logger.warning("Phase 1 CPE extraction: response truncated at max_tokens — batch too large")
         return []
 
     out: list[dict] = []
@@ -526,14 +535,16 @@ Hosts:
 Respond with ONLY JSON: [{{"id": "host-N", "role": "role_name", "confidence": 0.0-1.0}}]
 Only include hosts where confidence > 0.6."""
 
-    # Output budget: up to ~50 hosts × ~50 tokens per JSON entry = 2500,
-    # plus JSON punctuation / safety margin. 4096 covers the whole batch
-    # size without truncating tail entries.
-    response = _call_claude(prompt, max_tokens=4096)
+    # Output budget: 8192 leaves comfortable headroom over the ~2500-token
+    # baseline for a 50-host batch. We pay only for what's generated;
+    # over-provisioning costs nothing if the actual response fits.
+    response = _call_claude(prompt, max_tokens=8192)
     if not response:
         return 0
+    if response.truncated:
+        logger.warning("Phase 2 classification: response truncated; tail hosts will not be reclassified")
 
-    classifications = _parse_classification_response(response, reverse_map)
+    classifications = _parse_classification_response(response.text, reverse_map)
     return _apply_classifications(classifications)
 
 
@@ -542,11 +553,18 @@ Only include hosts where confidence > 0.6."""
 # ---------------------------------------------------------------------------
 
 
-def _contextual_vuln_triage() -> tuple[int, int]:
+def _contextual_vuln_triage() -> tuple[int, int, int, int]:
     """AI reviews all vulns with engagement context and triages them.
 
     AI sees: scan sources (our positions), owned hosts, target hosts,
     all hosts with their vulns. Returns keep/dismiss verdicts.
+
+    Returns:
+        (kept, dismissed, targets_set, parse_failures)
+        ``parse_failures`` counts how many batches returned a response we
+        couldn't parse (typically truncated at max_tokens). Surfaced so a
+        zero-dismissal result that's actually a parse-fail doesn't look
+        like a clean run.
 
     Rules:
     - Remote RCE/auth_bypass on non-owned hosts: KEEP
@@ -602,7 +620,7 @@ def _contextual_vuln_triage() -> tuple[int, int]:
         """))
 
     if not rows:
-        return 0, 0
+        return 0, 0, 0, 0
 
     # Group by host
     host_data: dict[str, dict] = {}
@@ -672,11 +690,14 @@ TARGET HOSTS (engagement goals): {', '.join(target_lines) if target_lines else '
     batches = [hosts[i:i + 15] for i in range(0, len(hosts), 15)]
     batch_total = len(batches)
 
-    def _run_one(batch_num: int, batch: list[dict]) -> tuple[int, int, int]:
+    def _run_one(batch_num: int, batch: list[dict]) -> tuple[int, int, int, int]:
         logger.info("AI triage batch %d/%d (%d hosts)", batch_num, batch_total, len(batch))
-        k, d, t = _triage_batch(batch, ip_map, reverse_map, context)
-        logger.info("AI triage batch %d result: kept=%d, dismissed=%d, targets=%d", batch_num, k, d, t)
-        return k, d, t
+        k, d, t, pf = _triage_batch(batch, ip_map, reverse_map, context)
+        logger.info(
+            "AI triage batch %d result: kept=%d, dismissed=%d, targets=%d, parse_failures=%d",
+            batch_num, k, d, t, pf,
+        )
+        return k, d, t, pf
 
     results = _gather_batches(
         [(_run_one, (n + 1, b)) for n, b in enumerate(batches)],
@@ -684,7 +705,8 @@ TARGET HOSTS (engagement goals): {', '.join(target_lines) if target_lines else '
     total_kept = sum(r[0] for r in results)
     total_dismissed = sum(r[1] for r in results)
     total_targets = sum(r[2] for r in results)
-    return total_kept, total_dismissed, total_targets
+    total_parse_failures = sum(r[3] for r in results)
+    return total_kept, total_dismissed, total_targets, total_parse_failures
 
 
 def _triage_batch(
@@ -839,11 +861,36 @@ Rules:
 - Include ALL vulns for each host (don't omit any)
 - Respond with ONLY the JSON, no other text"""
 
-    response = _call_claude(prompt, max_tokens=4096)
+    # Output budget: triage output scales with the count of vulns in the
+    # batch (every vuln gets a verdict line, optionally with a reason).
+    # A single host with 60+ findings (Kioptrix-class legacy stack) already
+    # overflows 4096 tokens — the JSON gets truncated mid-string and the
+    # parser silently fails, producing "0 dismissed" even when AI made
+    # correct calls. 32768 covers every realistic batch (a 15-host batch
+    # with ~50 vulns/host × ~75 tokens/verdict ≈ 56k worst-case, this
+    # cap leaves room for typical 5-15k responses while still bounding
+    # runaway output). Sonnet 4.6 supports up to 64k output; we pay only
+    # for what's generated, so over-provisioning is free.
+    response = _call_claude(prompt, max_tokens=32768)
     if not response:
-        return vuln_count, 0, 0  # If AI fails, keep everything
+        return vuln_count, 0, 0, 0  # If AI fails, keep everything
 
-    return _apply_triage(response, reverse_map)
+    kept, dismissed, targets = _apply_triage(response.text, reverse_map)
+    parse_failed = 0
+    if kept == 0 and dismissed == 0 and targets == 0 and vuln_count > 0:
+        # Distinguish "AI returned a valid empty triage" from "AI response
+        # was unparseable or truncated." A valid response would normally
+        # carry at least some keeps for a non-empty batch -- zero across
+        # the board only happens when the parser bailed.
+        logger.warning(
+            "AI triage returned 0 verdicts on a batch of %d vulns -- response %s. "
+            "First 200 chars: %r",
+            vuln_count,
+            "TRUNCATED at max_tokens" if response.truncated else "unparseable",
+            response.text[:200] if response.text else "(empty)",
+        )
+        parse_failed = 1
+    return kept, dismissed, targets, parse_failed
 
 
 def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int, int]:
@@ -1042,8 +1089,32 @@ def _deanonymize_hosts(hosts: list[str], reverse_map: dict[str, str]) -> list[st
 # ---------------------------------------------------------------------------
 
 
-def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
-    """Call Claude API and return the text response."""
+@dataclass
+class ClaudeResponse:
+    """Structured result of a Claude API call.
+
+    Carries the response text plus the stop_reason so callers can detect
+    truncation ("max_tokens") and either bump the budget or split the
+    batch instead of silently treating a truncated response as a complete
+    one. Before this struct, the parser would fail on the cut-off JSON
+    and the caller would report "AI dismissed 0 findings" — visually
+    indistinguishable from "AI kept everything intentionally."
+    """
+
+    text: str
+    stop_reason: str | None = None  # "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | None
+    truncated: bool = False
+
+
+def _call_claude(prompt: str, max_tokens: int = 2048) -> ClaudeResponse | None:
+    """Call Claude API and return a structured ClaudeResponse.
+
+    Returns None for non-recoverable errors (auth raised separately,
+    rate-limit, bad request, unexpected). Truncation at ``max_tokens``
+    is NOT an error — caller decides whether to retry or accept the
+    partial output. The ``truncated`` flag and ``stop_reason`` let
+    callers tell "AI finished cleanly" from "we ran out of budget."
+    """
     try:
         import anthropic
     except ImportError:
@@ -1052,12 +1123,30 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
 
     try:
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        # Explicit ``timeout=600`` (10 min) bypasses the SDK's auto-
+        # calculated nonstreaming timeout, which otherwise refuses any
+        # ``max_tokens`` above ~21k as "streaming-required". With this in
+        # place we can use the full Sonnet output budget (up to 64k) for
+        # triage on engagement-scale graphs without rearchitecting to
+        # streaming. Triage rarely takes more than 60-90s in practice;
+        # 600s is a generous ceiling for the worst-case batch.
         message = client.messages.create(
             model=settings.ai_model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
+            timeout=600.0,
         )
-        return message.content[0].text
+        text = message.content[0].text if message.content else ""
+        stop_reason = getattr(message, "stop_reason", None)
+        truncated = stop_reason == "max_tokens"
+        if truncated:
+            logger.warning(
+                "Claude response truncated at max_tokens=%d (stop_reason=%s). "
+                "The JSON parser will likely fail on cut-off output. "
+                "Bump max_tokens or split the batch.",
+                max_tokens, stop_reason,
+            )
+        return ClaudeResponse(text=text, stop_reason=stop_reason, truncated=truncated)
     except anthropic.AuthenticationError as e:
         # Short-circuit the whole boil pipeline — every subsequent phase
         # would hit the same 401 and spam the same log line. Caller is
@@ -1072,7 +1161,7 @@ def _call_claude(prompt: str, max_tokens: int = 2048) -> str | None:
         logger.error("Anthropic API error: %s", e.message)
         return None
     except Exception:
-        logger.error("Claude API call failed unexpectedly")
+        logger.exception("Claude API call failed unexpectedly")
         return None
 
 

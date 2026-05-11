@@ -116,6 +116,7 @@ class TestCallClaude:
 
         mock_message = MagicMock()
         mock_message.content = [MagicMock(text="test response")]
+        mock_message.stop_reason = "end_turn"
 
         with patch("cauldron.ai.analyzer.settings") as mock_settings:
             mock_settings.anthropic_api_key = "sk-ant-test"
@@ -126,8 +127,36 @@ class TestCallClaude:
                 mock_anthropic.return_value = mock_client
 
                 result = _call_claude("test prompt")
-                assert result == "test response"
+                assert result is not None
+                assert result.text == "test response"
+                assert result.stop_reason == "end_turn"
+                assert result.truncated is False
                 mock_client.messages.create.assert_called_once()
+
+    def test_max_tokens_truncation_flagged(self):
+        """``stop_reason=max_tokens`` must set ``truncated=True`` so the
+        caller can distinguish a clean response from a cut-off one. Before
+        this flag, a truncated JSON response was silently dropped by the
+        parser and the caller logged 'AI dismissed 0' as if AI made no
+        decisions, when in reality AI made many decisions that we lost."""
+        from cauldron.ai.analyzer import _call_claude
+
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text='[{"id":"host-1","vulns":[{"cve_id":"CVE-')]
+        mock_message.stop_reason = "max_tokens"
+
+        with patch("cauldron.ai.analyzer.settings") as mock_settings:
+            mock_settings.anthropic_api_key = "sk-ant-test"
+            mock_settings.ai_model = "claude-sonnet-4-6"
+            with patch("anthropic.Anthropic") as mock_anthropic:
+                mock_client = MagicMock()
+                mock_client.messages.create.return_value = mock_message
+                mock_anthropic.return_value = mock_client
+
+                result = _call_claude("test prompt", max_tokens=100)
+                assert result is not None
+                assert result.truncated is True
+                assert result.stop_reason == "max_tokens"
 
     def test_auth_error_raises_to_short_circuit_pipeline(self):
         """``_call_claude`` must raise ClaudeAuthError on a 401 instead
@@ -317,6 +346,15 @@ class TestAiCpesForBatch:
         base.update(kwargs)
         return base
 
+    @staticmethod
+    def _resp(text: str):
+        """Wrap a JSON string in the ClaudeResponse shape that _call_claude
+        now returns. Tests previously mocked the raw string; the refactor
+        added stop_reason / truncated tracking so the parser can tell
+        cleanly-finished responses from cut-off ones."""
+        from cauldron.ai.analyzer import ClaudeResponse
+        return ClaudeResponse(text=text, stop_reason="end_turn", truncated=False)
+
     def test_parses_valid_response(self):
         from cauldron.ai.analyzer import _ai_cpes_for_batch
 
@@ -327,7 +365,7 @@ class TestAiCpesForBatch:
             ]},
         ])
 
-        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+        with patch("cauldron.ai.analyzer._call_claude", return_value=self._resp(fake_response)):
             out = _ai_cpes_for_batch(batch)
 
         assert out == [{
@@ -343,7 +381,7 @@ class TestAiCpesForBatch:
         batch = [("10.0.0.2", [self._svc(banner="opaque custom banner")])]
         with patch(
             "cauldron.ai.analyzer._call_claude",
-            return_value=json.dumps([{"index": 0, "cpes": []}]),
+            return_value=self._resp(json.dumps([{"index": 0, "cpes": []}])),
         ):
             out = _ai_cpes_for_batch(batch)
         assert len(out) == 1
@@ -361,7 +399,7 @@ class TestAiCpesForBatch:
                 "cpe:2.3:a:apache:tomcat:9.0.50:*:*:*:*:*:*:*",
             ],
         }])
-        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+        with patch("cauldron.ai.analyzer._call_claude", return_value=self._resp(fake_response)):
             out = _ai_cpes_for_batch(batch)
         assert len(out[0]["cpes"]) == 2
 
@@ -374,7 +412,7 @@ class TestAiCpesForBatch:
             {"index": 0, "cpes": ["cpe:2.3:a:openbsd:openssh:7.4:*:*:*:*:*:*:*"]},
             {"index": 99, "cpes": ["cpe:2.3:a:fake:stuff:1.0:*:*:*:*:*:*:*"]},
         ])
-        with patch("cauldron.ai.analyzer._call_claude", return_value=fake_response):
+        with patch("cauldron.ai.analyzer._call_claude", return_value=self._resp(fake_response)):
             out = _ai_cpes_for_batch(batch)
         assert len(out) == 1
         assert out[0]["port"] == 22
@@ -405,7 +443,7 @@ class TestAiCpesForBatch:
 
         def fake_call(prompt, max_tokens=None):  # noqa: ARG001
             captured["prompt"] = prompt
-            return json.dumps([{"index": 0, "cpes": []}])
+            return self._resp(json.dumps([{"index": 0, "cpes": []}]))
 
         with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
             _ai_cpes_for_batch(batch)

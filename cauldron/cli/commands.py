@@ -402,8 +402,19 @@ def boil(nvd: bool, ai: bool, run_all: bool):
                 console.print(f"  [yellow]![/yellow] AI dismissed {ai_result.vulns_dismissed} noise vulnerabilities")
             if ai_result.targets_set:
                 console.print(f"  [red]>[/red] AI suggested {ai_result.targets_set} priority targets")
+            if ai_result.parse_failures:
+                # Parse failures are usually max_tokens truncation. Surface
+                # loudly because they look identical to "AI kept everything"
+                # in the per-counter view and silently leak noise into the
+                # graph.
+                console.print(
+                    f"  [bold red]! AI: {ai_result.parse_failures} batch(es) failed to parse "
+                    f"(response truncated or malformed). Findings in those batches kept as-is. "
+                    f"Check logs and re-run [cyan]cauldron boil --ai[/cyan].[/bold red]"
+                )
             if not any([ai_result.cves_found, ai_result.ambiguous_classified,
-                        ai_result.vulns_kept, ai_result.vulns_dismissed, ai_result.targets_set]):
+                        ai_result.vulns_kept, ai_result.vulns_dismissed, ai_result.targets_set,
+                        ai_result.parse_failures]):
                 console.print("  [dim]  No findings to triage[/dim]")
 
     console.print()

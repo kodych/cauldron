@@ -215,6 +215,11 @@ class AnalyzeResponse(BaseModel):
     # can show a prominent "fix your API key" banner instead of
     # reporting every AI counter as zero.
     ai_auth_error: str | None = None
+    # Count of AI triage batches whose response we couldn't parse — almost
+    # always a max_tokens truncation. Surfaced separately so the UI can
+    # warn the operator that a "zero dismissed" result is actually
+    # "some batches didn't deliver verdicts", with kept-as-is fallout.
+    ai_parse_failures: int = 0
 
 
 class VulnStatusUpdate(BaseModel):
@@ -1002,6 +1007,7 @@ def _run_analysis_pipeline(
     ai_targets = 0
     ai_cves = 0
     ai_auth_error: str | None = None
+    ai_parse_failures = 0
     if ai:
         from cauldron.ai.analyzer import analyze_graph, is_ai_available
         if is_ai_available():
@@ -1013,6 +1019,7 @@ def _run_analysis_pipeline(
             ai_cves = ai_result.cves_found
             ai_targets = ai_result.targets_set
             ai_auth_error = ai_result.auth_error
+            ai_parse_failures = ai_result.parse_failures
 
     if ai and (ai_dismissed or ai_cves):
         summary = get_path_summary()
@@ -1029,6 +1036,7 @@ def _run_analysis_pipeline(
         ai_targets_set=ai_targets,
         ai_cves_found=ai_cves,
         ai_auth_error=ai_auth_error,
+        ai_parse_failures=ai_parse_failures,
     )
 
 
