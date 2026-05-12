@@ -18,6 +18,18 @@ from cauldron.ai.analyzer import (
 )
 from cauldron.graph.connection import clear_database, get_session, verify_connection
 
+
+def _resp(text: str):
+    """Wrap a string in the ClaudeResponse shape that ``_call_claude``
+    returns post-P0 refactor. Mocks that used to return the raw string
+    now need this so callers can read ``response.truncated`` /
+    ``response.text`` without an AttributeError. Module-level so every
+    test class can reach it.
+    """
+    from cauldron.ai.analyzer import ClaudeResponse
+    return ClaudeResponse(text=text, stop_reason="end_turn", truncated=False)
+
+
 # --- Unit tests (no Neo4j needed) ---
 
 
@@ -348,12 +360,9 @@ class TestAiCpesForBatch:
 
     @staticmethod
     def _resp(text: str):
-        """Wrap a JSON string in the ClaudeResponse shape that _call_claude
-        now returns. Tests previously mocked the raw string; the refactor
-        added stop_reason / truncated tracking so the parser can tell
-        cleanly-finished responses from cut-off ones."""
-        from cauldron.ai.analyzer import ClaudeResponse
-        return ClaudeResponse(text=text, stop_reason="end_turn", truncated=False)
+        """Class-local alias kept so existing call sites in this class
+        stay one-line. Delegates to the module-level helper."""
+        return _resp(text)
 
     def test_parses_valid_response(self):
         from cauldron.ai.analyzer import _ai_cpes_for_batch
@@ -509,7 +518,7 @@ class TestClassifyAmbiguousBatching:
             import re as _re
             for match in _re.findall(r"(host-\d+):", prompt):
                 seen_ids.add(match)
-            return "[]"  # no reclassifications needed for this assertion
+            return _resp("[]")  # no reclassifications needed for this assertion
 
         with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
             _classify_ambiguous_hosts()
@@ -533,7 +542,7 @@ class TestClassifyAmbiguousBatching:
         def fake_call(prompt, max_tokens=None):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
-            return "[]"
+            return _resp("[]")
 
         with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
             _classify_ambiguous_hosts()
@@ -551,7 +560,7 @@ class TestClassifyAmbiguousBatching:
         def fake_call(prompt, max_tokens=None):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
-            return "[]"
+            return _resp("[]")
 
         with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
             result = _classify_ambiguous_hosts()
@@ -578,11 +587,11 @@ class TestClassifyAmbiguousBatching:
             if batch_num["n"] == 1:
                 import re as _re
                 ids = _re.findall(r"(host-\d+):", prompt)
-                return _json.dumps([
+                return _resp(_json.dumps([
                     {"id": i, "role": "web_server", "confidence": 0.85}
                     for i in ids
-                ])
-            return "[]"
+                ]))
+            return _resp("[]")
 
         with patch("cauldron.ai.analyzer._call_claude", side_effect=fake_call):
             updated = _classify_ambiguous_hosts()
