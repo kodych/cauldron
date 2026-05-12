@@ -213,81 +213,116 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     g.forEachNode((node, attrs) => {
       if (attrs.isScanSource || attrs.nodeType === 'scan_source') sourceNodes.push(node);
     });
-    let i = 0;
-    g.forEachNode((node, attrs) => {
-      if (attrs.isScanSource || attrs.nodeType === 'scan_source') {
-        // Multiple scan sources: spread around center; single: dead center
-        const srcIdx = sourceNodes.indexOf(node);
-        const angle = sourceNodes.length > 1 ? (srcIdx / sourceNodes.length) * 2 * Math.PI : 0;
+
+    // Tiny graphs (single scan source + a handful of hosts) get a fixed
+    // deterministic ring layout, no ForceAtlas2. The sunflower formula
+    // puts the i=0 node at radius 0, which collides with the centered
+    // scan source; FA2 with 2 overlapping points produces near-zero
+    // separation because gravity (pull-to-center) overpowers the
+    // repulsion when there's almost nothing to push against. The
+    // user-visible symptom is two nodes glued together with Sigma's
+    // hit-test picking whichever the z-index put on top — drags feel
+    // "stuck" because the wrong node is being grabbed.
+    const isTiny = nodeCount <= 5;
+    if (isTiny) {
+      const nonSourceNodes: string[] = [];
+      g.forEachNode((node, attrs) => {
+        if (!(attrs.isScanSource || attrs.nodeType === 'scan_source')) {
+          nonSourceNodes.push(node);
+        }
+      });
+      // Single source: dead center. Multiple sources: small inner ring.
+      sourceNodes.forEach((node, idx) => {
+        const angle = sourceNodes.length > 1 ? (idx / sourceNodes.length) * 2 * Math.PI : 0;
         const offset = sourceNodes.length > 1 ? 0.15 : 0;
         g.setNodeAttribute(node, 'x', offset * Math.cos(angle));
         g.setNodeAttribute(node, 'y', offset * Math.sin(angle));
-      } else {
-        // Vogel's model: r = sqrt(i/N), θ = i * golden_angle
-        const r = Math.sqrt(i / nodeCount);
-        const theta = i * GOLDEN_ANGLE;
-        g.setNodeAttribute(node, 'x', r * Math.cos(theta));
-        g.setNodeAttribute(node, 'y', r * Math.sin(theta));
-        i++;
-      }
-    });
-
-    // ForceAtlas2 settings scale with network size
-    const isLarge = nodeCount > 200;
-    const isHuge = nodeCount > 800;
-    const gravity = isHuge ? 0.5 : isLarge ? 1 : 3;
-    const scalingRatio = isHuge ? 100 : isLarge ? 30 : 8;
-    const iterations = isHuge ? 500 : isLarge ? 350 : Math.min(300, 80 + nodeCount * 2);
-
-    forceAtlas2.assign(g, {
-      iterations,
-      settings: {
-        gravity,
-        scalingRatio,
-        barnesHutOptimize: nodeCount > 50,
-        barnesHutTheta: isHuge ? 0.8 : 0.5,
-        strongGravityMode: false,
-        slowDown: isLarge ? 8 : 5,
-        outboundAttractionDistribution: true,
-      },
-    });
-
-    // Post-layout: redistribute radii to fill disk uniformly
-    // FA2 groups nodes angularly, but puts them all at same radius (ring).
-    // Fix: preserve angle, remap radius so nodes fill center→edge evenly.
-    if (isLarge) {
-      // Find center of mass (scan source position)
-      let cx = 0, cy = 0, sourceCount = 0;
-      g.forEachNode((_node, attrs) => {
+      });
+      // Hosts on a unit ring around the source(s). Spacing is regular,
+      // so two hosts land opposite each other, three form a triangle,
+      // etc. — predictable, never overlapping.
+      nonSourceNodes.forEach((node, idx) => {
+        const angle = (idx / nonSourceNodes.length) * 2 * Math.PI;
+        g.setNodeAttribute(node, 'x', Math.cos(angle));
+        g.setNodeAttribute(node, 'y', Math.sin(angle));
+      });
+    } else {
+      let i = 0;
+      g.forEachNode((node, attrs) => {
         if (attrs.isScanSource || attrs.nodeType === 'scan_source') {
-          cx += attrs.x as number;
-          cy += attrs.y as number;
-          sourceCount++;
+          // Multiple scan sources: spread around center; single: dead center
+          const srcIdx = sourceNodes.indexOf(node);
+          const angle = sourceNodes.length > 1 ? (srcIdx / sourceNodes.length) * 2 * Math.PI : 0;
+          const offset = sourceNodes.length > 1 ? 0.15 : 0;
+          g.setNodeAttribute(node, 'x', offset * Math.cos(angle));
+          g.setNodeAttribute(node, 'y', offset * Math.sin(angle));
+        } else {
+          // Vogel's model: r = sqrt(i/N), θ = i * golden_angle
+          const r = Math.sqrt(i / nodeCount);
+          const theta = i * GOLDEN_ANGLE;
+          g.setNodeAttribute(node, 'x', r * Math.cos(theta));
+          g.setNodeAttribute(node, 'y', r * Math.sin(theta));
+          i++;
         }
       });
-      if (sourceCount > 0) { cx /= sourceCount; cy /= sourceCount; }
 
-      // Collect non-source nodes with their angle and current radius
-      const nodes: { id: string; angle: number; radius: number }[] = [];
-      g.forEachNode((node, attrs) => {
-        if (attrs.isScanSource || attrs.nodeType === 'scan_source') return;
-        const dx = (attrs.x as number) - cx;
-        const dy = (attrs.y as number) - cy;
-        const radius = Math.sqrt(dx * dx + dy * dy);
-        const angle = Math.atan2(dy, dx);
-        nodes.push({ id: node, angle, radius });
+      // ForceAtlas2 settings scale with network size
+      const isLarge = nodeCount > 200;
+      const isHuge = nodeCount > 800;
+      const gravity = isHuge ? 0.5 : isLarge ? 1 : 3;
+      const scalingRatio = isHuge ? 100 : isLarge ? 30 : 8;
+      const iterations = isHuge ? 500 : isLarge ? 350 : Math.min(300, 80 + nodeCount * 2);
+
+      forceAtlas2.assign(g, {
+        iterations,
+        settings: {
+          gravity,
+          scalingRatio,
+          barnesHutOptimize: nodeCount > 50,
+          barnesHutTheta: isHuge ? 0.8 : 0.5,
+          strongGravityMode: false,
+          slowDown: isLarge ? 8 : 5,
+          outboundAttractionDistribution: true,
+        },
       });
 
-      // Sort by radius, then assign new radii to fill disk with a minimum distance from center
-      nodes.sort((a, b) => a.radius - b.radius);
-      const maxR = nodes.length > 0 ? nodes[nodes.length - 1].radius : 1;
-      const minRatio = 0.25; // inner 25% of radius is empty (keeps center clear)
-      for (let j = 0; j < nodes.length; j++) {
-        const t = Math.sqrt((j + 1) / nodes.length); // 0..1 uniform disk fill
-        const newR = maxR * (minRatio + (1 - minRatio) * t); // remap to [25%..100%] of radius
-        const { id, angle } = nodes[j];
-        g.setNodeAttribute(id, 'x', cx + newR * Math.cos(angle));
-        g.setNodeAttribute(id, 'y', cy + newR * Math.sin(angle));
+      // Post-layout: redistribute radii to fill disk uniformly
+      // FA2 groups nodes angularly, but puts them all at same radius (ring).
+      // Fix: preserve angle, remap radius so nodes fill center→edge evenly.
+      if (isLarge) {
+        // Find center of mass (scan source position)
+        let cx = 0, cy = 0, sourceCount = 0;
+        g.forEachNode((_node, attrs) => {
+          if (attrs.isScanSource || attrs.nodeType === 'scan_source') {
+            cx += attrs.x as number;
+            cy += attrs.y as number;
+            sourceCount++;
+          }
+        });
+        if (sourceCount > 0) { cx /= sourceCount; cy /= sourceCount; }
+
+        // Collect non-source nodes with their angle and current radius
+        const nodes: { id: string; angle: number; radius: number }[] = [];
+        g.forEachNode((node, attrs) => {
+          if (attrs.isScanSource || attrs.nodeType === 'scan_source') return;
+          const dx = (attrs.x as number) - cx;
+          const dy = (attrs.y as number) - cy;
+          const radius = Math.sqrt(dx * dx + dy * dy);
+          const angle = Math.atan2(dy, dx);
+          nodes.push({ id: node, angle, radius });
+        });
+
+        // Sort by radius, then assign new radii to fill disk with a minimum distance from center
+        nodes.sort((a, b) => a.radius - b.radius);
+        const maxR = nodes.length > 0 ? nodes[nodes.length - 1].radius : 1;
+        const minRatio = 0.25; // inner 25% of radius is empty (keeps center clear)
+        for (let j = 0; j < nodes.length; j++) {
+          const t = Math.sqrt((j + 1) / nodes.length); // 0..1 uniform disk fill
+          const newR = maxR * (minRatio + (1 - minRatio) * t); // remap to [25%..100%] of radius
+          const { id, angle } = nodes[j];
+          g.setNodeAttribute(id, 'x', cx + newR * Math.cos(angle));
+          g.setNodeAttribute(id, 'y', cy + newR * Math.sin(angle));
+        }
       }
     }
 
@@ -412,53 +447,73 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     });
 
     // --- Node drag-and-drop ---
+    //
+    // Two subtleties make a naive drag handler look broken in tiny graphs:
+    //
+    // 1. Sigma's mouseCaptor pans the camera on mousemove unless we call
+    //    ``preventSigmaDefault()`` on the ``mousemovebody`` event. The DOM
+    //    mousemove listeners we used before never reached that flag, so
+    //    the camera kept panning underneath our node update.
+    //
+    // 2. Sigma rebuilds its ``normalizationFunction`` every render from the
+    //    current ``nodeExtent`` (the bounding box of all node coordinates).
+    //    With two nodes, dragging one stretches the extent, and the new
+    //    normalization re-centers the box -- so the *other* node visibly
+    //    slides in the opposite direction even though its graph attrs
+    //    never changed. The visible symptom is the "two points orbit
+    //    around their midpoint" effect on tiny graphs.
+    //    Fix: call ``setCustomBBox(getBBox())`` on mousedown to lock the
+    //    bounding box at its pre-drag extent. Sigma then keeps every
+    //    non-dragged node fixed in viewport for the duration of the drag.
     let draggedNode: string | null = null;
     let isDragging = false;
+    const mouseCaptor = sigma.getMouseCaptor();
 
     sigma.on('downNode', ({ node, event }) => {
       draggedNode = node;
       isDragging = false;
-      // Disable camera drag while dragging a node
-      sigma.getCamera().disable();
+      // Lock the bounding box so other nodes don't drift as this one moves.
+      // Once set, we keep the lock for the entire session: releasing on
+      // mouseup would force Sigma to recompute ``nodeExtent`` from the
+      // new post-drag positions, and the normalization shift produces
+      // a "teleport" effect where the static nodes hop slightly the
+      // moment the drag ends. With the lock held, every non-dragged
+      // node stays exactly where the user last placed it.
+      if (!sigma.getCustomBBox()) sigma.setCustomBBox(sigma.getBBox());
       event.original.preventDefault();
       event.original.stopPropagation();
     });
 
-    const handleMouseMove = (e: MouseEvent) => {
+    const onMouseMoveBody = (e: { x: number; y: number; preventSigmaDefault: () => void; original: MouseEvent }) => {
       if (!draggedNode) return;
       isDragging = true;
-      const coords = sigma.viewportToGraph({ x: e.offsetX, y: e.offsetY });
-      graph.setNodeAttribute(draggedNode, 'x', coords.x);
-      graph.setNodeAttribute(draggedNode, 'y', coords.y);
+      const pos = sigma.viewportToGraph({ x: e.x, y: e.y });
+      graph.setNodeAttribute(draggedNode, 'x', pos.x);
+      graph.setNodeAttribute(draggedNode, 'y', pos.y);
+      // Stop Sigma's camera from also panning on the same mousemove
+      e.preventSigmaDefault();
+      e.original.preventDefault();
+      e.original.stopPropagation();
     };
 
-    const handleMouseUp = () => {
-      if (draggedNode) {
-        // If it was just a click (not drag), let clickNode handle it
-        if (isDragging) {
-          // Suppress the click after drag
-          sigma.getCamera().enable();
-        } else {
-          sigma.getCamera().enable();
-        }
-        draggedNode = null;
-        isDragging = false;
-      }
+    const onMouseUp = () => {
+      draggedNode = null;
+      isDragging = false;
+      // BBox lock is deliberately NOT released here — see downNode comment.
     };
+
+    mouseCaptor.on('mousemovebody', onMouseMoveBody);
+    mouseCaptor.on('mouseup', onMouseUp);
 
     const container = containerRef.current;
     const handleContextMenu = (e: MouseEvent) => e.preventDefault();
-    container.addEventListener('mousemove', handleMouseMove);
-    container.addEventListener('mouseup', handleMouseUp);
-    container.addEventListener('mouseleave', handleMouseUp);
     container.addEventListener('contextmenu', handleContextMenu);
 
     sigmaRef.current = sigma;
 
     return () => {
-      container.removeEventListener('mousemove', handleMouseMove);
-      container.removeEventListener('mouseup', handleMouseUp);
-      container.removeEventListener('mouseleave', handleMouseUp);
+      mouseCaptor.off('mousemovebody', onMouseMoveBody);
+      mouseCaptor.off('mouseup', onMouseUp);
       container.removeEventListener('contextmenu', handleContextMenu);
       sigma.kill();
       sigmaRef.current = null;
