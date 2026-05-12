@@ -1896,6 +1896,27 @@ def enrich_services_from_graph(
                         target_endpoints=endpoints,
                     )
 
+    # Defensive orphan sweep. The MERGE-after-MATCH refactor in
+    # _upsert_vulnerability stops the function from creating dangling
+    # :Vulnerability nodes when no service matches the link query, but
+    # legacy data from earlier Cauldron versions (or any future code
+    # path that resurrects the older pattern) can still leave hangers
+    # behind. Running the sweep at the end of every NVD pass keeps the
+    # graph consistent with /api/v1/stats — ``MATCH (v:Vulnerability)``
+    # always equals "Vulnerabilities reachable from a Service."
+    with get_session() as session:
+        removed = session.run(
+            """
+            MATCH (v:Vulnerability)
+            WHERE NOT EXISTS { (:Service)-[:HAS_VULN]->(v) }
+            DETACH DELETE v
+            RETURN count(v) AS removed
+            """
+        ).single()
+    stats["orphans_removed"] = removed["removed"] if removed else 0
+    if stats["orphans_removed"]:
+        logger.info("Removed %d orphan Vulnerability nodes", stats["orphans_removed"])
+
     return stats
 
 
@@ -2029,6 +2050,28 @@ def enrich_epss_from_graph(progress_callback=None) -> dict:
     return stats
 
 
+_VULN_MERGE_CLAUSE = """
+    MERGE (v:Vulnerability {cve_id: $cve_id})
+    ON CREATE SET
+        v.cvss = $cvss,
+        v.cvss_vector = $cvss_vector,
+        v.severity = $severity,
+        v.description = $description,
+        v.has_exploit = $has_exploit,
+        v.exploit_url = $exploit_url,
+        v.epss = $epss,
+        v.in_cisa_kev = $in_cisa_kev,
+        v.cisa_kev_added = $cisa_kev_added,
+        v.source = 'nvd'
+    ON MATCH SET
+        v.cvss = COALESCE($cvss, v.cvss),
+        v.severity = COALESCE($severity, v.severity),
+        v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
+        v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
+        v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added)
+"""
+
+
 def _upsert_vulnerability(
     session,
     product: str,
@@ -2053,40 +2096,14 @@ def _upsert_vulnerability(
       * Otherwise fall back to matching services by product+version and by
         CPE prefix. Kept for backward compatibility with callers that
         don't have explicit endpoint info.
-    """
-    session.run(
-        """
-        MERGE (v:Vulnerability {cve_id: $cve_id})
-        ON CREATE SET
-            v.cvss = $cvss,
-            v.cvss_vector = $cvss_vector,
-            v.severity = $severity,
-            v.description = $description,
-            v.has_exploit = $has_exploit,
-            v.exploit_url = $exploit_url,
-            v.epss = $epss,
-            v.in_cisa_kev = $in_cisa_kev,
-            v.cisa_kev_added = $cisa_kev_added,
-            v.source = 'nvd'
-        ON MATCH SET
-            v.cvss = COALESCE($cvss, v.cvss),
-            v.severity = COALESCE($severity, v.severity),
-            v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
-            v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
-            v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added)
-        """,
-        cve_id=cve.cve_id,
-        cvss=cve.cvss,
-        cvss_vector=cve.cvss_vector,
-        severity=cve.severity,
-        description=cve.description,
-        has_exploit=cve.has_exploit,
-        exploit_url=cve.exploit_url,
-        epss=cve.epss,
-        in_cisa_kev=cve.in_cisa_kev,
-        cisa_kev_added=cve.cisa_kev_added,
-    )
 
+    Orphan-prevention contract: the Vulnerability node is MERGE-d
+    inside the same Cypher statement that MATCHes the target Service.
+    If the service MATCH fails (or yields zero services on the legacy
+    fallback paths), the rest of the query — including the Vulnerability
+    MERGE — never executes. The graph never accumulates a
+    ``:Vulnerability`` node that has no HAS_VULN edge attached to it.
+    """
     # Per-edge ``version_unconfirmed`` — True when the CPE that produced
     # this CVE did NOT carry a pinned version (and no service-version
     # override was threaded in). For sub-product matches (e.g. mod_ssl
@@ -2097,41 +2114,63 @@ def _upsert_vulnerability(
     # property fall back to the service-level check in the API Cypher.
     version_unconfirmed = not getattr(cve, "matched_version_pinned", False)
 
+    cve_params = {
+        "cve_id": cve.cve_id,
+        "cvss": cve.cvss,
+        "cvss_vector": cve.cvss_vector,
+        "severity": cve.severity,
+        "description": cve.description,
+        "has_exploit": cve.has_exploit,
+        "exploit_url": cve.exploit_url,
+        "epss": cve.epss,
+        "in_cisa_kev": cve.in_cisa_kev,
+        "cisa_kev_added": cve.cisa_kev_added,
+    }
+
     # Direct endpoint linking -- caller knows exactly which services to
-    # attach this CVE to (multi-CPE candidate path).
+    # attach this CVE to (multi-CPE candidate path). The Service MATCH
+    # gates the Vulnerability MERGE in one statement, so a stale
+    # endpoint that no longer resolves to a Service never produces an
+    # orphan Vulnerability node.
     if target_endpoints:
         for ip, port, protocol in target_endpoints:
             session.run(
-                """
-                MATCH (s:Service {host_ip: $ip, port: $port, protocol: $protocol})
-                MATCH (v:Vulnerability {cve_id: $cve_id})
+                f"""
+                MATCH (s:Service {{host_ip: $ip, port: $port, protocol: $protocol}})
+                {_VULN_MERGE_CLAUSE}
                 MERGE (s)-[rel:HAS_VULN]->(v)
                 ON CREATE SET rel.confidence = 'check'
                 SET rel.version_unconfirmed = $version_unconfirmed
                 """,
-                ip=ip, port=port, protocol=protocol, cve_id=cve.cve_id,
+                ip=ip, port=port, protocol=protocol,
                 version_unconfirmed=version_unconfirmed,
+                **cve_params,
             )
         return
 
-    # Legacy fallback: link by product+version. The earlier
-    # surface-based pre-filter has been removed — AI triage now reads
-    # the CVE description plus the host's full service inventory and
-    # makes the keep/dismiss call directly.
+    # Legacy fallback: link by product+version. ``WITH collect(...) AS
+    # svcs WHERE size(svcs) > 0`` short-circuits the query when no
+    # services match — without this guard the MERGE (v:Vulnerability)
+    # below would fire even with zero candidates and leave a dangling
+    # node behind.
     if product and version:
         session.run(
-            """
+            f"""
             MATCH (s:Service)
             WHERE s.product = $product AND s.version = $version
-            MATCH (v:Vulnerability {cve_id: $cve_id})
+            WITH collect(s) AS svcs
+            WHERE size(svcs) > 0
+            {_VULN_MERGE_CLAUSE}
+            WITH v, svcs
+            UNWIND svcs AS s
             MERGE (s)-[rel:HAS_VULN]->(v)
             ON CREATE SET rel.confidence = 'check'
             SET rel.version_unconfirmed = $version_unconfirmed
             """,
             product=product,
             version=version,
-            cve_id=cve.cve_id,
             version_unconfirmed=version_unconfirmed,
+            **cve_params,
         )
 
     # Also link by CPE (catches services where product name differs but CPE matches).
@@ -2157,16 +2196,20 @@ def _upsert_vulnerability(
                 else:
                     cpe_prefix = f"cpe:/{cpe_part}:{cpe_vendor}:{cpe_product}"
                 session.run(
-                    """
+                    f"""
                     MATCH (s:Service)
                     WHERE s.cpe STARTS WITH $prefix OR s.cpe CONTAINS $contains
-                    MATCH (v:Vulnerability {cve_id: $cve_id})
+                    WITH collect(s) AS svcs
+                    WHERE size(svcs) > 0
+                    {_VULN_MERGE_CLAUSE}
+                    WITH v, svcs
+                    UNWIND svcs AS s
                     MERGE (s)-[rel:HAS_VULN]->(v)
                     ON CREATE SET rel.confidence = 'check'
                     SET rel.version_unconfirmed = $version_unconfirmed
                     """,
                     prefix=cpe_prefix,
                     contains=f";{cpe_prefix}",
-                    cve_id=cve.cve_id,
                     version_unconfirmed=version_unconfirmed,
+                    **cve_params,
                 )

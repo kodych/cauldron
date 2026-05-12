@@ -1763,3 +1763,140 @@ class TestUpsertVulnerabilityLinking:
         assert prefixes == []
 
 
+@pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
+class TestUpsertVulnerabilityOrphanPrevention:
+    """The Vulnerability MERGE must never fire when nothing in the
+    graph will end up linked to it. An orphan node — Vulnerability
+    with zero incoming HAS_VULN edges — silently drifts the
+    "Vulnerabilities" count in /api/v1/stats vs `MATCH (v) RETURN
+    count(v)`, breaks paths analysis assumptions, and accumulates
+    across boil --nvd runs.
+
+    Two layers of defence:
+
+      a) Source: _upsert_vulnerability gates the Vulnerability MERGE
+         behind a Service MATCH. If the link target doesn't exist,
+         the MERGE clause never executes.
+      b) Defensive: enrich_services_from_graph sweeps any remaining
+         orphans at the end of every pass (covers legacy data and
+         any future code path that resurrects the old pattern).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_db(self):
+        clear_database()
+        yield
+        clear_database()
+
+    def test_target_endpoint_missing_no_orphan_node(self):
+        """target_endpoints contains a service IP that isn't in the
+        graph — Vulnerability node must NOT be created."""
+        from cauldron.ai.cve_enricher import CVEInfo, _upsert_vulnerability
+
+        with get_session() as session:
+            _upsert_vulnerability(
+                session,
+                product="Apache httpd",
+                version="2.4.49",
+                cpe_list=[],
+                cve=CVEInfo(cve_id="CVE-2021-41773", cvss=9.8),
+                target_endpoints=[("10.99.99.99", 80, "tcp")],  # not in graph
+            )
+            count = session.run(
+                "MATCH (v:Vulnerability {cve_id: 'CVE-2021-41773'}) "
+                "RETURN count(v) AS c"
+            ).single()["c"]
+            assert count == 0
+
+    def test_target_endpoint_exists_node_and_edge_created(self):
+        """The positive case: when the target Service exists, both the
+        Vulnerability node and the HAS_VULN edge appear together."""
+        from cauldron.ai.cve_enricher import CVEInfo, _upsert_vulnerability
+
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: 80, protocol: 'tcp',
+                                   product: 'Apache httpd', version: '2.4.49'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+            """)
+            _upsert_vulnerability(
+                session,
+                product="Apache httpd",
+                version="2.4.49",
+                cpe_list=[],
+                cve=CVEInfo(cve_id="CVE-2021-41773", cvss=9.8),
+                target_endpoints=[("10.0.0.1", 80, "tcp")],
+            )
+            row = session.run("""
+                MATCH (s:Service {host_ip: '10.0.0.1', port: 80})-[:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-2021-41773'})
+                RETURN v.cvss AS cvss
+            """).single()
+            assert row is not None
+            assert row["cvss"] == 9.8
+
+    def test_legacy_product_version_no_match_no_orphan(self):
+        """Legacy fallback path: product+version don't match any service.
+        Vulnerability node must NOT be created. The
+        ``WITH collect(s) AS svcs WHERE size(svcs) > 0`` guard inside
+        the Cypher is what stops the MERGE."""
+        from cauldron.ai.cve_enricher import CVEInfo, _upsert_vulnerability
+
+        with get_session() as session:
+            session.run("""
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: 80, protocol: 'tcp',
+                                   product: 'nginx', version: '1.18.0'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+            """)
+            _upsert_vulnerability(
+                session,
+                product="Apache httpd",  # no such service
+                version="2.4.49",
+                cpe_list=[],
+                cve=CVEInfo(cve_id="CVE-2021-41773", cvss=9.8),
+            )
+            count = session.run(
+                "MATCH (v:Vulnerability) RETURN count(v) AS c"
+            ).single()["c"]
+            assert count == 0
+
+    def test_orphan_sweep_removes_pre_existing_dangling_vulns(self):
+        """Defensive layer: legacy data (or any future regression) that
+        leaves a :Vulnerability without HAS_VULN edges is removed by
+        the sweep at the end of enrich_services_from_graph."""
+        from cauldron.ai.cve_enricher import enrich_services_from_graph
+        from unittest.mock import patch
+
+        with get_session() as session:
+            # Seed an orphan plus a properly-linked vuln. The sweep
+            # must touch only the orphan.
+            session.run("""
+                CREATE (v_orphan:Vulnerability {cve_id: 'CVE-9999-ORPHAN', cvss: 5.0, source: 'nvd'})
+                CREATE (h:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (s:Service {host_ip: '10.0.0.1', port: 80, protocol: 'tcp',
+                                   product: 'nginx', version: '1.18.0'})
+                CREATE (h)-[:HAS_SERVICE]->(s)
+                CREATE (v_linked:Vulnerability {cve_id: 'CVE-9999-LINKED', cvss: 6.0, source: 'nvd'})
+                CREATE (s)-[:HAS_VULN]->(v_linked)
+            """)
+
+        # Run enrichment with NVD mocked out — we only care about the
+        # sweep at the end. enrich_service is called per-service, so
+        # we return an empty result (no new CVEs) and let the function
+        # reach its orphan-cleanup tail.
+        from cauldron.ai.cve_enricher import EnrichmentResult
+        with patch(
+            "cauldron.ai.cve_enricher.enrich_service",
+            return_value=EnrichmentResult(product="nginx", version="1.18.0", cves=[]),
+        ):
+            stats = enrich_services_from_graph()
+
+        assert stats.get("orphans_removed", 0) == 1
+        with get_session() as session:
+            remaining = [r["cve"] for r in session.run(
+                "MATCH (v:Vulnerability) RETURN v.cve_id AS cve ORDER BY cve"
+            )]
+            assert remaining == ["CVE-9999-LINKED"]
+
+
