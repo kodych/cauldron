@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-12
+
+Quality patches across the CVE pipeline, report output, graph topology, and
+the UI. No schema or CLI-flag changes; safe to upgrade in place.
+
+### Added
+
+- Multi-CPE candidates via the NVD CPE Dictionary, so a single service can
+  surface CVEs from every product alias the dictionary lists for it.
+- Path-scoped exploit URL detection, narrowing exploit-availability flags to
+  references that actually point at proof-of-concept code.
+- Traceroute-based topology with pivot auto-own and a per-source edge
+  palette in the graph view.
+- Per-host services inventory in the engagement report.
+- Community standards: `SECURITY.md` (GitHub Private Vulnerability Reporting
+  flow), `CODE_OF_CONDUCT.md`, issue templates (bug / feature / question),
+  and a pull-request template.
+
+### Changed
+
+- CVE enrichment now extracts `Name-Version` tokens from banners and retries
+  matches with a major-only version when the full version returns nothing.
+- Versionless nmap-emitted CPEs are merged with `service.version` before
+  hitting NVD, so banner-derived versions are not silently dropped.
+- Versionless applicability is tighter: range-bounded CVEs (those with
+  explicit `versionStartIncluding` / `versionEndExcluding` bounds) are
+  dropped when the service version is unknown, instead of pinning to a
+  random in-range version.
+- Per-edge `version_unconfirmed` flag on sub-product CVE matches, so the UI
+  can mark inferred matches without poisoning the overall vuln verdict.
+
+### Fixed
+
+- AI triage no longer fails silently on large batches; parse failures are
+  surfaced as pipeline errors instead of being swallowed.
+- Orphan `Vulnerability` nodes are prevented at the source (MERGE moved
+  inside the service-match Cypher) and a defensive sweep removes any that
+  pre-existed in the graph.
+- `cauldron paths` dedupes multi-port CVEs in CLI output: one row per CVE,
+  with the affected port set collected on the host locator.
+- UI: `version_unconfirmed` is OR-merged across multi-port CVE instances so
+  the flag does not flicker between refreshes.
+- Browser tab title is trimmed; node-drag stays stable on tiny graphs (no
+  more "two-node orbit" artefact).
+
 ## [0.1.0] — 2026-04-28
 
 Initial public release.
@@ -91,5 +136,6 @@ Initial public release.
 - AI prompts are anonymized so client IPs / hostnames never reach the
   Anthropic API.
 
-[Unreleased]: https://github.com/kodych/cauldron/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kodych/cauldron/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/kodych/cauldron/releases/tag/v0.1.1
 [0.1.0]: https://github.com/kodych/cauldron/releases/tag/v0.1.0

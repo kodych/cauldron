@@ -40,7 +40,7 @@ Every pentester runs the same loop on every engagement:
 Cauldron automates the analytical work so you can spend your engagement
 hours on actually exploiting things.
 
-## What's in v0.1.0
+## Features
 
 - **Ingestion** — Nmap XML and Masscan (XML + JSON), with NEW / GONE /
   CHANGED diffing across re-imports from different network positions.
@@ -187,7 +187,7 @@ pip install -e ".[all]"
 
 # Backend
 ruff check cauldron/
-pytest tests/                  # 466 unit tests; DB-backed tests skip without Neo4j
+pytest tests/                  # DB-backed tests skip without Neo4j
 
 # Frontend
 cd frontend
