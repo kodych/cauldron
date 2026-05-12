@@ -324,6 +324,18 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
         if (v.has_exploit && !existing.vuln.has_exploit) existing.vuln = { ...existing.vuln, has_exploit: true };
         if (v.exploit_url && !existing.vuln.exploit_url) existing.vuln = { ...existing.vuln, exploit_url: v.exploit_url };
         if (v.exploit_module && !existing.vuln.exploit_module) existing.vuln = { ...existing.vuln, exploit_module: v.exploit_module };
+        // OR-merge ``version_unconfirmed`` across port-instances. Without
+        // this the badge flickered on re-fetch — the API returns one row
+        // per (cve_id, port) and each row computes the flag from its
+        // own service's version, but Neo4j's ``collect(DISTINCT ...)``
+        // gives the rows in arbitrary order, so whichever instance
+        // happened to come first decided the badge. Asymmetric cost
+        // favours "show if any": false positive is one extra '?' the
+        // operator can dismiss; false negative is the operator chasing
+        // a CVE on a service whose version is actually unknown.
+        if (v.version_unconfirmed && !existing.vuln.version_unconfirmed) {
+          existing.vuln = { ...existing.vuln, version_unconfirmed: true };
+        }
       } else {
         map.set(v.cve_id, { vuln: v, ports: v.port != null ? [v.port] : [] });
       }
