@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Info } from 'lucide-react';
-import { ROLE_COLORS } from '../utils/colors';
+import { ROLE_COLORS, getScanSourceColor } from '../utils/colors';
+import type { ScanSourceOut } from '../types';
 
 // Legend floats as a chip in the graph canvas's top-right controls bar.
 // Collapsed it is a single Info-icon button. On hover the full panel
@@ -18,7 +19,15 @@ const KEY_ROLES = [
   'FIREWALL',
 ];
 
-export function Legend() {
+interface Props {
+  // Ordered list of scan sources (by first_seen). Each gets the next
+  // palette colour for its edges. Pass empty / undefined to hide the
+  // scan-source section entirely (single-source engagements don't
+  // need it).
+  scanSources?: ScanSourceOut[];
+}
+
+export function Legend({ scanSources }: Props = {}) {
   const [expanded, setExpanded] = useState(false);
   const [open, setOpen] = useState(false);
   // Close timer keeps the panel visible for ~150ms after the mouse
@@ -129,6 +138,33 @@ export function Legend() {
             </div>
           </div>
         </div>
+
+        {/* Scan-source palette — only shown on multi-source engagements
+            where edge colour actually conveys information. Each edge
+            on the canvas takes the colour of the scan position that
+            observed it; this mapping shows operator which colour goes
+            with which pivot. Order matches first_seen ascending, same
+            as the backend's /api/v1/scan-sources response. */}
+        {scanSources && scanSources.length > 1 && (
+          <div className="mt-2 pt-2 border-t border-gray-800/60">
+            <p className="mb-1 text-xs font-medium uppercase tracking-wider text-gray-500">
+              Scan sources (edge colour)
+            </p>
+            <div className="space-y-0.5">
+              {scanSources.map((s, i) => (
+                <div key={s.name} className="flex items-center gap-1.5">
+                  <div
+                    className="h-2 w-4 shrink-0 rounded-sm"
+                    style={{ backgroundColor: getScanSourceColor(i) }}
+                  />
+                  <span className="text-xs text-gray-400 font-mono truncate" title={s.name}>
+                    {s.name}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
       )}
     </div>

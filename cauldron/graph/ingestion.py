@@ -83,22 +83,88 @@ def ingest_scan(scan: ScanResult, source_name: str | None = None) -> dict:
             for script in host.host_scripts:
                 _upsert_host_script(session, host.ip, script)
 
-            # Traceroute relationships
-            for hop in host.traceroute:
-                if hop.ip and hop.ip != host.ip:
-                    _upsert_traceroute_hop(session, host.ip, hop.ip, hop.ttl)
-                    stats["relationships_created"] += 1
+            # Traceroute relationships.
+            #
+            # For host with trace ``[h1, h2, ..., h_n, self]`` (sorted by
+            # TTL ascending) we materialize:
+            #   - Every hop as a :Host node with discovered_via='traceroute'
+            #     (so the gateway/switch IPs exist in the graph).
+            #   - One ROUTE_THROUGH edge from host to its IMMEDIATE previous
+            #     hop (h_n, the highest-TTL non-self hop) — NOT to every hop
+            #     in the chain. The earlier hops are reached via the
+            #     consecutive-hop chain below, not by short-circuit edges
+            #     from the host. Otherwise the graph shows parallel routes
+            #     (host → gw AND host → sw-dmz) when the real path is
+            #     strictly serial (host → sw-dmz → gw).
+            #   - hop[i+1] → hop[i] edges connecting adjacent hops, so the
+            #     chain itself is materialized as edges.
+            #
+            # Result: each scanned host's path forms a single unbroken
+            # chain through the topology, with no redundant parallel
+            # edges between the host and intermediate hops.
+            hops = sorted(
+                (h for h in host.traceroute if h.ip and h.ip != host.ip),
+                key=lambda h: h.ttl,
+            )
+            # Materialize every hop as a Host node (without yet creating
+            # any host→hop edge). The node carries discovered_via='traceroute'
+            # on first create.
+            for hop in hops:
+                _upsert_hop_node(session, hop.ip, hop.hostname)
+                segment = _ip_to_segment(hop.ip)
+                if segment:
+                    _upsert_segment(session, segment)
+                    _link_host_to_segment(session, hop.ip, segment)
+            # Single host → immediate-prev-hop edge (the last hop before
+            # self in the trace). hops[-1] is the highest-TTL non-self hop.
+            # Each ROUTE_THROUGH carries ``source`` = scan source name so
+            # downstream chain traversal can filter to a single scan's
+            # trace. Without this, chains from different scan positions
+            # merge at shared hops (e.g. the DMZ gateway 10.0.2.1 is on
+            # both the external scanner's ISP path AND the DMZ pivot's
+            # internal path); a global walk from DC01 would bleed into
+            # the external ISP chain and surface bogus "DC01 → rtr-edge"
+            # SCANNED_FROM edges in the API render.
+            if hops:
+                immediate = hops[-1]
+                _link_route_through(session, host.ip, immediate.ip, immediate.ttl, source)
+                stats["relationships_created"] += 1
+            # Consecutive-hop chain (ttl_low → ttl_high). Semantics
+            # unchanged: A → B means "to reach A, traffic goes through B",
+            # so the downstream hop points at the upstream one.
+            for upstream, downstream in zip(hops, hops[1:]):
+                _link_hops(session, downstream.ip, upstream.ip, source)
+                stats["relationships_created"] += 1
 
     return stats
 
 
 def _upsert_scan_source(session: Session, name: str, timestamp: datetime, args: str | None) -> None:
-    """Create or update a scan source node."""
+    """Create or update a scan source node.
+
+    Auto-ownership bootstrap: if a ``:Host`` with the same IP as
+    ``name`` already exists in the graph (typical when scan N imports
+    new scanning position whose target was first seen in an earlier
+    scan), we promote that host to ``owned=true``. The semantic: to
+    run nmap from a host means having a shell on it. The mirror
+    direction (host created later for an IP that's already a scan
+    source) is handled by ``_upsert_host``'s ON CREATE clause.
+
+    Only fires when the host hasn't been explicitly marked. The
+    operator can still right-click → Unmark Owned later — the next
+    import doesn't re-flip it, because ``_upsert_host`` only auto-owns
+    on first creation.
+    """
     session.run(
         """
         MERGE (s:ScanSource {name: $name})
         ON CREATE SET s.first_seen = $ts, s.last_seen = $ts, s.scan_args = $args
         ON MATCH SET s.last_seen = $ts
+        WITH s, s.first_seen = $ts AS just_created
+        OPTIONAL MATCH (h:Host {ip: $name})
+        FOREACH (_ IN CASE WHEN h IS NOT NULL AND just_created THEN [1] ELSE [] END |
+            SET h.owned = true
+        )
         """,
         name=name,
         ts=timestamp.isoformat(),
@@ -107,9 +173,27 @@ def _upsert_scan_source(session: Session, name: str, timestamp: datetime, args: 
 
 
 def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
-    """Create or update a host node."""
+    """Create or update a host node.
+
+    Whether a host is "fully scanned" or "traceroute-only" emerges from
+    its data: a real scan produces ``HAS_SERVICE`` edges, a bare hop
+    doesn't. No separate provenance flag — when nmap later targets an
+    IP that previously appeared only as a hop, this MERGE fills in the
+    OS / hostname / state and subsequent ``_upsert_service`` calls add
+    the services. The host "becomes complete" implicitly.
+
+    Auto-ownership: on first creation we check whether a ``:ScanSource``
+    already exists with the same IP as the host's. If yes, the host
+    is automatically marked ``owned=true`` — the pentester ran nmap
+    from this IP, which means they have shell access on it. ON CREATE
+    only — manual unmark via right-click survives subsequent imports.
+    The mirror direction (host pre-exists when scan source is later
+    registered) is handled inside ``_upsert_scan_source``.
+    """
     session.run(
         """
+        OPTIONAL MATCH (src:ScanSource {name: $ip})
+        WITH src IS NOT NULL AS auto_owned
         MERGE (h:Host {ip: $ip})
         ON CREATE SET
             h.first_seen = $ts,
@@ -125,7 +209,7 @@ def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
             h.state = $state,
             h.role = $role,
             h.role_confidence = $role_confidence,
-            h.owned = false,
+            h.owned = auto_owned,
             h.target = false
         ON MATCH SET
             h.last_seen = $ts,
@@ -320,33 +404,109 @@ def _upsert_host_script(session: Session, host_ip: str, script) -> None:
     )
 
 
-def _upsert_traceroute_hop(session: Session, target_ip: str, hop_ip: str, ttl: int) -> None:
-    """Create ROUTE_THROUGH relationship from traceroute data."""
-    # Validate hop IP before creating Host node
+def _upsert_hop_node(
+    session: Session,
+    hop_ip: str,
+    hop_hostname: str | None = None,
+) -> None:
+    """Materialize a traceroute hop as a :Host node (no edges, no services).
+
+    The hop becomes a regular ``Host`` with ``state='up'``,
+    ``role='unknown'`` and no ``HAS_SERVICE`` edges. The empty-services
+    shape IS the "this is unscanned" signal — both render and reports
+    treat any zero-service host the same way regardless of how it got
+    into the graph (traceroute hop, firewalled scan target, half-imported
+    history, etc.).
+
+    Hostname is preserved on first creation (e.g. ``gw.corp.local``,
+    ``sw-dmz.corp.local``) so the rule-based classifier can pick up
+    tokens. ``ON CREATE SET`` only — if the same IP is later port-
+    scanned, ``_upsert_host`` runs and fills in OS / services / etc.
+    via the normal MERGE path. The "promotion" from hop to fully-scanned
+    happens implicitly: services appear, the host stops looking empty.
+
+    Edges are NOT created here — callers build the topology chain
+    explicitly via ``_link_route_through`` and ``_link_hops``.
+    """
     try:
         ipaddress.ip_address(hop_ip)
     except (ValueError, TypeError):
         return  # Skip invalid IPs from traceroute
 
-    # First ensure the hop host exists
     session.run(
         """
         MERGE (h:Host {ip: $ip})
-        ON CREATE SET h.state = 'up', h.role = 'unknown', h.role_confidence = 0.0
+        ON CREATE SET
+            h.state = 'up',
+            h.role = 'unknown',
+            h.role_confidence = 0.0,
+            h.hostname = $hostname,
+            h.owned = false,
+            h.target = false
         """,
         ip=hop_ip,
+        hostname=hop_hostname,
     )
+
+
+def _link_route_through(
+    session: Session,
+    downstream_ip: str,
+    upstream_ip: str,
+    ttl: int | None = None,
+    source: str | None = None,
+) -> None:
+    """Create one ROUTE_THROUGH edge between two existing :Host nodes.
+
+    ``downstream -[ROUTE_THROUGH {source} ]-> upstream`` — "to reach
+    downstream, traffic passes through upstream, as observed by the
+    scan named ``source``". Used twice:
+
+    - host → immediate previous hop  (one edge per scanned host)
+    - hop[i+1] → hop[i]              (consecutive hops in a trace)
+
+    ``source`` is the scan source name. It MUST be set for new edges
+    so the API's chain-traversal can stay inside one scan's trace —
+    without it, a chain walked from a host in scan B leaks into
+    shared hops contributed by scan A and lands at a chain root the
+    scanner has no business reaching directly. We MERGE on
+    (downstream, upstream, source) so the same edge tagged by a
+    different source becomes a SEPARATE relationship rather than
+    overwriting the original.
+    """
+    try:
+        ipaddress.ip_address(downstream_ip)
+        ipaddress.ip_address(upstream_ip)
+    except (ValueError, TypeError):
+        return
+
     session.run(
         """
-        MATCH (target:Host {ip: $target_ip})
-        MATCH (hop:Host {ip: $hop_ip})
-        MERGE (target)-[r:ROUTE_THROUGH]->(hop)
-        SET r.ttl = $ttl
+        MATCH (downstream:Host {ip: $downstream})
+        MATCH (upstream:Host {ip: $upstream})
+        MERGE (downstream)-[r:ROUTE_THROUGH {source: $source}]->(upstream)
+        SET r.ttl = CASE WHEN $ttl IS NULL THEN r.ttl ELSE $ttl END
         """,
-        target_ip=target_ip,
-        hop_ip=hop_ip,
+        downstream=downstream_ip,
+        upstream=upstream_ip,
         ttl=ttl,
+        source=source or "unknown",
     )
+
+
+def _link_hops(
+    session: Session,
+    downstream_ip: str,
+    upstream_ip: str,
+    source: str | None = None,
+) -> None:
+    """Connect two consecutive traceroute hops via ROUTE_THROUGH.
+
+    Thin alias over ``_link_route_through`` (without a TTL) — the
+    hop-to-hop edge doesn't carry a meaningful TTL value, it's just
+    "this hop is downstream of that hop, observed by ``source``".
+    """
+    _link_route_through(session, downstream_ip, upstream_ip, ttl=None, source=source)
 
 
 def get_graph_stats() -> dict:

@@ -7,13 +7,14 @@ import { Legend } from './Legend';
 import forceAtlas2 from 'graphology-layout-forceatlas2';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { getNodeColor, getCvssColor, getConfidenceColor, ROLE_COLORS } from '../utils/colors';
+import { getNodeColor, getCvssColor, getConfidenceColor, getScanSourceColor, ROLE_COLORS } from '../utils/colors';
 import { HIGH_VALUE_ROLES, formatCvss } from '../utils/format';
-import type { GraphResponse, PathsResponse, HostListResponse, VulnOut } from '../types';
+import type { GraphResponse, PathsResponse, HostListResponse, ScanSourceOut, VulnOut } from '../types';
 
 interface Props {
   selectedHost: string | null;
   onSelectHost: (ip: string | null) => void;
+  onSelectScanSource?: (name: string | null) => void;
   highlightPathIps?: string[] | null;
   onClearPath?: () => void;
   onDataChanged?: () => void;
@@ -33,7 +34,7 @@ interface HostVulnInfo {
   topVulns: VulnOut[];
 }
 
-export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onClearPath, onDataChanged, onCloseDetail, refreshKey = 0 }: Props) {
+export function GraphCanvas({ selectedHost, onSelectHost, onSelectScanSource, highlightPathIps, onClearPath, onDataChanged, onCloseDetail, refreshKey = 0 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -82,6 +83,20 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     () => api.getHosts({ limit: GRAPH_HOST_CAP }),
     [refreshKey],
   );
+  // Ordered list of scan sources (by first_seen). The index in this list
+  // determines the palette colour each scan position paints onto its
+  // edges — earliest scan = lime, first pivot = cyan, etc. Sorted on the
+  // backend, so re-renders never shuffle colours.
+  const { data: scanSourcesData } = useApi<ScanSourceOut[]>(
+    () => api.listScanSources(),
+    [refreshKey],
+  );
+  const scanSourceColorMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!scanSourcesData) return map;
+    scanSourcesData.forEach((s, i) => map.set(s.name, getScanSourceColor(i)));
+    return map;
+  }, [scanSourcesData]);
 
   // Build host vuln lookup from hosts data — stored in ref to avoid graph rebuilds
   const hostVulnMapRef = useRef(new Map<string, HostVulnInfo>());
@@ -115,25 +130,93 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     return map;
   }, [hostsData]);
 
-  // Collect attack path edges with vuln count of target
+  // Adjacency map over topology edges (everything except IN_SEGMENT).
+  // Used by ``findTopologyPath`` to expand each abstract attack step
+  // into the chain of edges that physically connect the two endpoints —
+  // so a path "scanner → DC01" tints the chain "scanner → gw → DC01"
+  // rather than drawing a direct red shortcut on top of the green
+  // topology that already shows the real route.
+  const topologyAdj = useMemo(() => {
+    const adj = new Map<string, string[]>();
+    if (!data) return adj;
+    for (const e of data.edges) {
+      if (e.type === 'IN_SEGMENT') continue;
+      const list = adj.get(e.source) || [];
+      list.push(e.target);
+      adj.set(e.source, list);
+    }
+    return adj;
+  }, [data]);
+
+  const nodeIdSet = useMemo(
+    () => new Set(data?.nodes.map((n) => n.id) ?? []),
+    [data],
+  );
+
+  // Path-node IPs come bare (no host:/source: prefix). The graph node
+  // ID depends on whether the renderer kept the scan source as its own
+  // node or merged it into a host. Try both and return whichever the
+  // canvas knows about.
+  const resolveNodeId = useCallback(
+    (ip: string): string | null => {
+      const h = `host:${ip}`;
+      if (nodeIdSet.has(h)) return h;
+      const s = `source:${ip}`;
+      if (nodeIdSet.has(s)) return s;
+      return null;
+    },
+    [nodeIdSet],
+  );
+
+  // BFS along the directed topology adjacency. Returns the ordered list
+  // of edge keys ("src->tgt") that connect start to end. Empty array
+  // means no path found in this direction.
+  const findTopologyPath = useCallback(
+    (start: string, end: string): string[] => {
+      if (start === end) return [];
+      const visited = new Set([start]);
+      const queue: Array<[string, string[]]> = [[start, []]];
+      while (queue.length) {
+        const [node, edgesSoFar] = queue.shift()!;
+        const nexts = topologyAdj.get(node) || [];
+        for (const n of nexts) {
+          if (visited.has(n)) continue;
+          const newEdges = [...edgesSoFar, `${node}->${n}`];
+          if (n === end) return newEdges;
+          visited.add(n);
+          queue.push([n, newEdges]);
+        }
+      }
+      return [];
+    },
+    [topologyAdj],
+  );
+
+  // Attack-edge map keyed on topology edge directions ("src->tgt").
+  // For every consecutive (src, dst) pair in an attack path we walk the
+  // topology and mark each edge on the route as attack-relevant with
+  // the target's vuln count. Edges shared between multiple paths take
+  // the largest vuln count. The reducer reads this map to tint the
+  // topology edges red — no separate synthetic attack edges are drawn,
+  // so the visual chain stays single-stroke (no green/red overlap).
   const attackEdgeMap = useMemo(() => {
-    const map = new Map<string, number>(); // edgeKey -> vuln count of target
+    const map = new Map<string, number>();
     if (!pathsData) return map;
     for (const path of pathsData.paths) {
       const target = path.nodes[path.nodes.length - 1];
       const vulnCount = target.vulns.length;
       for (let i = 0; i < path.nodes.length - 1; i++) {
-        const src = `host:${path.nodes[i].ip}`;
-        const tgt = `host:${path.nodes[i + 1].ip}`;
-        const key = `${src}->${tgt}`;
-        map.set(key, Math.max(map.get(key) || 0, vulnCount));
-        const srcAlt = `source:${path.nodes[i].ip}`;
-        const keyAlt = `${srcAlt}->${tgt}`;
-        map.set(keyAlt, Math.max(map.get(keyAlt) || 0, vulnCount));
+        const startId = resolveNodeId(path.nodes[i].ip);
+        const endId = resolveNodeId(path.nodes[i + 1].ip);
+        if (!startId || !endId) continue;
+        const edgeKeys = findTopologyPath(startId, endId);
+        for (const ekey of edgeKeys) {
+          map.set(ekey, Math.max(map.get(ekey) || 0, vulnCount));
+        }
       }
     }
     return map;
-  }, [pathsData]);
+  }, [pathsData, resolveNodeId, findTopologyPath]);
 
   const graph = useMemo(() => {
     if (!data || data.nodes.length === 0) return null;
@@ -148,11 +231,35 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       const roleUpper = (role || '').toUpperCase();
       const ip = node.properties.ip as string || node.properties.name as string || '';
       const isScanSource = node.type === 'scan_source' || node.properties.is_scan_source === true;
-      const color = getNodeColor(node.type, role);
+      // Hosts with zero services are "incomplete" — could be a traceroute
+      // hop we haven't scanned yet, a firewalled target with no open ports,
+      // or anything in between. Render them visually subordinate (small
+      // dim gray) so the operator instantly sees what's actionable vs
+      // what's a stub waiting for a follow-up scan.
+      //
+      // Standalone scan-source nodes (operator's external box) are
+      // intentionally serviceless — they don't get the "incomplete"
+      // treatment. They're command-center nodes, not under-enumerated
+      // targets. Red color + size 8 makes them prominent at the start
+      // of the kill chain.
+      const serviceCount = (node.properties.service_count as number) ?? 0;
+      const isIncomplete = node.type === 'host' && serviceCount === 0;
+      const color = isIncomplete ? '#6b7280' : getNodeColor(node.type, role);
 
       // Base sizing: vuln-based sizing applied in nodeReducer
       let size = node.type === 'host' ? 8 : 5;
-      if (isScanSource) {
+      if (isIncomplete) {
+        // Hops (zero-service hosts) — sized so they're visible at typical
+        // zoom levels and the hostname label stays legible, but still
+        // clearly subordinate to scanned hosts (8) and high-value role
+        // hosts (10). Going below 5 made gateway / firewall nodes look
+        // like noise; 6 is the smallest size that keeps both the dot
+        // and the label readable at standard pan-zoom.
+        size = 6;
+      } else if (node.type === 'scan_source') {
+        // Standalone scan sources: visible command-center node, not a
+        // tiny incomplete-host dot. ``isScanSource`` also fires for
+        // pivot-merged hosts, but those go through the host branch.
         size = 8;
       } else if (node.type === 'host' && HIGH_VALUE_ROLES.has(roleUpper)) {
         size = 10;
@@ -166,40 +273,38 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
         role: role || '',
         ip,
         isScanSource: isScanSource,
-        zIndex: isScanSource ? 100 : 1,
+        isIncomplete,
+        zIndex: isScanSource ? 100 : isIncomplete ? 0 : 1,
       });
     }
 
-    // Topology edges: thin, dim green — skip IN_SEGMENT (hosts-to-segment
-    // clutter the canvas, segments are hidden from UI anyway).
+    // Topology edges: thin, source-coloured — skip IN_SEGMENT
+    // (hosts-to-segment clutter the canvas, segments are hidden from UI
+    // anyway). Edge colour comes from the scan source that observed the
+    // hop: scanSourceColorMap looks up the source name (carried in the
+    // edge's ``properties.scan_source`` from the API) and returns the
+    // palette colour for that source's index. Edges without a known
+    // source fall back to a dim default. The edgeReducer can still
+    // override this with attack-chain red on top.
     for (const edge of data.edges) {
       if (edge.type === 'IN_SEGMENT') continue;
       if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
         const edgeKey = `topo:${edge.source}->${edge.target}`;
         if (!g.hasEdge(edgeKey)) {
+          const scanSource = edge.properties?.scan_source as string | undefined;
+          const baseColor = (scanSource && scanSourceColorMap.get(scanSource)) || '#22c55e18';
           g.addEdgeWithKey(edgeKey, edge.source, edge.target, {
             type: 'arrow',
-            size: 0.5,
-            color: '#22c55e18',
+            // Default edge width tuned so the kill chain stays readable
+            // at zoom-out (where 0.8px collapsed into the canvas) without
+            // overwhelming small graphs (where 2+ looked cartoonish).
+            // 1.4 keeps a clear 1.8x ratio against path-highlight (2.5),
+            // so the user-clicked path still pops above default chains.
+            size: 1.4,
+            color: baseColor,
             edgeType: 'topology',
+            scanSource: scanSource ?? null,
             zIndex: 0,
-          });
-        }
-      }
-    }
-
-    // Attack path edges — red, thin, arrow
-    for (const [pathEdgeKey] of attackEdgeMap) {
-      const [src, tgt] = pathEdgeKey.split('->');
-      if (g.hasNode(src) && g.hasNode(tgt)) {
-        const atkKey = `atk:${pathEdgeKey}`;
-        if (!g.hasEdge(atkKey)) {
-          g.addEdgeWithKey(atkKey, src, tgt, {
-            type: 'arrow',
-            size: 1.5,
-            color: '#ef4444',
-            edgeType: 'attack',
-            zIndex: 10,
           });
         }
       }
@@ -327,7 +432,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     }
 
     return g;
-  }, [data, attackEdgeMap]);
+  }, [data, attackEdgeMap, scanSourceColorMap]);
 
   // Sigma instance management
   useEffect(() => {
@@ -400,6 +505,15 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       const attrs = graph.getNodeAttributes(node);
       if (attrs.nodeType === 'host' && attrs.ip) {
         onSelectHost(attrs.ip as string);
+        return;
+      }
+      // Standalone scan-source nodes (operator boxes that never got
+      // scanned themselves) open the ScanSourceDetail panel instead
+      // of the host one. The node id is "source:<name>", we strip
+      // the prefix to get the name the API expects.
+      if (attrs.nodeType === 'scan_source' && onSelectScanSource) {
+        const name = node.startsWith('source:') ? node.slice('source:'.length) : (attrs.ip as string);
+        if (name) onSelectScanSource(name);
       }
     });
 
@@ -470,6 +584,14 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     const mouseCaptor = sigma.getMouseCaptor();
 
     sigma.on('downNode', ({ node, event }) => {
+      // Only the LEFT mouse button starts a drag. Right-click is reserved
+      // for the host context menu (set-as-target / mark-as-owned) — if
+      // we accepted the right-button mousedown here too, every
+      // right-click would attach the node to the cursor until the
+      // contextmenu released; the menu would still appear, but the
+      // node "stuck" to the pointer mid-flight. Filter at button level.
+      const original = event.original as MouseEvent;
+      if (original.button !== 0) return;
       draggedNode = node;
       isDragging = false;
       // Lock the bounding box so other nodes don't drift as this one moves.
@@ -480,8 +602,8 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       // moment the drag ends. With the lock held, every non-dragged
       // node stays exactly where the user last placed it.
       if (!sigma.getCustomBBox()) sigma.setCustomBBox(sigma.getBBox());
-      event.original.preventDefault();
-      event.original.stopPropagation();
+      original.preventDefault();
+      original.stopPropagation();
     });
 
     const onMouseMoveBody = (e: { x: number; y: number; preventSigmaDefault: () => void; original: MouseEvent }) => {
@@ -518,20 +640,61 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       sigma.kill();
       sigmaRef.current = null;
     };
-  }, [graph, onSelectHost, onClearPath, onCloseDetail]);
+  }, [graph, onSelectHost, onSelectScanSource, onClearPath, onCloseDetail]);
 
-  // Collect nodes that participate in attack paths
+  // Collect nodes that participate in attack paths, expanded along the
+  // topology chain. ``attackOnly`` mode dims nodes outside this set, so
+  // intermediate hops (gw, dmz-switch) need to be included — otherwise
+  // they'd vanish from the canvas the moment the operator flips the
+  // Attack Paths toggle, breaking the chain.
   const attackNodeIds = useMemo(() => {
     const ids = new Set<string>();
     if (!pathsData) return ids;
     for (const path of pathsData.paths) {
+      // Endpoint nodes (hosts and the scan source) are always included.
       for (const node of path.nodes) {
         ids.add(`host:${node.ip}`);
         ids.add(`source:${node.ip}`);
       }
+      // Topology hops between consecutive nodes in the path.
+      for (let i = 0; i < path.nodes.length - 1; i++) {
+        const startId = resolveNodeId(path.nodes[i].ip);
+        const endId = resolveNodeId(path.nodes[i + 1].ip);
+        if (!startId || !endId) continue;
+        for (const ekey of findTopologyPath(startId, endId)) {
+          const [s, t] = ekey.split('->');
+          ids.add(s);
+          ids.add(t);
+        }
+      }
     }
     return ids;
-  }, [pathsData]);
+  }, [pathsData, resolveNodeId, findTopologyPath]);
+
+  // Highlight-path node set, expanded along the topology chain so the
+  // intermediate hops between consecutive path-nodes also stay visible
+  // when the operator clicks a specific attack path in the side panel.
+  // Without this expansion the gateway and DMZ-switch hops would be
+  // dimmed by the nodeReducer and the chain would visually break.
+  const expandedPathNodeIds = useMemo(() => {
+    if (!highlightPathIps) return null;
+    const ids = new Set<string>();
+    for (const ip of highlightPathIps) {
+      ids.add(`host:${ip}`);
+      ids.add(`source:${ip}`);
+    }
+    for (let i = 0; i < highlightPathIps.length - 1; i++) {
+      const startId = resolveNodeId(highlightPathIps[i]);
+      const endId = resolveNodeId(highlightPathIps[i + 1]);
+      if (!startId || !endId) continue;
+      for (const ekey of findTopologyPath(startId, endId)) {
+        const [s, t] = ekey.split('->');
+        ids.add(s);
+        ids.add(t);
+      }
+    }
+    return ids;
+  }, [highlightPathIps, resolveNodeId, findTopologyPath]);
 
   // Set of hidden node IDs based on filters
   const hiddenNodes = useMemo(() => {
@@ -575,7 +738,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       let label = attrs.label as string;
       let forceLabel = false;
 
-      if (info && !attrs.isScanSource) {
+      if (info) {
         if (info.vulnCount > 0) {
           if (info.hasExploit) {
             // Has public exploit — largest: 14 base + increment
@@ -625,23 +788,33 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
         }
       }
 
-      let nodeColor = attrs.color as string;
-      // Owned is the one colour override: once compromised, "access
-      // state" dominates "what the host is" for pentester intent.
-      if (info?.owned && !attrs.isScanSource) {
-        nodeColor = '#22c55e';  // green — we have access
+      // Standalone scan-source nodes (operator's external box, the
+      // one that never got scanned itself). They're not in
+      // hostVulnMap because they're not :Host nodes, but they ARE
+      // owned by definition — to run nmap from a box, the pentester
+      // controls it. Same 💀 marker as for compromised hosts; the
+      // red colour baked in at graph-build time is what tells them
+      // apart visually from a real owned DC.
+      if (attrs.nodeType === 'scan_source') {
+        label = `💀 ${label}`;
+        forceLabel = true;
       }
 
-      const base = { ...attrs, size, label, forceLabel, color: nodeColor };
+      // Color: keep the role color (or scan-source red, or
+      // incomplete-host gray) baked in at graph-build time. Owned
+      // status is signalled by the 💀 label prefix, not by recoloring.
+      // Earlier iterations overrode owned hosts to green, which
+      // erased the role information ("is this owned DC or owned DB?")
+      // and conflicted with the new convention where standalone scan
+      // sources are red. The marker does the job; colours stay
+      // semantically stable.
+      const base = { ...attrs, size, label, forceLabel };
 
-      // Path highlight mode: dim everything except selected path
-      // Node IDs can be host:{ip}, source:{name}, or host:{name} (merged pivot)
-      const pathNodeIds = highlightPathIps
-        ? new Set(highlightPathIps.flatMap((ip) => [`host:${ip}`, `source:${ip}`]))
-        : null;
-
-      if (pathNodeIds) {
-        if (pathNodeIds.has(node)) {
+      // Path highlight mode: dim everything except selected path.
+      // ``expandedPathNodeIds`` includes the intermediate topology
+      // hops so the chain stays visible through gw / dmz-switch.
+      if (expandedPathNodeIds) {
+        if (expandedPathNodeIds.has(node)) {
           return { ...base, size: base.size * 1.5, forceLabel: true, zIndex: 10 };
         }
         return { ...base, color: base.color + '15', label: '', size: 2, zIndex: -1 };
@@ -665,32 +838,42 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     });
 
     sigma.setSetting('edgeReducer', (edge, attrs) => {
-      const edgeType = graph.getEdgeAttribute(edge, 'edgeType');
       const src = graph.source(edge);
       const tgt = graph.target(edge);
+      const isAttack = attackEdgeMap.has(`${src}->${tgt}`);
 
       // Hide edges connected to filtered-out nodes
       if (hiddenNodes.has(src) || hiddenNodes.has(tgt)) {
         return { ...attrs, hidden: true };
       }
 
-      // Path highlight mode
-      const pathNodeIds = highlightPathIps
-        ? new Set(highlightPathIps.flatMap((ip) => [`host:${ip}`, `source:${ip}`]))
-        : null;
-
-      if (pathNodeIds) {
-        if (pathNodeIds.has(src) && pathNodeIds.has(tgt)) {
+      // Path highlight mode (chain-aware via expandedPathNodeIds)
+      if (expandedPathNodeIds) {
+        if (expandedPathNodeIds.has(src) && expandedPathNodeIds.has(tgt)) {
           return { ...attrs, color: '#ef4444', size: 2.5, zIndex: 10 };
         }
         return { ...attrs, hidden: true };
       }
 
-      // Attack-only mode: hide topology edges
-      if (attackOnly && edgeType === 'topology') {
+      // Attack-only mode: hide edges that are NOT on any attack chain.
+      // Topology edges that ARE on a chain (red-tinted below) stay
+      // visible — they're the actual visualization of the attack path.
+      if (attackOnly && !isAttack) {
         return { ...attrs, hidden: true };
       }
 
+      // Default view keeps the scan-source colour and size the edge was
+      // built with — no attack-chain colour or thickness override. On a
+      // real engagement 80%+ of hosts carry at least one vulnerability,
+      // so a constant attack overlay drowns out the scan-source palette
+      // and turns the canvas into noise. The red visual is reserved for
+      // two user-initiated focus modes above this branch:
+      //   - ``expandedPathNodeIds`` (operator clicked a specific attack
+      //     path in the side panel — that path renders red)
+      //   - Attack-paths-only toggle filters non-attack edges out, but
+      //     the survivors keep their scan-source colour (the toggle
+      //     answers "show me only what's on an attack path" via
+      //     visibility, not via colour).
       if (selectedNodeId) {
         if (src === selectedNodeId || tgt === selectedNodeId) {
           return { ...attrs, size: (attrs.size as number) * 1.5 };
@@ -701,7 +884,10 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
     });
 
     sigma.refresh();
-  }, [selectedHost, graph, attackOnly, attackNodeIds, hiddenNodes, highlightPathIps]);
+  }, [
+    selectedHost, graph, attackOnly, attackNodeIds, hiddenNodes,
+    highlightPathIps, attackEdgeMap, expandedPathNodeIds,
+  ]);
 
   // Tooltip data
   const tooltipData = useMemo(() => {
@@ -717,6 +903,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
       maxCvss: info?.maxCvss ?? -1,
       hasExploit: info?.hasExploit || false,
       isScanSource: (attrs.isScanSource as boolean) || attrs.nodeType === 'scan_source',
+      isIncomplete: (attrs.isIncomplete as boolean) || false,
       isNew: info?.isNew || false,
       isStale: info?.isStale || false,
       topVulns: info?.topVulns || [],
@@ -725,7 +912,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
 
   const renderTooltip = useCallback(() => {
     if (!tooltipData) return null;
-    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource, isNew, isStale, topVulns } = tooltipData;
+    const { ip, role, vulnCount, maxCvss, hasExploit, isScanSource, isIncomplete, isNew, isStale, topVulns } = tooltipData;
     return (
       <div
         ref={tooltipRef}
@@ -737,8 +924,14 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
           {isNew && <Badge tone="green">NEW</Badge>}
           {isStale && <Badge tone="gray">GONE</Badge>}
           {isScanSource && <Badge tone="green">PIVOT</Badge>}
+          {isIncomplete && <Badge tone="gray">NO PORTS</Badge>}
         </div>
         <p className="text-xs text-gray-400 mt-0.5">{role}</p>
+        {isIncomplete && (
+          <p className="text-xs text-gray-500 mt-1 italic">
+            No services yet — rescan from a closer position or with different flags.
+          </p>
+        )}
         {vulnCount > 0 ? (
           <div className="mt-1.5 space-y-0.5">
             <div className="flex items-center gap-2 mb-1">
@@ -891,7 +1084,7 @@ export function GraphCanvas({ selectedHost, onSelectHost, highlightPathIps, onCl
 
       {/* Legend — hover chip. Lives on the graph canvas because that
           is the only view where role colours and state glyphs apply. */}
-      <Legend />
+      <Legend scanSources={scanSourcesData ?? []} />
 
       {/* Filter button */}
       <div

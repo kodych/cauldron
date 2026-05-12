@@ -175,6 +175,103 @@ class TestMultiSourceImport:
         assert stats["segments"] == 2  # 10.0.0.0/24 and 10.0.1.0/24
 
 
+class TestScanSourceAutoOwn:
+    """A host that doubles as a scan source (pivot) is automatically
+    owned — the pentester runs nmap from it, which requires shell
+    access. Two code paths handle this: ``_upsert_host`` checks for
+    a pre-existing ScanSource on CREATE, and ``_upsert_scan_source``
+    promotes a pre-existing Host whose IP matches the source name.
+    Manual ``Mark as Owned`` toggling via the API survives later
+    imports — ON CREATE only.
+    """
+
+    def test_host_created_after_scan_source_is_auto_owned(self):
+        """The mirror case: scan 1 registers ScanSource ``10.0.0.5``
+        (operator's box). Scan 2 from elsewhere also enumerates
+        ``10.0.0.5`` as a target. The Host created during scan 2's
+        ingestion should land with ``owned=true`` because the
+        ScanSource already exists."""
+        ingest_scan(_make_scan([_make_host("198.51.100.10", [(80, "http")])]),
+                    source_name="10.0.0.5")
+        # 10.0.0.5 now exists ONLY as a :ScanSource (no Host yet).
+
+        # Different scan from a different position lists 10.0.0.5 as a host.
+        ingest_scan(_make_scan([_make_host("10.0.0.5", [(22, "ssh")])]),
+                    source_name="external")
+
+        with get_session() as session:
+            owned = session.run(
+                "MATCH (h:Host {ip: '10.0.0.5'}) RETURN h.owned AS owned"
+            ).single()["owned"]
+            assert owned is True
+
+    def test_scan_source_created_after_host_promotes_host_to_owned(self):
+        """First scan brings web01 in as a target. Second scan uses
+        web01 as its pivot position. The Host created in scan 1 must
+        be promoted to owned at the moment scan 2's ScanSource is
+        upserted — without this, pivot hosts that were targets first
+        would never get the auto-owned flag."""
+        # Scan 1: web01 is just a target.
+        ingest_scan(
+            _make_scan([_make_host("10.0.2.10", [(80, "http")])]),
+            source_name="external",
+        )
+        with get_session() as session:
+            owned_before = session.run(
+                "MATCH (h:Host {ip: '10.0.2.10'}) RETURN h.owned AS owned"
+            ).single()["owned"]
+            assert owned_before is False
+
+        # Scan 2: operator now pivots from web01.
+        ingest_scan(
+            _make_scan([_make_host("10.0.1.10", [(445, "smb")])]),
+            source_name="10.0.2.10",
+        )
+        with get_session() as session:
+            owned_after = session.run(
+                "MATCH (h:Host {ip: '10.0.2.10'}) RETURN h.owned AS owned"
+            ).single()["owned"]
+            assert owned_after is True
+
+    def test_manual_unmark_owned_survives_reimport(self):
+        """If the operator manually unmarks a pivot host as owned
+        (right-click → Unmark), a subsequent re-import of the same
+        scan must NOT auto-own it again. Promotion happens only at
+        creation moments — manual state takes over after."""
+        ingest_scan(
+            _make_scan([_make_host("10.0.2.10", [(80, "http")])]),
+            source_name="external",
+        )
+        ingest_scan(
+            _make_scan([_make_host("10.0.1.10", [(445, "smb")])]),
+            source_name="10.0.2.10",
+        )
+
+        # Verify auto-owned fired.
+        with get_session() as session:
+            assert session.run(
+                "MATCH (h:Host {ip: '10.0.2.10'}) RETURN h.owned AS owned"
+            ).single()["owned"] is True
+
+            # Operator unmarks via API.
+            session.run("MATCH (h:Host {ip: '10.0.2.10'}) SET h.owned = false")
+
+        # Re-import same scans — owned must stay false.
+        ingest_scan(
+            _make_scan([_make_host("10.0.2.10", [(80, "http")])]),
+            source_name="external",
+        )
+        ingest_scan(
+            _make_scan([_make_host("10.0.1.10", [(445, "smb")])]),
+            source_name="10.0.2.10",
+        )
+
+        with get_session() as session:
+            assert session.run(
+                "MATCH (h:Host {ip: '10.0.2.10'}) RETURN h.owned AS owned"
+            ).single()["owned"] is False
+
+
 class TestNetworkSegments:
     """Test network segment detection and linking."""
 
@@ -226,9 +323,25 @@ class TestNetworkSegments:
 
 
 class TestTraceroute:
-    """Test traceroute data ingestion."""
+    """Test traceroute data ingestion.
 
-    def test_traceroute_creates_route_through(self):
+    Cauldron materializes intermediate traceroute hops as :Host nodes
+    flagged ``discovered_via='traceroute'`` (vs ``'scan'`` for the actual
+    targets). The host→hop fan-out plus consecutive hop→hop edges form a
+    real topology chain in the graph instead of disconnected dots.
+    """
+
+    def test_traceroute_creates_single_chain_no_fanout(self):
+        """For trace [h1, h2, target], the graph must contain:
+
+          target -[ROUTE_THROUGH]-> h2   (immediate previous hop only)
+          h2     -[ROUTE_THROUGH]-> h1   (consecutive chain)
+
+        and NOT a direct ``target → h1`` edge — that would create a
+        parallel route on top of the chain, which is what produces the
+        "weird shortcut paths" the operator caught in the visualization.
+        Every earlier hop must be reached through the chain.
+        """
         host = Host(
             ip="10.0.1.100",
             state="up",
@@ -242,13 +355,138 @@ class TestTraceroute:
         ingest_scan(_make_scan([host]), source_name="scanner")
 
         with get_session() as session:
-            result = session.run(
+            # Direct host→hop edges: ONLY to the immediate previous hop.
+            direct_hops = [r["ip"] for r in session.run(
                 "MATCH (target:Host {ip: '10.0.1.100'})-[:ROUTE_THROUGH]->(hop:Host) "
-                "RETURN hop.ip AS ip ORDER BY ip"
-            )
-            hops = [r["ip"] for r in result]
-            assert "10.0.0.1" in hops
-            assert "10.0.1.1" in hops
+                "RETURN hop.ip AS ip"
+            )]
+            assert direct_hops == ["10.0.1.1"]
+
+            # But the earlier hop is reachable through the chain.
+            chained = session.run(
+                "MATCH p = (target:Host {ip: '10.0.1.100'})-[:ROUTE_THROUGH*1..3]->(hop:Host {ip: '10.0.0.1'}) "
+                "RETURN length(p) AS hops"
+            ).single()
+            assert chained is not None and chained["hops"] == 2
+
+    def test_hop_nodes_materialize_with_hostname_no_services(self):
+        """A traceroute hop becomes a :Host with state='up', hostname
+        preserved, and NO ``HAS_SERVICE`` edges. The empty-services
+        shape is what marks it as "not yet enumerated" — same shape a
+        firewalled-but-up scan target would produce. The frontend
+        treats both as visually subordinate without a separate flag."""
+        host = Host(
+            ip="10.0.1.100",
+            state="up",
+            services=[Service(port=80, state="open", name="http")],
+            traceroute=[
+                TracerouteHop(ttl=1, ip="10.0.0.1", hostname="gw.example"),
+                TracerouteHop(ttl=2, ip="10.0.1.100"),
+            ],
+        )
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            # Scanned target has services and a hostname-or-IP label.
+            row = session.run(
+                "MATCH (h:Host {ip: '10.0.1.100'})-[:HAS_SERVICE]->(s:Service) "
+                "RETURN count(s) AS svc_count"
+            ).single()
+            assert row["svc_count"] == 1
+
+            # Hop exists as a Host node, has hostname preserved, but no
+            # HAS_SERVICE edges.
+            hop = session.run(
+                "MATCH (h:Host {ip: '10.0.0.1'}) "
+                "OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service) "
+                "RETURN h.hostname AS hn, count(s) AS svc_count"
+            ).single()
+            assert hop["hn"] == "gw.example"
+            assert hop["svc_count"] == 0
+
+    def test_consecutive_hops_linked(self):
+        """The chain h1 → h2 → host must also create h2 → h1 directly
+        (semantics: 'to reach h2, traffic goes through h1'). Without
+        this edge the hops are isolated points connected only to the
+        scanned host — fanout, not topology."""
+        host = Host(
+            ip="10.0.2.20",
+            state="up",
+            services=[Service(port=80, state="open", name="http")],
+            traceroute=[
+                TracerouteHop(ttl=1, ip="10.0.0.1", hostname="gw"),
+                TracerouteHop(ttl=2, ip="10.0.2.1", hostname="sw-dmz"),
+                TracerouteHop(ttl=3, ip="10.0.2.20"),
+            ],
+        )
+        ingest_scan(_make_scan([host]), source_name="scanner")
+
+        with get_session() as session:
+            # The consecutive-hop edge: 10.0.2.1 (ttl=2) routes through
+            # 10.0.0.1 (ttl=1).
+            chain = session.run(
+                "MATCH (sw:Host {ip: '10.0.2.1'})-[:ROUTE_THROUGH]->(gw:Host {ip: '10.0.0.1'}) "
+                "RETURN count(*) AS c"
+            ).single()["c"]
+            assert chain == 1
+
+    def test_scan_fills_in_previously_hop_only_host(self):
+        """When an IP first appears as a traceroute hop and is later
+        actually scanned, the second import fills in services / OS /
+        role via normal MERGE. The host becomes "complete" implicitly
+        — no explicit promotion state to maintain, no provenance flag
+        to flip. The empty-services shape disappears the moment real
+        service data arrives."""
+        # First scan: 10.0.0.1 appears only as a hop.
+        host_a = Host(
+            ip="10.0.1.100",
+            state="up",
+            services=[Service(port=80, state="open", name="http")],
+            traceroute=[
+                TracerouteHop(ttl=1, ip="10.0.0.1", hostname="gw"),
+                TracerouteHop(ttl=2, ip="10.0.1.100"),
+            ],
+        )
+        ingest_scan(_make_scan([host_a]), source_name="external-scan")
+
+        with get_session() as session:
+            # Hop exists with no services yet.
+            row = session.run(
+                "MATCH (h:Host {ip: '10.0.0.1'}) "
+                "OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service) "
+                "RETURN h.hostname AS hn, count(s) AS svc_count"
+            ).single()
+            assert row["svc_count"] == 0
+            assert row["hn"] == "gw"
+
+        # Second scan: we now actually target 10.0.0.1 from an internal
+        # pivot. Services + OS show up; the original hostname is kept.
+        host_b = Host(
+            ip="10.0.0.1",
+            hostname=None,  # internal scan didn't resolve a hostname
+            state="up",
+            os_name="VyOS 1.4",
+            services=[
+                Service(port=22, state="open", name="ssh"),
+                Service(port=443, state="open", name="https"),
+            ],
+        )
+        ingest_scan(_make_scan([host_b]), source_name="internal-pivot")
+
+        with get_session() as session:
+            row = session.run(
+                "MATCH (h:Host {ip: '10.0.0.1'}) "
+                "OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service) "
+                "RETURN h.hostname AS hn, h.os_name AS os, count(s) AS svc_count"
+            ).single()
+            # Services now exist — host is "complete".
+            assert row["svc_count"] == 2
+            # OS picked up from the new scan.
+            assert row["os"] == "VyOS 1.4"
+            # Hostname preserved from the original hop import (COALESCE
+            # in _upsert_host kept the existing one because the new
+            # scan didn't resolve a hostname).
+            assert row["hn"] == "gw"
 
 
 class TestRealNmapFile:

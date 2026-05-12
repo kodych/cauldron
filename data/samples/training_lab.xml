@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="file:///usr/share/nmap/nmap.xsl" type="text/xsl"?>
+<!--
+  Sample: training_lab.xml
+
+  A flat /24 with four classic vulnerable training VMs on a host-only
+  VirtualBox network. Single-shot ``nmap -sV -sC`` scan from the
+  operator's laptop on the same L2 — no traceroute, no pivoting,
+  every host one hop away.
+
+  Use this fixture to exercise:
+    - NVD enrichment on textbook clichés (vsftpd 2.3.4 backdoor,
+      Drupalgeddon2, mod_ssl Slapper, PHP-CGI RCE)
+    - exploit-db rule matcher (anonymous FTP, default Tomcat creds,
+      SMB-signing-disabled, NULL-session Samba)
+    - host classifier on a small heterogeneous set
+    - graph rendering without any traceroute hops — every host
+      attaches directly to the scan source, no chain
+
+  Each VM here is a canonical CTF box. The CVEs are publicly known,
+  pre-2022, with one-line Metasploit modules — perfect to verify the
+  whole boil enrichment pipeline (NVD + AI flags) catches what every
+  pentester recognises on sight.
+-->
+<nmaprun scanner="nmap" args="nmap -sV -sC -O -oX training_lab.xml 192.168.56.0/24" start="1715000000" startstr="Sun May 11 2025 14:00:00" version="7.94" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="1000" services="1-1000"/>
+
+<!-- metasploitable.lab — Metasploitable 2 clone. The catalogue of
+     classic Linux RCE shipped at every penetration testing course. -->
+<host starttime="1715000001" endtime="1715000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="192.168.56.10" addrtype="ipv4"/>
+  <address addr="08:00:27:A5:01:0A" addrtype="mac" vendor="Oracle VirtualBox virtual NIC"/>
+  <hostnames><hostname name="metasploitable.lab" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 2.6.24 - 2.6.36" accuracy="93"/></os>
+  <ports>
+    <!-- vsftpd 2.3.4 backdoor — CVE-2011-2523. Smiley-face login triggers
+         RCE on port 6200. The textbook "first shell" of CTF training. -->
+    <port protocol="tcp" portid="21"><state state="open" reason="syn-ack"/><service name="ftp" product="vsftpd" version="2.3.4">
+      <script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)"/>
+    </service></port>
+    <!-- OpenSSH 4.7p1 — old, predictable hostkey scope but not
+         directly RCE-able. Useful for password-spray + once-creds-known. -->
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="4.7p1 Debian 8ubuntu1" ostype="Linux">
+      <script id="ssh-hostkey" output="1024 60:0f:cf:e1:c0:5f:6a:74:d6:90:24:fa:c4:d5:6c:cd"/>
+    </service></port>
+    <!-- Telnet plaintext + default credentials at user 'msfadmin'. -->
+    <port protocol="tcp" portid="23"><state state="open" reason="syn-ack"/><service name="telnet" product="Linux telnetd"/></port>
+    <port protocol="tcp" portid="25"><state state="open" reason="syn-ack"/><service name="smtp" product="Postfix smtpd"/></port>
+    <!-- ISC BIND 9.4.2 — old, multiple CVEs. -->
+    <port protocol="tcp" portid="53"><state state="open" reason="syn-ack"/><service name="domain" product="ISC BIND" version="9.4.2"/></port>
+    <!-- Apache 2.2.8 + PHP 5.2.4 — pre-historic, CVE-2012-1823 path. -->
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.2.8" extrainfo="(Ubuntu) DAV/2">
+      <script id="http-server-header" output="Apache/2.2.8 (Ubuntu) PHP/5.2.4-2ubuntu5.10 with Suhosin-Patch"/>
+      <script id="http-title" output="Metasploitable2 - Linux"/>
+    </service></port>
+    <!-- Samba 3.0.20-Debian — CVE-2007-2447 username map script RCE
+         (smb_usermap_script Metasploit module). Pre-auth, root. -->
+    <port protocol="tcp" portid="139"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Samba smbd" version="3.0.20-Debian"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Samba smbd" version="3.0.20-Debian"/></port>
+    <!-- MySQL with anonymous / weak login. -->
+    <port protocol="tcp" portid="3306"><state state="open" reason="syn-ack"/><service name="mysql" product="MySQL" version="5.0.51a-3ubuntu5">
+      <script id="mysql-info" output="Protocol: 10; Version: 5.0.51a-3ubuntu5; Capabilities: Long Password, Found Rows..."/>
+    </service></port>
+    <!-- PostgreSQL with default creds. -->
+    <port protocol="tcp" portid="5432"><state state="open" reason="syn-ack"/><service name="postgresql" product="PostgreSQL DB" version="8.3.0 - 8.3.7"/></port>
+    <!-- distccd — CVE-2004-2687 command-injection RCE. -->
+    <port protocol="tcp" portid="3632"><state state="open" reason="syn-ack"/><service name="distccd" product="distccd" version="v1" extrainfo="(GNU 4.2.4)"/></port>
+    <!-- IRC backdoored UnrealIRCd 3.2.8.1 — CVE-2010-2075. -->
+    <port protocol="tcp" portid="6667"><state state="open" reason="syn-ack"/><service name="irc" product="UnrealIRCd"/></port>
+    <!-- Tomcat 5.5 with default tomcat:tomcat manager creds. -->
+    <port protocol="tcp" portid="8180"><state state="open" reason="syn-ack"/><service name="http" product="Apache Tomcat/Coyote JSP engine" version="1.1"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb-security-mode" output="account_used: guest; authentication_level: user; challenge_response: supported; message_signing: disabled"/>
+    <script id="smb-os-discovery" output="OS: Unix (Samba 3.0.20-Debian); Computer name: metasploitable; Domain: WORKGROUP"/>
+  </hostscript>
+</host>
+
+<!-- dc-1.lab — DC-1 Vulnhub. Drupal 7 site with Drupalgeddon2. -->
+<host starttime="1715000001" endtime="1715000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="192.168.56.20" addrtype="ipv4"/>
+  <address addr="08:00:27:A5:01:14" addrtype="mac" vendor="Oracle VirtualBox virtual NIC"/>
+  <hostnames><hostname name="dc-1.lab" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 3.2 - 3.16" accuracy="92"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="6.0p1 Debian 4+deb7u7" ostype="Linux"/></port>
+    <!-- Apache 2.2.22 serving Drupal 7 — CVE-2018-7600 Drupalgeddon2.
+         http-generator NSE script surfaces the Drupal version for the
+         banner tokenizer that Cauldron's CPE resolver picks up. -->
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.2.22" extrainfo="(Debian)">
+      <script id="http-server-header" output="Apache/2.2.22 (Debian)"/>
+      <script id="http-title" output="Welcome to Drupal Site | Drupal Site"/>
+      <script id="http-generator" output="Drupal 7 (http://drupal.org)"/>
+      <script id="http-robots.txt" output="36 disallowed entries (15 shown)&#xa;/includes/ /misc/ /modules/ /profiles/ /scripts/ &#xa;/themes/ /CHANGELOG.txt /cron.php /INSTALL.mysql.txt"/>
+    </service></port>
+    <port protocol="tcp" portid="111"><state state="open" reason="syn-ack"/><service name="rpcbind" version="2-4" extrainfo="RPC #100000"/></port>
+  </ports>
+</host>
+
+<!-- kioptrix.lab — Kioptrix Level 1. Apache 1.3.20 + mod_ssl 2.8.4 +
+     OpenSSL 0.9.6b on RHL 7.x. The classic Slapper-worm CVE-2002-0082
+     plus Samba 2.2.1a NetBIOS shell. -->
+<host starttime="1715000001" endtime="1715000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="192.168.56.30" addrtype="ipv4"/>
+  <address addr="08:00:27:A5:01:1E" addrtype="mac" vendor="Oracle VirtualBox virtual NIC"/>
+  <hostnames><hostname name="kioptrix.lab" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 2.4.x" accuracy="88"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="2.9p2" extrainfo="protocol 1.99"/></port>
+    <!-- Compound banner — Cauldron's slash-tokenizer extracts mod_ssl
+         and OpenSSL sub-product CPEs from this string. -->
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="1.3.20" extrainfo="(Unix) (Red-Hat/Linux) mod_ssl/2.8.4 OpenSSL/0.9.6b">
+      <script id="http-server-header" output="Apache/1.3.20 (Unix) (Red-Hat/Linux) mod_ssl/2.8.4 OpenSSL/0.9.6b"/>
+      <script id="http-title" output="Test Page for the Apache Web Server on Red Hat Linux"/>
+    </service></port>
+    <port protocol="tcp" portid="111"><state state="open" reason="syn-ack"/><service name="rpcbind"/></port>
+    <!-- Samba 2.2.1a — CVE-2003-0201 trans2open RCE. -->
+    <port protocol="tcp" portid="139"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Samba smbd"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Apache httpd" version="1.3.20" extrainfo="(Unix) (Red-Hat/Linux) mod_ssl/2.8.4 OpenSSL/0.9.6b" tunnel="ssl"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb-os-discovery" output="OS: Unix (Samba 2.2.1a)&#xa;Workgroup: MYGROUP"/>
+  </hostscript>
+</host>
+
+<!-- pwnos.lab — pWnOS 1.0 Vulnhub. PHP 5.2 + Apache + obvious-vuln
+     stack. Includes outdated WebDAV + writable shares. -->
+<host starttime="1715000001" endtime="1715000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="192.168.56.40" addrtype="ipv4"/>
+  <address addr="08:00:27:A5:01:28" addrtype="mac" vendor="Oracle VirtualBox virtual NIC"/>
+  <hostnames><hostname name="pwnos.lab" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 2.6.20" accuracy="89"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="4.6p1 Debian 5build1"/></port>
+    <!-- PHP CGI on Apache — CVE-2012-1823 if query starts with ?-s. -->
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Apache httpd" version="2.2.4" extrainfo="(Ubuntu) PHP/5.2.4-2ubuntu5 with Suhosin-Patch">
+      <script id="http-server-header" output="Apache/2.2.4 (Ubuntu) PHP/5.2.4-2ubuntu5 with Suhosin-Patch"/>
+      <script id="http-title" output="Welcome to pWnOS"/>
+    </service></port>
+    <port protocol="tcp" portid="139"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Samba smbd" version="3.0.28a"/></port>
+    <port protocol="tcp" portid="445"><state state="open" reason="syn-ack"/><service name="netbios-ssn" product="Samba smbd" version="3.0.28a"/></port>
+    <!-- ProFTPD 1.3.0a — CVE-2009-3580 buffer overflow. -->
+    <port protocol="tcp" portid="10000"><state state="open" reason="syn-ack"/><service name="http" product="MiniServ" version="0.01" extrainfo="Webmin httpd"/></port>
+  </ports>
+  <hostscript>
+    <script id="smb-security-mode" output="account_used: guest; authentication_level: user; message_signing: disabled"/>
+  </hostscript>
+</host>
+
+<runstats><finished time="1715000180" elapsed="180.00" summary="Nmap done at Sun May 11 2025 14:03:00; 256 IP addresses (4 hosts up) scanned in 180.00 seconds" exit="success"/></runstats>
+</nmaprun>

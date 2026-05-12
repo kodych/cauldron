@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet href="file:///usr/share/nmap/nmap.xsl" type="text/xsl"?>
+<!--
+  Sample: internet_facing.xml
+
+  External attack surface assessment of a small business's public IP
+  block 198.51.100.0/29 (8 IPs, 6 hosts up). Scan from the operator's
+  external box, ``-sV`` + ``-sC`` only — no ``-A``, no traceroute. The
+  most common pre-engagement nmap profile: identify exposed services
+  + their versions, hand the report off to the operator who'll start
+  exploit research.
+
+  Use this fixture to exercise:
+    - NVD enrichment on modern (post-2020) clichés — ProxyShell,
+      Log4j-via-VMware, GitLab exiftool RCE, Confluence OGNL,
+      Fortinet SSL-VPN heap overflow
+    - Hostname-pattern classification (``mail.*``, ``vpn.*``, ``git.*``)
+      against role-based rule firing
+    - Graph rendering on a single-subnet, single-source scan — no
+      traceroute hops, no pivoting, every host attached directly
+      to the scan source
+    - Pentester-priority sort (CISA KEV first, then has_exploit,
+      then CVSS) on a graph where every host has at least one KEV
+      CVE attached
+
+  No internal network is visible from this position — these are all
+  public IPs scanned from the open internet. To "go deeper" the
+  operator would need to compromise one and pivot inside (see
+  ``pivot_demo/`` for that scenario).
+-->
+<nmaprun scanner="nmap" args="nmap -sV -sC -oX internet_facing.xml 198.51.100.0/29" start="1716000000" startstr="Fri May 23 2025 09:00:00" version="7.94" xmloutputversion="1.05">
+<scaninfo type="syn" protocol="tcp" numservices="1000" services="1-1000"/>
+
+<!-- webmail.acmecorp.example — Microsoft Exchange 2019 CU8.
+     ProxyShell chain: CVE-2021-26855 (SSRF) + CVE-2021-27065 (RCE).
+     Pre-auth RCE on the Exchange server's IIS layer. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.10" addrtype="ipv4"/>
+  <hostnames><hostname name="webmail.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="Microsoft Windows Server 2019" accuracy="95"/></os>
+  <ports>
+    <port protocol="tcp" portid="25"><state state="open" reason="syn-ack"/><service name="smtp" product="Microsoft Exchange smtpd" version="15.02.0792.015">
+      <script id="smtp-commands" output="webmail.acmecorp.example Hello, EHLO mail.acmecorp.example"/>
+    </service></port>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Microsoft IIS httpd" version="10.0">
+      <script id="http-server-header" output="Microsoft-IIS/10.0"/>
+      <script id="http-title" output="IIS Windows Server"/>
+    </service></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Microsoft IIS httpd" version="10.0" tunnel="ssl">
+      <script id="http-title" output="Outlook Web App"/>
+      <script id="http-server-header" output="Microsoft-IIS/10.0"/>
+      <script id="ssl-cert" output="Subject: CN=webmail.acmecorp.example"/>
+    </service></port>
+    <port protocol="tcp" portid="465"><state state="open" reason="syn-ack"/><service name="smtps" product="Microsoft Exchange smtpd" version="15.02.0792.015" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="587"><state state="open" reason="syn-ack"/><service name="submission" product="Microsoft Exchange smtpd" version="15.02.0792.015"/></port>
+    <port protocol="tcp" portid="993"><state state="open" reason="syn-ack"/><service name="imaps" product="Microsoft Exchange imap4" tunnel="ssl"/></port>
+    <port protocol="tcp" portid="995"><state state="open" reason="syn-ack"/><service name="pop3s" product="Microsoft Exchange pop3" tunnel="ssl"/></port>
+  </ports>
+</host>
+
+<!-- git.acmecorp.example — GitLab CE 13.10.2 with the exiftool RCE.
+     CVE-2021-22205 — unauth file upload triggers ImageMagick to
+     hand off to exiftool, which executes arbitrary code. CISA KEV
+     since 2021, mass-exploited in the wild. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.11" addrtype="ipv4"/>
+  <hostnames><hostname name="git.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 5.4" accuracy="91"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="8.2p1" extrainfo="Ubuntu 4ubuntu0.5">
+      <script id="ssh-hostkey" output="3072 SHA256:gitlab-host-key..."/>
+    </service></port>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="nginx" version="1.18.0">
+      <script id="http-server-header" output="nginx/1.18.0 (Ubuntu)"/>
+      <script id="http-title" output="Sign in - GitLab"/>
+      <script id="http-generator" output="GitLab 13.10.2"/>
+    </service></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="nginx" version="1.18.0" tunnel="ssl">
+      <script id="http-title" output="Sign in - GitLab"/>
+      <script id="ssl-cert" output="Subject: CN=git.acmecorp.example"/>
+    </service></port>
+  </ports>
+</host>
+
+<!-- wiki.acmecorp.example — Atlassian Confluence 7.13.6.
+     CVE-2022-26134 — OGNL injection, pre-auth RCE. Same vuln
+     pattern as the pivot_demo, useful for repeat-detection
+     sanity check across multiple fixtures. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.12" addrtype="ipv4"/>
+  <hostnames><hostname name="wiki.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="Linux 5.15" accuracy="89"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="8.9p1"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Atlassian Confluence" version="7.13.6" tunnel="ssl">
+      <script id="http-server-header" output="Atlassian Confluence/7.13.6"/>
+      <script id="http-title" output="Log in - Confluence"/>
+      <script id="ssl-cert" output="Subject: CN=wiki.acmecorp.example"/>
+    </service></port>
+    <port protocol="tcp" portid="8090"><state state="open" reason="syn-ack"/><service name="http" product="Atlassian Confluence" version="7.13.6">
+      <script id="http-title" output="Log in - Confluence"/>
+    </service></port>
+  </ports>
+</host>
+
+<!-- vpn.acmecorp.example — Fortinet FortiOS 7.2.2 SSL VPN.
+     CVE-2022-42475 — heap overflow in SSL VPN, pre-auth RCE.
+     CISA KEV. Internet-exposed VPN gateways with this version
+     have been mass-compromised. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.13" addrtype="ipv4"/>
+  <hostnames><hostname name="vpn.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="Fortinet FortiOS 7.2" accuracy="93"/></os>
+  <ports>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Fortinet FortiOS SSL VPN" version="7.2.2" tunnel="ssl">
+      <script id="http-title" output="FortiGate SSL VPN"/>
+      <script id="ssl-cert" output="Subject: CN=vpn.acmecorp.example"/>
+    </service></port>
+    <port protocol="tcp" portid="10443"><state state="open" reason="syn-ack"/><service name="https-alt" product="Fortinet FortiOS Admin" tunnel="ssl"/></port>
+  </ports>
+</host>
+
+<!-- vmgmt.acmecorp.example — VMware vCenter Server 7.0u2.
+     CVE-2021-21972 — unauth RCE in /ui/vropspluginui/rest/services/uploadova.
+     The "spray-the-internet" CVE of 2021. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.14" addrtype="ipv4"/>
+  <hostnames><hostname name="vmgmt.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="VMware Photon OS" accuracy="86"/></os>
+  <ports>
+    <port protocol="tcp" portid="80"><state state="open" reason="syn-ack"/><service name="http" product="Envoy" extrainfo="reverse-proxy"/></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="VMware vCenter Server" version="7.0.2.00100" tunnel="ssl">
+      <script id="http-title" output="VMware vSphere"/>
+      <script id="http-server-header" output="VMware vCenter Server"/>
+    </service></port>
+    <port protocol="tcp" portid="5480"><state state="open" reason="syn-ack"/><service name="https-alt" product="VMware vCenter Server Appliance Management" tunnel="ssl"/></port>
+  </ports>
+</host>
+
+<!-- fw.acmecorp.example — Cisco ASA 9.8(1). Just SSH + WebVPN
+     exposed; no vulnerable HTTP fingerprint. Acts as the "clean"
+     host in the graph so the operator can see what NORMAL looks
+     like next to obvious targets. -->
+<host starttime="1716000001" endtime="1716000060">
+  <status state="up" reason="syn-ack"/>
+  <address addr="198.51.100.5" addrtype="ipv4"/>
+  <hostnames><hostname name="fw.acmecorp.example" type="PTR"/></hostnames>
+  <os><osmatch name="Cisco ASA 9.8" accuracy="94"/></os>
+  <ports>
+    <port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="Cisco SSH" version="2.0">
+      <script id="ssh-hostkey" output="2048 SHA256:fw-host-key..."/>
+    </service></port>
+    <port protocol="tcp" portid="443"><state state="open" reason="syn-ack"/><service name="https" product="Cisco ASA SSL VPN" tunnel="ssl"/></port>
+  </ports>
+</host>
+
+<runstats><finished time="1716000300" elapsed="300.00" summary="Nmap done at Fri May 23 2025 09:05:00; 8 IP addresses (6 hosts up) scanned in 300.00 seconds" exit="success"/></runstats>
+</nmaprun>

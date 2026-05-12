@@ -23,10 +23,47 @@ export const ROLE_COLORS: Record<string, string> = {
   unknown:           '#4b5563',  // gray-600
 };
 
+// Scan-source palette: each scan position gets a distinct edge colour,
+// so the kill chain "this segment was unlocked from THIS pivot" is
+// readable at a glance on multi-source engagements. Order matches
+// scan first_seen ascending: the earliest scan source paints lime,
+// the first pivot paints cyan, etc.
+//
+// Red is deliberately absent — it's reserved for attack-chain overlay
+// on top of these. The palette is colour-blind-aware (no
+// indistinguishable green/red pairs).
+export const SCAN_SOURCE_PALETTE: readonly string[] = [
+  '#84cc16',  // lime — initial scan position
+  '#06b6d4',  // cyan — first pivot
+  '#a855f7',  // purple — second pivot
+  '#f97316',  // orange — third pivot
+  '#92400e',  // amber-800 (brown) — fourth pivot
+];
+
+// Beyond the palette length, sources fall back to a neutral colour —
+// engagements with more than 5 pivot positions are unusual, and the
+// operator can still tell sources apart via the scan-source detail
+// panel. The fallback is brighter than the topology default so the
+// edges don't disappear entirely.
+export const SCAN_SOURCE_FALLBACK = '#64748b';  // slate-500
+
+export function getScanSourceColor(index: number): string {
+  if (index < 0) return SCAN_SOURCE_FALLBACK;
+  return SCAN_SOURCE_PALETTE[index] ?? SCAN_SOURCE_FALLBACK;
+}
+
+
 export const NODE_TYPE_COLORS: Record<string, string> = {
   host:        '#6366f1',  // indigo — default for hosts without role
   segment:     '#f59e0b',  // amber
-  scan_source: '#22c55e',  // green
+  // Standalone scan source = pentester's box at the start of the kill
+  // chain. Red mirrors the DC role color: the engagement starts at
+  // a red node (operator's kali) and ends at a red node (compromised
+  // DC). The 💀 marker + IP-only label + small size disambiguate them
+  // at a glance. Pivot hosts that double as scan sources keep their
+  // role color instead — they're not "scan source" type, they're
+  // regular hosts merged with the source.
+  scan_source: '#ef4444',  // red — kali-on-the-attack-side bookend
 };
 
 export function getRoleColor(role: string): string {

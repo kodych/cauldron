@@ -68,6 +68,11 @@ factors into four conceptual layers:
     is_new, is_stale, has_changes,
     owned, target, target_blocked, notes
 })
+// A Host with no HAS_SERVICE edges represents an "incomplete" host:
+// either a traceroute hop we know exists but haven't enumerated, or a
+// scanned-but-firewalled target. The frontend treats both the same way.
+// MERGE-based ingestion lets later scans fill in the services without
+// any explicit provenance flag.
 (:Service {
     port, protocol, state,
     name, product, version, extra_info, banner, servicefp,
@@ -90,7 +95,7 @@ factors into four conceptual layers:
     source                // nvd | exploit_db | ai
 }]->(:Vulnerability)
 (:NetworkSegment)-[:CAN_REACH]->(:NetworkSegment)
-(:Host)-[:ROUTE_THROUGH]->(:Host)
+(:Host)-[:ROUTE_THROUGH {ttl}]->(:Host)  // host→hop and hop→upstream-hop
 (:Credential)-[:VALID_FOR]->(:Service)
 ```
 

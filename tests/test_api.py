@@ -303,6 +303,86 @@ class TestGraph:
         host_nodes = [n for n in resp.json()["nodes"] if n["type"] == "host"]
         assert len(host_nodes) == 1
 
+    def test_graph_remaps_scanned_from_to_first_hop_when_traceroute_exists(self, client):
+        """When a scanned host has traceroute data, the ScanSource → host
+        edge gets remapped to ScanSource → first_hop. The host then
+        reaches back via its own ROUTE_THROUGH chain. This forms a real
+        topology tree instead of a fan-out star from the scan source.
+        Hosts without traceroute keep the direct edge (status quo).
+
+        ROUTE_THROUGH edges are emitted REVERSED relative to Neo4j: the
+        graph stores ``downstream → upstream`` (semantically "to reach
+        downstream, traffic goes through upstream"), but the frontend
+        needs arrows in packet-flow direction (upstream → downstream)
+        so the visual chain reads scanner → gw → sw → host.
+        """
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner'})
+                // Host with traceroute through gw -> sw -> self
+                CREATE (target:Host {ip: '10.0.2.20', state: 'up'})
+                CREATE (svc:Service {port: 80, protocol: 'tcp', name: 'http'})
+                CREATE (target)-[:HAS_SERVICE]->(svc)
+                // Hop nodes have no services (they're traceroute-only).
+                CREATE (gw:Host {ip: '10.0.0.1', state: 'up'})
+                CREATE (sw:Host {ip: '10.0.2.1', state: 'up'})
+                CREATE (src)-[:SCANNED_FROM]->(target)
+                // Production-shaped data: host → immediate prev hop only,
+                // earlier hop reached through the chain. ROUTE_THROUGH
+                // edges carry ``source`` matching the ScanSource name so
+                // chain traversal can stay within one scan's trace.
+                CREATE (target)-[:ROUTE_THROUGH {ttl: 2, source: 'scanner'}]->(sw)
+                CREATE (sw)-[:ROUTE_THROUGH {source: 'scanner'}]->(gw)
+                // Host WITHOUT traceroute keeps direct SCANNED_FROM.
+                CREATE (direct:Host {ip: '10.0.5.5', state: 'up'})
+                CREATE (svc2:Service {port: 22, protocol: 'tcp', name: 'ssh'})
+                CREATE (direct)-[:HAS_SERVICE]->(svc2)
+                CREATE (src)-[:SCANNED_FROM]->(direct)
+            """)
+
+        resp = client.get("/api/v1/graph")
+        data = resp.json()
+        scan_edges = [e for e in data["edges"] if e["type"] == "SCANNED_FROM"]
+        targets = {e["target"] for e in scan_edges}
+        # Traceroute-host: scanner connects to first hop (the smallest
+        # TTL hop in the host's trace, == gw here), NOT to target directly.
+        assert "host:10.0.0.1" in targets  # remapped to gw
+        assert "host:10.0.2.20" not in targets  # NOT directly to scanned host
+        # Direct-scan host: keeps direct SCANNED_FROM
+        assert "host:10.0.5.5" in targets
+
+        # ROUTE_THROUGH edges: exposed in packet-flow direction
+        # (source = upstream, target = downstream).
+        route_edges = [e for e in data["edges"] if e["type"] == "ROUTE_THROUGH"]
+        assert len(route_edges) == 2
+        rt_pairs = {(e["source"], e["target"]) for e in route_edges}
+        assert ("host:10.0.0.1", "host:10.0.2.1") in rt_pairs  # gw → sw
+        assert ("host:10.0.2.1", "host:10.0.2.20") in rt_pairs  # sw → target
+
+    def test_graph_exposes_service_count_on_nodes(self, client):
+        """Frontend uses ``service_count == 0`` as the "incomplete host"
+        signal (renders smaller / dim gray). This covers both true
+        traceroute hops AND scanned-but-firewalled hosts — the same
+        treatment because the operator action is the same: re-approach."""
+        with get_session() as session:
+            session.run("""
+                CREATE (src:ScanSource {name: 'scanner'})
+                CREATE (scanned:Host {ip: '10.0.1.10', state: 'up'})
+                CREATE (svc:Service {port: 80, protocol: 'tcp', name: 'http'})
+                CREATE (scanned)-[:HAS_SERVICE]->(svc)
+                // Hop: no services, just a hostname from traceroute.
+                CREATE (hop:Host {ip: '10.0.0.1', state: 'up', hostname: 'gw.example'})
+                CREATE (src)-[:SCANNED_FROM]->(scanned)
+                CREATE (scanned)-[:ROUTE_THROUGH {ttl: 1, source: 'scanner'}]->(hop)
+            """)
+
+        resp = client.get("/api/v1/graph")
+        data = resp.json()
+        scanned_node = next(n for n in data["nodes"] if n["id"] == "host:10.0.1.10")
+        hop_node = next(n for n in data["nodes"] if n["id"] == "host:10.0.0.1")
+        assert scanned_node["properties"]["service_count"] == 1
+        assert hop_node["properties"]["service_count"] == 0
+
     def test_graph_merges_pivot_host_with_scan_source(self, client):
         """When ScanSource.name matches Host.ip, they merge into one node."""
         with get_session() as session:

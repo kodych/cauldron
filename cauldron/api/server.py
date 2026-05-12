@@ -283,6 +283,19 @@ class TopologyResponse(BaseModel):
     segments: list[TopologySegment]
 
 
+class ScanSourceOut(BaseModel):
+    """A single ScanSource — the position the operator ran nmap from.
+
+    Powers the click-detail view for ``scan_source`` nodes on the canvas
+    (external scanner boxes that never got scanned themselves, so they
+    don't appear in the Hosts list).
+    """
+    name: str
+    scan_args: str | None
+    first_seen: str | None
+    last_seen: str | None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -785,9 +798,11 @@ def get_graph(
             ORDER BY vuln_tier, role_tier, h.ip
             LIMIT $limit
             OPTIONAL MATCH (h)-[:IN_SEGMENT]->(seg:NetworkSegment)
+            OPTIONAL MATCH (h)-[:HAS_SERVICE]->(svc:Service)
+            WITH h, seg, count(svc) AS service_count
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.os_name AS os_name, h.owned AS owned, h.target AS target,
-                   seg.cidr AS segment
+                   seg.cidr AS segment, service_count
             """,
             limit=limit,
         )
@@ -805,6 +820,14 @@ def get_graph(
                     "segment": r["segment"],
                     "owned": bool(r.get("owned")),
                     "target": bool(r.get("target")),
+                    # Number of services we have for this host. Zero means
+                    # either an unscanned traceroute hop or a scanned host
+                    # with no open/filtered ports (firewalled). The frontend
+                    # uses this to render incomplete hosts as small dim
+                    # nodes — the visual treatment is the same regardless
+                    # of how we arrived at "no ports", because the operator
+                    # action is the same: rescan / approach differently.
+                    "service_count": int(r.get("service_count") or 0),
                 },
             ))
             seen_nodes.add(node_id)
@@ -857,19 +880,118 @@ def get_graph(
                     seen_nodes.add(src_id)
                 source_to_node[src_name] = src_id
 
-        # SCANNED_FROM edges
+        # ROUTE_THROUGH edges (topology chain). Neo4j stores them with
+        # the semantic direction "downstream → upstream" ("to reach the
+        # downstream node, traffic passes through the upstream one").
+        # For the frontend we emit them REVERSED so the arrow points in
+        # packet-flow direction (scanner → gateway → switch → host),
+        # which matches the operator's mental model. Without this
+        # reversal, all arrows converge into the gateway from both
+        # directions (scanner→gw AND host→gw) and the chain reads as
+        # "everyone fights for the gateway" instead of "the scanner
+        # reaches things through the gateway".
+        result = session.run(
+            """
+            MATCH (downstream:Host)-[r:ROUTE_THROUGH]->(upstream:Host)
+            WHERE downstream.ip IN $ips AND upstream.ip IN $ips
+            RETURN downstream.ip AS down_ip, upstream.ip AS up_ip, r.source AS source
+            """,
+            ips=host_ips,
+        )
+        for r in result:
+            down_id = f"host:{r['down_ip']}"
+            up_id = f"host:{r['up_ip']}"
+            if down_id in seen_nodes and up_id in seen_nodes:
+                # Render direction = upstream → downstream (packet flow).
+                # ``scan_source`` lets the frontend tint each edge by the
+                # ScanSource that observed the hop. Two scans through the
+                # same gateway get distinct edges (MERGE keyed on source),
+                # so each chain segment carries the colour of the position
+                # that revealed it.
+                edges.append(GraphEdge(
+                    source=up_id, target=down_id, type="ROUTE_THROUGH",
+                    properties={"scan_source": r["source"]} if r["source"] else {},
+                ))
+
+        # For SCANNED_FROM rendering: when a host has any traceroute data,
+        # the scanner connects to the host's FIRST HOP (the closest-to-
+        # scanner end of the ROUTE_THROUGH chain), not directly to the
+        # host. The host then reaches back through its own chain. Hosts
+        # without traceroute data keep the direct ScanSource → host edge.
+        #
+        # "First hop" = the endpoint of the chain that has no further
+        # ROUTE_THROUGH edge **tagged with the same scan source**. The
+        # filter matters when chains from different scan positions
+        # share intermediate hops (e.g. the DMZ gateway 10.0.2.1 is on
+        # both the external scanner's ISP path AND the DMZ pivot's
+        # internal path). Without it, the chain walked from a host in
+        # scan B bleeds into shared hops contributed by scan A and
+        # lands at a chain root the scanner has no business reaching
+        # directly. With it, each scan's view of a host is rendered
+        # against that scan's own traceroute.
+        #
+        # The verified-reachability fact (ScanSource → host) stays in
+        # Neo4j untouched — this is purely a visualization choice.
+        # Attack-path analysis (which queries SCANNED_FROM directly) is
+        # unaffected.
+        first_hop_rows = session.run(
+            """
+            MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
+            WHERE h.ip IN $ips
+            MATCH path = (h)-[chain:ROUTE_THROUGH*1..10]->(root:Host)
+            WHERE ALL(rel IN chain WHERE rel.source = src.name)
+              AND NOT EXISTS {
+                MATCH (root)-[next:ROUTE_THROUGH {source: src.name}]->(:Host)
+              }
+            WITH src.name AS source, h.ip AS host_ip, root.ip AS first_hop, length(path) AS hops
+            ORDER BY hops DESC
+            WITH source, host_ip, head(collect(first_hop)) AS first_hop
+            RETURN source, host_ip, first_hop
+            """,
+            ips=host_ips,
+        ).data()
+        # Per-(source, host) chain root. Some (source, host) pairs have
+        # no traceroute under that source (host was scanned directly,
+        # no chain) — those fall through to a direct SCANNED_FROM
+        # render below.
+        first_hop_by_source_host: dict[tuple[str, str], str] = {
+            (r["source"], r["host_ip"]): r["first_hop"]
+            for r in first_hop_rows if r["first_hop"]
+        }
+
+        # SCANNED_FROM edges (deduplicated — multiple hosts often share the
+        # same first hop, so the scanner→gateway edge would otherwise be
+        # emitted N times).
         result = session.run(
             """
             MATCH (src:ScanSource)-[:SCANNED_FROM]->(h:Host)
             RETURN src.name AS source, h.ip AS host_ip
             """,
         )
+        emitted_scan_edges: set[tuple[str, str]] = set()
         for r in result:
             src_node_id = source_to_node.get(r["source"])
-            host_id = f"host:{r['host_ip']}"
-            # Skip self-edges (pivot host pointing to itself)
-            if src_node_id and host_id in seen_nodes and src_node_id != host_id:
-                edges.append(GraphEdge(source=src_node_id, target=host_id, type="SCANNED_FROM"))
+            host_ip = r["host_ip"]
+            # Per-source chain root: remap to chain root if found
+            # within THIS scan's edges, else point at the host directly.
+            first_hop = first_hop_by_source_host.get((r["source"], host_ip))
+            target_id = f"host:{first_hop}" if first_hop else f"host:{host_ip}"
+            edge_key = (src_node_id, target_id) if src_node_id else None
+            # Skip self-edges (pivot host pointing to itself) and duplicates.
+            if (
+                src_node_id
+                and target_id in seen_nodes
+                and src_node_id != target_id
+                and edge_key not in emitted_scan_edges
+            ):
+                emitted_scan_edges.add(edge_key)
+                # SCANNED_FROM carries the source name explicitly so the
+                # frontend palette logic can colour scan-position edges
+                # the same as their downstream ROUTE_THROUGH chain.
+                edges.append(GraphEdge(
+                    source=src_node_id, target=target_id, type="SCANNED_FROM",
+                    properties={"scan_source": r["source"]},
+                ))
 
     return GraphResponse(nodes=nodes, edges=edges, total_hosts=total_hosts)
 
@@ -886,6 +1008,71 @@ def get_topology():
         for s in stats["segments"]
     ]
     return TopologyResponse(segments=segments)
+
+
+@app.get("/api/v1/scan-sources", response_model=list[ScanSourceOut])
+def list_scan_sources():
+    """All scan sources, ordered by first_seen ascending.
+
+    The order matters for the frontend's source→colour palette: the
+    earliest scan source gets palette index 0 (lime), the next gets
+    index 1 (cyan), and so on. Deterministic ordering keeps colours
+    stable across page reloads — the same engagement always paints
+    the same way.
+    """
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        rows = session.run(
+            """
+            MATCH (s:ScanSource)
+            RETURN s.name AS name, s.scan_args AS scan_args,
+                   s.first_seen AS first_seen, s.last_seen AS last_seen
+            ORDER BY s.first_seen ASC, s.name ASC
+            """
+        ).data()
+    return [
+        ScanSourceOut(
+            name=r["name"],
+            scan_args=r["scan_args"],
+            first_seen=r["first_seen"],
+            last_seen=r["last_seen"],
+        )
+        for r in rows
+    ]
+
+
+@app.get("/api/v1/scan-sources/{name}", response_model=ScanSourceOut)
+def get_scan_source(name: str):
+    """Detail for a single ScanSource (a position the operator scanned from).
+
+    Powers the click-detail panel for ``scan_source`` nodes on the
+    canvas. External scanner boxes that never got scanned themselves
+    end up here — they don't belong on the Hosts tab (no services, no
+    role) but the operator still wants to know the scan args and when
+    that position was active.
+    """
+    _check_neo4j()
+    from cauldron.graph.connection import get_session
+
+    with get_session() as session:
+        row = session.run(
+            """
+            MATCH (s:ScanSource {name: $name})
+            RETURN s.name AS name, s.scan_args AS scan_args,
+                   s.first_seen AS first_seen, s.last_seen AS last_seen
+            """,
+            name=name,
+        ).single()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Scan source {name!r} not found")
+    return ScanSourceOut(
+        name=row["name"],
+        scan_args=row["scan_args"],
+        first_seen=row["first_seen"],
+        last_seen=row["last_seen"],
+    )
 
 
 @app.post("/api/v1/import", response_model=ImportResponse)

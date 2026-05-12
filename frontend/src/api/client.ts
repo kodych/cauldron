@@ -7,6 +7,7 @@ import type {
   PathsResponse,
   GraphResponse,
   TopologyResponse,
+  ScanSourceOut,
   CollectResponse,
   ImportResponse,
   AnalyzeResponse,
@@ -85,6 +86,10 @@ export const api = {
   getGraph: (limit?: number) => get<GraphResponse>('/graph', limit ? { limit } : undefined),
 
   getTopology: () => get<TopologyResponse>('/topology'),
+
+  getScanSource: (name: string) => get<ScanSourceOut>(`/scan-sources/${encodeURIComponent(name)}`),
+
+  listScanSources: () => get<ScanSourceOut[]>('/scan-sources'),
 
   getCollect: (params: { filter?: string; port?: number; role?: string; source?: string }) =>
     get<CollectResponse>('/collect', params as Record<string, string | number>),

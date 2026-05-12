@@ -9,6 +9,7 @@ import { AttackPaths } from './AttackPaths';
 import { CollectPanel } from './CollectPanel';
 import { ImportPanel } from './ImportPanel';
 import { HostDetail } from './HostDetail';
+import { ScanSourceDetail } from './ScanSourceDetail';
 import { GraphCanvas } from './GraphCanvas';
 
 type Tab = 'stats' | 'hosts' | 'paths' | 'collect' | 'import';
@@ -52,6 +53,11 @@ export function Layout() {
   const [collapsed, setCollapsed] = useState(false);
   const [selectedHost, setSelectedHost] = useState<string | null>(null);
   const [showHostDetail, setShowHostDetail] = useState(false);
+  // Scan-source detail is a separate panel from HostDetail because
+  // ScanSource ≠ Host in the schema. Standalone scan sources (operator
+  // boxes that never got scanned themselves) don't have port data /
+  // services / roles, so the host panel layout doesn't apply.
+  const [selectedScanSource, setSelectedScanSource] = useState<string | null>(null);
   const [graphKey, setGraphKey] = useState(0);
   const [dataVersion, setDataVersion] = useState(0);
   const [selectedPathIps, setSelectedPathIps] = useState<string[] | null>(null);
@@ -128,16 +134,29 @@ export function Layout() {
     setSelectedHost(ip);
     if (ip) {
       setShowHostDetail(true);
+      setSelectedScanSource(null);  // host detail overrides scan-source panel
+    }
+  }, []);
+
+  const handleSelectScanSource = useCallback((name: string | null) => {
+    setSelectedScanSource(name);
+    if (name) {
+      // Mutually exclusive with HostDetail — clicking a scan source
+      // closes any open host card and opens the scan-source one.
+      setShowHostDetail(false);
+      setSelectedHost(null);
     }
   }, []);
 
   const handleBackFromDetail = useCallback(() => {
-    // Close the detail pane and drop the graph highlight in one shot.
-    // Leaving `selectedHost` set after an explicit Back kept the host
-    // glowing on the canvas with no way to un-glow it except a graph
-    // stage click — confusing because the detail card is already gone.
+    // Close any open detail pane and drop the graph highlight in one
+    // shot. Leaving ``selectedHost`` set after an explicit Back kept
+    // the host glowing on the canvas with no way to un-glow it except
+    // a graph stage click — confusing because the detail card is
+    // already gone.
     setShowHostDetail(false);
     setSelectedHost(null);
+    setSelectedScanSource(null);
   }, []);
 
   const bumpDataVersion = useCallback(() => setDataVersion((v) => v + 1), []);
@@ -236,9 +255,9 @@ export function Layout() {
             {tabs.map((tab) => (
               <button
                 key={tab.id}
-                onClick={() => { setActiveTab(tab.id); setShowHostDetail(false); }}
+                onClick={() => { setActiveTab(tab.id); setShowHostDetail(false); setSelectedScanSource(null); }}
                 className={`flex flex-1 items-center justify-center gap-1 py-2.5 text-xs font-medium transition-colors ${
-                  activeTab === tab.id && !showHostDetail
+                  activeTab === tab.id && !showHostDetail && !selectedScanSource
                     ? 'border-b-2 border-steel-400 text-steel-400'
                     : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -257,7 +276,14 @@ export function Layout() {
             {showHostDetail && selectedHost && (
               <HostDetail ip={selectedHost} onBack={handleBackFromDetail} onDataChanged={bumpDataVersion} />
             )}
-            <div className={showHostDetail ? 'hidden' : ''}>
+            {/* Scan source detail overlays the same slot as HostDetail.
+                It's the only detail view that handles standalone
+                ``:ScanSource`` nodes (external scanner boxes that never
+                got scanned themselves). */}
+            {!showHostDetail && selectedScanSource && (
+              <ScanSourceDetail name={selectedScanSource} onBack={handleBackFromDetail} />
+            )}
+            <div className={(showHostDetail || selectedScanSource) ? 'hidden' : ''}>
               <div className={activeTab === 'stats' ? '' : 'hidden'}>
                 <StatsPanel refreshKey={dataVersion} />
               </div>
@@ -307,6 +333,7 @@ export function Layout() {
           key={graphKey}
           selectedHost={selectedHost}
           onSelectHost={handleSelectHost}
+          onSelectScanSource={handleSelectScanSource}
           highlightPathIps={selectedPathIps}
           onClearPath={handleClearPath}
           onDataChanged={bumpDataVersion}

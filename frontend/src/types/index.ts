@@ -158,6 +158,16 @@ export interface TopologyResponse {
   segments: TopologySegment[];
 }
 
+// Detail payload for a ``scan_source`` node clicked on the canvas.
+// External scanner boxes never get a HostOut entry — this is the
+// minimum useful info we have about them.
+export interface ScanSourceOut {
+  name: string;
+  scan_args: string | null;
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
 export interface VulnListItem {
   cve_id: string;
   cvss: number | null;
