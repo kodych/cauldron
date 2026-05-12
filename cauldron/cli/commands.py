@@ -516,23 +516,40 @@ def paths(target: str | None, role: str | None, top: int, show_all: bool):
         score_color = "bold red" if path.score >= 60 else "bold yellow" if path.score >= 40 else "white"
         console.print(f"  [{score_color}]#{i}  Score {path.score:.0f}[/{score_color}]  {path_str}")
 
-        # Details: exploits along the path (skip scan_source)
+        # Details: exploits along the path (skip scan_source).
+        # Dedupe by cve_id so a multi-port finding (PetitPotam on
+        # 88/135/445 of the same DC) shows up once with the port set
+        # rolled into the prefix — matches the web UI's per-host CVE
+        # collapsing instead of printing the same line three times.
         for node in path.nodes:
             if node.role == "scan_source" or not node.vulns:
                 continue
             icon = ROLE_ICONS.get(node.role, "[dim]?[/dim]")
-            for vuln in node.vulns[:3]:  # Top 3 vulns per node
-                # Label: EXPLOIT for confirmed/likely, CHECK for check
+            for entry in _dedupe_vulns_by_cve(node.vulns)[:3]:  # Top 3 distinct CVEs
+                vuln = entry["vuln"]
+                ports = entry["ports"]
+                # Label: EXPLOIT when ANY port-instance has a public exploit
+                # (the merged flag, not the representative's). A confirmed-
+                # exploitable finding on :445 should still mark the row red
+                # even if the representative we picked was on :88.
                 if vuln.confidence == "check":
                     expl_marker = "[dim]CHECK[/dim]"
-                elif vuln.has_exploit:
+                elif entry["has_exploit"]:
                     expl_marker = "[red]EXPLOIT[/red]"
                 else:
                     expl_marker = f"[yellow]CVSS {vuln.cvss:.1f}[/yellow]"
+                # Port set inline with the host IP: single port renders as
+                # "10.0.0.1:445", multiple as "10.0.0.1:88,135,445". Keeps
+                # the visual locator the operator needs without growing
+                # the row.
+                if ports:
+                    host_locator = f"{node.ip}:" + ",".join(str(p) for p in ports)
+                else:
+                    host_locator = node.ip
                 # Clean title: first sentence, max 60 chars
                 title = _truncate_title(vuln.title)
                 title_str = f" {title}" if title else ""
-                console.print(f"       {icon} {node.ip}  {expl_marker} {vuln.cve_id}{title_str}")
+                console.print(f"       {icon} {host_locator}  {expl_marker} {vuln.cve_id}{title_str}")
 
         # Show attack methods
         methods = path.attack_methods
@@ -554,6 +571,72 @@ def paths(target: str | None, role: str | None, top: int, show_all: bool):
     if hidden_check and not show_all:
         console.print(f"[dim]  + {hidden_check} check-level paths hidden. Use --all to see them.[/dim]")
         console.print()
+
+
+def _dedupe_vulns_by_cve(vulns):
+    """Group a list of VulnInfo entries by ``cve_id``, returning per-CVE
+    dicts with merged port set and aggregated flags.
+
+    Multi-port findings — one CVE attached to several services of the
+    same host (e.g. PetitPotam on 88/135/445 of a domain controller)
+    arrive in ``path.nodes[i].vulns`` as N separate ``VulnInfo``
+    entries with the same ``cve_id`` and different ``port``. The web
+    UI dedupes upstream (groups by cve_id, rolls ports into a single
+    badge); the CLI used to iterate raw rows and print the same CVE N
+    times. This helper closes the gap so ``cauldron paths`` output
+    reads the same way as the web view.
+
+    Within a group:
+      * ``rep`` is the entry with the highest ``confidence``
+        (confirmed > likely > check). Same-tier ties keep the first
+        seen — preserves ranking already imposed by the caller.
+      * ``ports`` is the sorted set of ports across all entries.
+      * ``has_exploit`` is the OR across all entries — a confirmed-with-
+        exploit on one port lifts the whole grouped finding to EXPLOIT
+        regardless of which port produced the representative.
+      * ``in_cisa_kev`` similar OR.
+
+    Returns a list of dicts preserving first-appearance order:
+        [{"vuln": VulnInfo, "ports": [int], "has_exploit": bool,
+          "in_cisa_kev": bool}, ...]
+    """
+    from collections import OrderedDict
+
+    conf_order = {"confirmed": 0, "likely": 1, "check": 2}
+    groups: "OrderedDict[str, dict]" = OrderedDict()
+
+    for v in vulns:
+        g = groups.get(v.cve_id)
+        if g is None:
+            groups[v.cve_id] = {
+                "vuln": v,
+                "ports": set(),
+                "has_exploit": bool(v.has_exploit),
+                "in_cisa_kev": bool(getattr(v, "in_cisa_kev", False)),
+            }
+            g = groups[v.cve_id]
+        else:
+            if v.has_exploit:
+                g["has_exploit"] = True
+            if getattr(v, "in_cisa_kev", False):
+                g["in_cisa_kev"] = True
+            cur = conf_order.get(g["vuln"].confidence, 99)
+            new = conf_order.get(v.confidence, 99)
+            if new < cur:
+                g["vuln"] = v
+        port = getattr(v, "port", None)
+        if port is not None:
+            g["ports"].add(int(port))
+
+    out = []
+    for g in groups.values():
+        out.append({
+            "vuln": g["vuln"],
+            "ports": sorted(g["ports"]),
+            "has_exploit": g["has_exploit"],
+            "in_cisa_kev": g["in_cisa_kev"],
+        })
+    return out
 
 
 def _truncate_title(title: str, max_len: int = 60) -> str:
