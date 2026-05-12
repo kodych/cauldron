@@ -580,7 +580,6 @@ export function GraphCanvas({ selectedHost, onSelectHost, onSelectScanSource, hi
     //    bounding box at its pre-drag extent. Sigma then keeps every
     //    non-dragged node fixed in viewport for the duration of the drag.
     let draggedNode: string | null = null;
-    let isDragging = false;
     const mouseCaptor = sigma.getMouseCaptor();
 
     sigma.on('downNode', ({ node, event }) => {
@@ -593,7 +592,6 @@ export function GraphCanvas({ selectedHost, onSelectHost, onSelectScanSource, hi
       const original = event.original as MouseEvent;
       if (original.button !== 0) return;
       draggedNode = node;
-      isDragging = false;
       // Lock the bounding box so other nodes don't drift as this one moves.
       // Once set, we keep the lock for the entire session: releasing on
       // mouseup would force Sigma to recompute ``nodeExtent`` from the
@@ -606,21 +604,20 @@ export function GraphCanvas({ selectedHost, onSelectHost, onSelectScanSource, hi
       original.stopPropagation();
     });
 
-    const onMouseMoveBody = (e: { x: number; y: number; preventSigmaDefault: () => void; original: MouseEvent }) => {
+    const onMouseMoveBody = (e: { x: number; y: number; preventSigmaDefault: () => void; original: MouseEvent | TouchEvent }) => {
       if (!draggedNode) return;
-      isDragging = true;
       const pos = sigma.viewportToGraph({ x: e.x, y: e.y });
       graph.setNodeAttribute(draggedNode, 'x', pos.x);
       graph.setNodeAttribute(draggedNode, 'y', pos.y);
       // Stop Sigma's camera from also panning on the same mousemove
       e.preventSigmaDefault();
       e.original.preventDefault();
-      e.original.stopPropagation();
+      // ``stopPropagation`` exists on both MouseEvent and TouchEvent.
+      (e.original as MouseEvent | TouchEvent).stopPropagation();
     };
 
     const onMouseUp = () => {
       draggedNode = null;
-      isDragging = false;
       // BBox lock is deliberately NOT released here — see downNode comment.
     };
 
@@ -808,7 +805,12 @@ export function GraphCanvas({ selectedHost, onSelectHost, onSelectScanSource, hi
       // and conflicted with the new convention where standalone scan
       // sources are red. The marker does the job; colours stay
       // semantically stable.
-      const base = { ...attrs, size, label, forceLabel };
+      // Carry ``color`` explicitly: a spread of ``attrs`` (typed as Sigma's
+      // ``Attributes``) doesn't preserve the field on the inferred shape, so
+      // ``base.color`` would otherwise be flagged by ``tsc -b``. The runtime
+      // value is the one baked in at graph-build time (role colour, scan-
+      // source red, or incomplete-host gray).
+      const base = { ...attrs, size, label, forceLabel, color: attrs.color as string };
 
       // Path highlight mode: dim everything except selected path.
       // ``expandedPathNodeIds`` includes the intermediate topology
