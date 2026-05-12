@@ -526,6 +526,21 @@ NVD_CPE_BASE = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 # so we don't match "foo/bar".
 _BANNER_TOKEN_RE = re.compile(r"\b([A-Za-z][\w.-]{1,})/(\d[\w.-]*)")
 
+# Same shape but space-separated: "Drupal 7" from http-generator NSE output,
+# "Samba 2.2.1a" from smb-os-discovery, "IIS 7.5" from http-server-header.
+# Stricter than the slash form because plain prose is full of "Word number"
+# pairs and we don't want to flood the resolver:
+#   - name must start with a CAPITAL letter (filters lowercase prose like
+#     "running version 1.2.3 of foo")
+#   - name must be at least 3 chars (drops "NT 10.0" abbreviations that
+#     aren't products on their own; real product names rarely sit at 2)
+#   - must be at start-of-string or preceded by whitespace, "(" or "["
+#     so we don't pick "PowerShell" out of "FoobarPowerShell 7.4"
+#   - version must start with a digit (same logic as the slash regex)
+# Tokens that survive the regex but aren't real products (e.g. "Mint 19.1")
+# still self-filter via NVD's CPE Dictionary returning zero hits.
+_BANNER_TOKEN_SPACE_RE = re.compile(r"(?:^|[\s(\[])([A-Z][\w.-]{2,})\s+(\d[\w.-]*)")
+
 # Session-scoped cache. Key = (name.lower(), version).
 # Value = canonical CPE 2.3 string, or "" sentinel meaning "queried, NVD has
 # no record" -- both avoid repeat lookups within a single boil --nvd run.
@@ -535,46 +550,50 @@ _cpe_resolution_cache: dict[tuple[str, str], str] = {}
 def _extract_banner_tokens(*sources: str | None) -> list[tuple[str, str]]:
     """Find (name, version) pairs in one or more banner-shaped strings.
 
-    Used to detect sub-products inside compound nmap banners and script
-    outputs. Returns deduplicated pairs preserving first-seen order. Junk
-    tokens are not filtered here -- ``_resolve_banner_token`` rejects them
-    via the NVD dictionary returning zero hits.
+    Catches two shapes:
+      - ``Name/Version`` (compound product banners, http-server-header):
+        ``Apache/1.3.20``, ``mod_ssl/2.8.4``, ``OpenSSL/0.9.6b``.
+      - ``Name Version`` (NSE script outputs that pretty-print products):
+        ``Drupal 7`` from http-generator, ``Samba 2.2.1a`` from
+        smb-os-discovery, ``IIS 7.5`` from http-server-header.
+
+    Returns deduplicated pairs preserving first-seen order; dedup is keyed
+    on ``(name.lower(), version)`` so the same product spelled differently
+    across two sources (or two shapes) resolves once. Junk tokens are not
+    filtered here -- ``_resolve_banner_token`` rejects them via the NVD
+    dictionary returning zero hits.
     """
     out: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for src in sources:
         if not src:
             continue
-        for m in _BANNER_TOKEN_RE.finditer(src):
-            name, version = m.group(1), m.group(2)
-            key = (name.lower(), version)
-            if key not in seen:
-                seen.add(key)
-                out.append((name, version))
+        for regex in (_BANNER_TOKEN_RE, _BANNER_TOKEN_SPACE_RE):
+            for m in regex.finditer(src):
+                name, version = m.group(1), m.group(2)
+                key = (name.lower(), version)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((name, version))
     return out
 
 
-def _resolve_banner_token(name: str, version: str) -> str | None:
-    """Look up the canonical NVD CPE 2.3 for a (name, version) banner token.
+_PROBE_TRANSIENT = object()  # sentinel: probe couldn't reach NVD, caller should not cache
 
-    Asks NVD's CPE Dictionary with version pinned and vendor wildcarded:
-    ``cpe:2.3:a:*:<name>:<version>:*:*:*:*:*:*:*``. NVD returns the real
-    canonical CPE(s) matching that shape. When NVD has no record (the token
-    was garbage like 'Red-Hat/Linux'), we cache a sentinel and skip retries.
 
-    Returns the canonical CPE string, or None when no match exists.
+def _probe_nvd_cpe_dict(name: str, version: str) -> str | None | object:
+    """Single shot at NVD's CPE Dictionary for a (name, version) pair.
 
-    Honors the existing ``_rate_limit()`` (0.7 s/req with key, 6.5 s without).
-    On HTTP 429 we back off 6 s / 12 s and retry up to twice -- NVD's "soft"
-    throttling lives outside the documented 50/30 s window, so the resolver
-    stays safe even when the global rate-limit constant is calibrated to
-    the technical ceiling.
+    Returns:
+      - Vendor-wildcarded CPE string when NVD has at least one app entry
+        matching ``cpe:2.3:a:*:<name>:<version>:*``.
+      - ``None`` when NVD definitively says "no such record" (zero hits or
+        non-429 HTTP error).
+      - ``_PROBE_TRANSIENT`` sentinel on network errors. Caller must not
+        cache a transient as a real "not-found".
+
+    Honors the global ``_rate_limit()`` and the 6 s / 12 s 429 backoff.
     """
-    key = (name.lower(), version)
-    cached = _cpe_resolution_cache.get(key)
-    if cached is not None:
-        return cached or None
-
     cpe_match = f"cpe:2.3:a:*:{name.lower()}:{version}:*:*:*:*:*:*:*"
     url = f"{NVD_CPE_BASE}?cpeMatchString={urllib.request.quote(cpe_match)}&resultsPerPage=20"
 
@@ -603,25 +622,20 @@ def _resolve_banner_token(name: str, version: str) -> str | None:
                 "NVD CPE resolve %s/%s returned HTTP %d -- caching as not-found",
                 name, version, e.code,
             )
-            _cpe_resolution_cache[key] = ""
             return None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             # Transient -- don't cache. Next caller may succeed.
             logger.warning("NVD CPE resolve transient failure for %s/%s: %s", name, version, e)
-            return None
+            return _PROBE_TRANSIENT
 
     if products is None:
-        return None
+        return _PROBE_TRANSIENT
 
     # Keep only application-typed CPEs (we tokenize app banners).
-    app_cpes = [
-        p.get("cpe", {}).get("cpeName", "")
-        for p in products
-    ]
+    app_cpes = [p.get("cpe", {}).get("cpeName", "") for p in products]
     app_cpes = [m for m in app_cpes if m and len(m.split(":")) >= 13 and m.split(":")[2] == "a"]
 
     if not app_cpes:
-        _cpe_resolution_cache[key] = ""
         return None
 
     # Return the vendor-wildcarded form, not the canonical vendor:product.
@@ -637,9 +651,63 @@ def _resolve_banner_token(name: str, version: str) -> str | None:
     # vendor form lets the downstream _query_nvd_cpe sweep up every CVE
     # filed under any vendor string for the same product, including
     # historic ones the dictionary never backfilled.
-    result = f"cpe:2.3:a:*:{name.lower()}:{version}:*:*:*:*:*:*:*"
-    _cpe_resolution_cache[key] = result
-    return result
+    return f"cpe:2.3:a:*:{name.lower()}:{version}:*:*:*:*:*:*:*"
+
+
+def _resolve_banner_token(name: str, version: str) -> str | None:
+    """Look up the canonical NVD CPE 2.3 for a (name, version) banner token.
+
+    Asks NVD's CPE Dictionary with version pinned and vendor wildcarded:
+    ``cpe:2.3:a:*:<name>:<version>:*:*:*:*:*:*:*``. NVD returns the real
+    canonical CPE(s) matching that shape. When NVD has no record (the token
+    was garbage like 'Red-Hat/Linux'), we cache a sentinel and skip retries.
+
+    Major-only version retry: NSE scripts like http-generator emit bare
+    major versions ("Drupal 7" instead of "Drupal 7.0"). NVD's CPE
+    Dictionary records versions at major.minor minimum, so the exact
+    ``drupal:7`` probe returns zero hits even though ``drupal:7.0`` has
+    16 entries (and the downstream CVE search at ``drupal:7.0`` lands 93
+    CVEs including CVE-2018-7600 Drupalgeddon2). When the banner version
+    is purely a digit and the exact probe missed, we retry once with
+    ``.0`` suffixed -- the most conservative possible upgrade. The
+    upgraded CPE goes back to the caller (``cpe:...:drupal:7.0:*``) so
+    downstream NVD CVE search uses the form NVD actually understands.
+
+    Returns the canonical CPE string, or None when no match exists.
+
+    Honors the existing ``_rate_limit()`` (0.7 s/req with key, 6.5 s without).
+    On HTTP 429 we back off 6 s / 12 s and retry up to twice -- NVD's "soft"
+    throttling lives outside the documented 50/30 s window, so the resolver
+    stays safe even when the global rate-limit constant is calibrated to
+    the technical ceiling.
+    """
+    key = (name.lower(), version)
+    cached = _cpe_resolution_cache.get(key)
+    if cached is not None:
+        return cached or None
+
+    # Probe order: exact banner version first, then major.0 fallback only
+    # when the banner gave us a bare major (digit-only with no dot).
+    versions_to_try = [version]
+    if version.isdigit():
+        versions_to_try.append(version + ".0")
+
+    saw_transient = False
+    for probe_version in versions_to_try:
+        result = _probe_nvd_cpe_dict(name, probe_version)
+        if isinstance(result, str):
+            _cpe_resolution_cache[key] = result
+            return result
+        if result is _PROBE_TRANSIENT:
+            saw_transient = True
+            break  # don't burn the .0 retry budget on a flaky network
+
+    if saw_transient:
+        # Don't cache -- next caller may succeed.
+        return None
+
+    _cpe_resolution_cache[key] = ""
+    return None
 
 
 def _build_cpe_candidates(

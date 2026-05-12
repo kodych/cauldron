@@ -78,6 +78,89 @@ class TestExtractBannerTokens:
         assert out == [("OpenSSL", "0.9.6b")]
 
 
+class TestExtractBannerTokensSpaceSeparated:
+    """The space-separated shape catches `Name Version` pretty-prints from NSE
+    script outputs that the slash regex misses entirely: http-generator emits
+    `Drupal 7`, smb-os-discovery emits `OS: Unix (Samba 2.2.1a)`, etc."""
+
+    def test_http_generator_drupal(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # The motivating case: DC-1 Vulnhub serves Drupal but nmap classifies
+        # the port as plain Apache. The http-generator NSE script emits
+        # "Drupal 7 (http://drupal.org)" -- the space-separated tokenizer
+        # picks "Drupal 7" out so the resolver can anchor on it.
+        assert _extract_banner_tokens("Drupal 7 (http://drupal.org)") == [("Drupal", "7")]
+
+    def test_smb_os_discovery_samba(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # smb-os-discovery's pretty-printed shape: "OS: Unix (Samba 2.2.1a)".
+        # The "(" before Samba is in the regex's allowed prefix set so the
+        # match anchors correctly.
+        assert _extract_banner_tokens("OS: Unix (Samba 2.2.1a)") == [("Samba", "2.2.1a")]
+
+    def test_iis_from_server_header(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # Some banner formats use "IIS 7.5" instead of "iis/7.5".
+        assert _extract_banner_tokens("Microsoft-IIS Server: IIS 7.5") == [("IIS", "7.5")]
+
+    def test_no_match_without_version(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # http-title style output: no digit follows the product name.
+        assert _extract_banner_tokens("Welcome to Drupal Site") == []
+
+    def test_no_match_for_lowercase_name(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # Capital-letter start is the first noise filter. Prose like
+        # "running drupal 7" doesn't anchor.
+        assert _extract_banner_tokens("running drupal 7") == []
+
+    def test_no_match_for_short_name(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # 2-char names are mostly abbreviations ("NT", "OS", "v1") that
+        # aren't products; require at least 3 chars to anchor.
+        assert _extract_banner_tokens("NT 10.0 and OS 12") == []
+
+    def test_no_match_for_digit_prefix_noise(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # http-robots.txt style: "36 disallowed entries (15 shown)". No
+        # capital-letter name precedes the digits, so nothing matches.
+        assert _extract_banner_tokens("36 disallowed entries (15 shown)") == []
+
+    def test_mid_word_capital_not_matched(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # A capital-letter mid-word must not anchor a token. In
+        # "abcPowerShell 7.4" the "P" is preceded by "c" (word char, not in
+        # the allowed [\s(\[]) so the regex shouldn't extract
+        # ("PowerShell", "7.4"). The whole "abcPowerShell" starts with a
+        # lowercase letter, so it doesn't match the capital-start rule and
+        # nothing is extracted.
+        assert _extract_banner_tokens("abcPowerShell 7.4") == []
+
+    def test_space_and_slash_combine(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # Real-world banner mixes both shapes (Apache/1.3.20 followed by an
+        # NSE-style appendix). Both regexes apply; dedup is keyed on
+        # (lowered name, version) so duplicates collapse.
+        out = _extract_banner_tokens("Apache/1.3.20 hosts Drupal 7")
+        assert ("Apache", "1.3.20") in out
+        assert ("Drupal", "7") in out
+
+    def test_space_dedup_with_slash_equivalent(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # When both forms appear in one source the second is dropped --
+        # otherwise the resolver fires duplicate NVD queries.
+        out = _extract_banner_tokens("Drupal/7 and also Drupal 7")
+        assert out == [("Drupal", "7")]
+
+    def test_slash_and_space_in_same_text_no_cross_pollination(self):
+        from cauldron.ai.cve_enricher import _extract_banner_tokens
+        # Verify the slash regex doesn't accidentally consume part of a
+        # space-pair (or vice-versa). Apache/1.3.20 is slash-only;
+        # nothing about "Apache/1.3.20" should yield a space-form match.
+        out = _extract_banner_tokens("Apache/1.3.20 (Unix)")
+        assert out == [("Apache", "1.3.20")]
+
+
 # --- Resolver --------------------------------------------------------------
 
 
@@ -173,6 +256,105 @@ class TestResolveBannerToken:
             r3 = _resolve_banner_token("openssl", "0.9.6b")  # case-insensitive key
             assert r1 == r2 == r3
             assert m.call_count == 1
+
+
+class TestResolverMajorOnlyRetry:
+    """NSE scripts like http-generator emit major-only versions ("Drupal 7"
+    instead of "Drupal 7.0"). NVD's CPE Dictionary records versions at
+    major.minor minimum, so the exact ``drupal:7`` probe returns zero hits
+    even though ``drupal:7.0`` has plenty. The resolver retries once with
+    ".0" suffixed when the banner version is purely a digit."""
+
+    def test_drupal_7_retries_as_7_0_and_succeeds(self):
+        from cauldron.ai.cve_enricher import _resolve_banner_token
+
+        # First probe with "7" -> 0 hits. Second probe with "7.0" -> hit.
+        responses = [
+            _cpe_response([]),  # drupal:7 -> empty
+            _cpe_response(["cpe:2.3:a:drupal:drupal:7.0:*:*:*:*:*:*:*"]),
+        ]
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout=15):
+            i = call_count["n"]
+            call_count["n"] += 1
+
+            class _Resp:
+                def __enter__(self): return self
+                def __exit__(self, *a): pass
+                def read(self): return json.dumps(responses[i]).encode()
+            return _Resp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = _resolve_banner_token("Drupal", "7")
+
+        # The returned CPE pins the UPGRADED version (7.0), not the
+        # original banner version (7), because downstream
+        # _query_nvd_cpe needs the form NVD's CVE search understands.
+        assert result == "cpe:2.3:a:*:drupal:7.0:*:*:*:*:*:*:*"
+        assert call_count["n"] == 2
+
+    def test_first_probe_hit_skips_retry(self):
+        from cauldron.ai.cve_enricher import _resolve_banner_token
+
+        # Real major.0 banner ("Drupal 7.0") -- the exact probe succeeds,
+        # no retry needed.
+        payload = _cpe_response(["cpe:2.3:a:drupal:drupal:7.0:*:*:*:*:*:*:*"])
+
+        with patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+            result = _resolve_banner_token("Drupal", "7.0")
+
+        assert result == "cpe:2.3:a:*:drupal:7.0:*:*:*:*:*:*:*"
+        # One call -- the version had a dot so no .0 retry was attempted.
+        assert m.call_count == 1
+
+    def test_non_digit_version_does_not_retry(self):
+        from cauldron.ai.cve_enricher import _resolve_banner_token
+
+        # "0.9.6b" already has dots, retry path doesn't fire. A miss is
+        # cached as a miss with one network call, not two.
+        payload = _cpe_response([])
+
+        with patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+            result = _resolve_banner_token("OpenSSL", "0.9.6b")
+
+        assert result is None
+        assert m.call_count == 1
+
+    def test_digit_only_miss_on_both_versions_caches_miss(self):
+        from cauldron.ai.cve_enricher import _cpe_resolution_cache, _resolve_banner_token
+
+        # Junk product ("Mint 19" from prose). Both "19" and "19.0" miss.
+        # The resolver caches under the ORIGINAL banner key, not the
+        # upgraded one, so future "Mint 19" lookups skip the retry.
+        payload = _cpe_response([])
+
+        with patch("urllib.request.urlopen") as m:
+            m.return_value.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+            r1 = _resolve_banner_token("Mint", "19")
+            r2 = _resolve_banner_token("Mint", "19")
+            assert r1 is None
+            assert r2 is None
+            # First call took two NVD hits (19, 19.0). Second call hit cache.
+            assert m.call_count == 2
+        assert _cpe_resolution_cache[("mint", "19")] == ""
+
+    def test_transient_on_first_probe_does_not_burn_retry(self):
+        from cauldron.ai.cve_enricher import _cpe_resolution_cache, _resolve_banner_token
+
+        def url_error(req, timeout=15):
+            raise urllib.error.URLError("network down")
+
+        with patch("urllib.request.urlopen", side_effect=url_error), patch("time.sleep"):
+            result = _resolve_banner_token("Drupal", "7")
+
+        # Transient on first probe -- no cache, no .0 attempt. Both retries
+        # cost real NVD budget, so we don't burn the .0 fallback on a
+        # network blip when the next caller may succeed cleanly.
+        assert result is None
+        assert ("drupal", "7") not in _cpe_resolution_cache
 
 
 class TestResolverRetryOn429:
@@ -334,7 +516,7 @@ class TestBuildCpeCandidates:
 
         def fake_resolve(name, version):
             return (
-                "cpe:2.3:a:samba:samba:2.2.1a:*:*:*:*:*:*:*"
+                "cpe:2.3:a:*:samba:2.2.1a:*:*:*:*:*:*:*"
                 if (name.lower(), version) == ("samba", "2.2.1a") else None
             )
 
@@ -345,13 +527,12 @@ class TestBuildCpeCandidates:
                 version=None,
                 script_outputs=["OS: Unix (Samba 2.2.1a)\n  Workgroup: MYGROUP"],
             )
-        # Script output isn't quite the "Name/Version" banner shape — the
-        # smb-os-discovery format is "Samba 2.2.1a" (space-separated). This
-        # test documents that the current tokenizer DOES NOT catch that
-        # form: smb-os-discovery needs a dedicated extractor in a future
-        # iteration. For now the test asserts that the standard Name/Version
-        # tokens are still tried, and the samba wildcard CPE passes through.
+        # The space-separated tokenizer extracts "Samba 2.2.1a" from
+        # smb-os-discovery's "(Samba 2.2.1a)" shape. The resolver returns
+        # the vendor-wildcarded CPE, which augments the versionless primary
+        # from nmap's structured cpe:/a:samba:samba entry.
         assert "cpe:2.3:a:samba:samba:*:*:*:*:*:*:*:*" in cands
+        assert "cpe:2.3:a:*:samba:2.2.1a:*:*:*:*:*:*:*" in cands
 
     def test_dedupes_nmap_emitted_against_primary(self):
         from cauldron.ai.cve_enricher import _build_cpe_candidates
