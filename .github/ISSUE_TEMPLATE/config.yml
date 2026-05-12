@@ -1,0 +1,16 @@
+# Disables the "Open a blank issue" escape hatch so reporters land
+# on one of the three structured templates instead of a free-form
+# editor with no context. Each link below appears on the same screen
+# as the templates so contributors don't have to scroll back to the
+# repo root for the security or community references.
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: 🔒 Report a security vulnerability (private)
+    url: https://github.com/kodych/cauldron/security/advisories/new
+    about: Found a security issue in Cauldron itself? Please use GitHub's Private Vulnerability Reporting — public issues are not the right channel for these.
+
+  - name: 📖 Read the docs
+    url: https://github.com/kodych/cauldron#readme
+    about: README plus the docs/ directory cover installation, the CLI, the API, and the graph schema. Check there before opening a usage question.
