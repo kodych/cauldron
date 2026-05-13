@@ -1030,7 +1030,7 @@ def _cve_published_year(cve: CVEInfo) -> int | None:
 _VERSIONLESS_RECENCY_YEARS = 5
 
 
-def _cve_is_gold(cve: CVEInfo, versionless: bool = False) -> bool:
+def _cve_is_gold(cve: CVEInfo, versionless: bool = False, os_cpe: bool = False) -> bool:
     """Decide whether a CVE clears the "actionable gold" bar for a pentester.
 
     Single gate: a CVE must have a public exploit to count as gold. When we
@@ -1053,6 +1053,13 @@ def _cve_is_gold(cve: CVEInfo, versionless: bool = False) -> bool:
       3. Admin-required reject — PR:H CVEs are post-exploitation, not a way in.
       4. Versionless recency reject — for "assume latest" queries, drop
          exploits registered against releases too old to still be running.
+         Carve-out for OS-typed CPE queries (``os_cpe=True``): the major OS
+         version is encoded in the product name (``windows_7``,
+         ``windows_server_2012``, …), not the version slot, so a wildcard
+         version is the normal shape rather than "we don't know the
+         release." EoL'd OS families retain CVE applicability indefinitely
+         — applying the 5-year recency cut to them drops every non-KEV
+         Win 7 / 2008 / XP CVE on a clearly-vulnerable legacy host.
       5. Actionable-exploit gate — has_exploit.
     """
     if _cve_is_local_only(cve):
@@ -1066,7 +1073,7 @@ def _cve_is_gold(cve: CVEInfo, versionless: bool = False) -> bool:
     if _cve_requires_admin(cve):
         return False
 
-    if versionless:
+    if versionless and not os_cpe:
         year = _cve_published_year(cve)
         if year is not None and year < datetime.now(timezone.utc).year - _VERSIONLESS_RECENCY_YEARS:
             return False
@@ -1163,9 +1170,15 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
     # Coarse pentester filter first (CWE + pattern), then the gold filter
     # requires an actionable public exploit (KEV overrides). Hard rejects
     # (local/DoS/admin-required) apply in both paths; the versionless path
-    # also cuts CVEs published too long ago to plausibly affect "latest".
+    # also cuts CVEs published too long ago to plausibly affect "latest"
+    # — except when the CPE is OS-typed (Win 7, Server 2012, ESXi, …),
+    # where the product name itself encodes the major version and EoL'd
+    # releases retain CVE applicability indefinitely. ``parts[2]`` is the
+    # CPE 2.3 part type slot (``a`` for application, ``o`` for operating
+    # system, ``h`` for hardware) — ``o`` triggers the carve-out.
+    is_os_cpe = len(parts) > 2 and parts[2] == "o"
     cves = [c for c in cves if _is_pentester_relevant(c)]
-    cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version)]
+    cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version, os_cpe=is_os_cpe)]
 
     # Pentester-priority sort: CISA KEV (active in-the-wild exploitation)
     # first, then CVEs with a public exploit, then CVSS descending within

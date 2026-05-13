@@ -1117,6 +1117,42 @@ class TestCVEIsGold:
         )
         assert _cve_is_gold(cve, versionless=True) is True
 
+    def test_versionless_os_cpe_skips_recency_cut(self):
+        """OS-typed CPE queries (``cpe:2.3:o:microsoft:windows_7:*:…``)
+        are versionless by shape — the major OS version is encoded in
+        the product name, not the version slot. Applying the 5-year
+        "assume latest" recency cut to them drops every Win 7 / 2008 /
+        XP CVE that isn't in CISA KEV, even on a legacy host the
+        operator is staring at and that clearly can't be patched.
+
+        Regression for the THM Blue sanity-check finding where the
+        pipeline returned only three NVD CVEs (CVE-2017-0144,
+        CVE-2018-8373, CVE-2012-4969) for a Win 7 SP1 box — every
+        other Win 7 CVE older than 2021 was cut here. The MS17-010
+        family CVEs (CVE-2017-0143/45/46/47/48) all have public
+        exploits but aren't individually KEV-listed, so the recency
+        cut dropped them silently."""
+        # 2017 Win 7 CVE with a public exploit, not in KEV — would
+        # normally be dropped by the versionless recency cut. With
+        # ``os_cpe=True`` it must pass.
+        ms17_family = self._cve_with_year(2017, has_exploit=True, in_cisa_kev=False)
+        assert _cve_is_gold(ms17_family, versionless=True, os_cpe=True) is True
+        # Without the carve-out the same CVE drops — sanity-check the
+        # control path.
+        assert _cve_is_gold(ms17_family, versionless=True, os_cpe=False) is False
+
+    def test_os_cpe_carve_out_still_requires_actionable_exploit(self):
+        """The OS-CPE carve-out only lifts the recency cut — it does
+        not bypass the ``has_exploit`` gate. A theoretical 2014 RCE
+        with no public PoC stays out of the "gold" set even on a Win 7
+        host, otherwise the pipeline would flood every Windows scan
+        with hundreds of CVSS-9.x entries that nobody has tooling for.
+        KEV-flagged ancient CVEs still pass via the soft override."""
+        theoretical = self._cve_with_year(2014, has_exploit=False, in_cisa_kev=False)
+        assert _cve_is_gold(theoretical, versionless=True, os_cpe=True) is False
+        kev_ancient = self._cve_with_year(2010, has_exploit=False, in_cisa_kev=True)
+        assert _cve_is_gold(kev_ancient, versionless=True, os_cpe=True) is True
+
     # --- Priority sort: KEV first, then exploit, then CVSS ---
 
     def test_priority_sort_kev_beats_exploit(self):
