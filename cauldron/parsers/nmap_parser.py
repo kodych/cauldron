@@ -6,6 +6,7 @@ Handles various Nmap versions and output quirks defensively.
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -134,6 +135,60 @@ def _parse_host(elem: ET.Element) -> Host | None:
             if ostype:
                 host.os_family = ostype
                 break
+
+    # ``smb-os-discovery`` overrides the ``<osmatch>`` fingerprint guess.
+    # The NSE script queries the SMB protocol directly and returns the OS
+    # string the target reports about itself, which is more reliable than
+    # nmap's TCP/IP-stack fingerprint — particularly for Windows, where
+    # Win 7 SP1 and Server 2012 R2 share an NT 6.1 signature and routinely
+    # get transposed in the osmatch ranking (the "Server 2012" mis-id on
+    # Win 7 SP1 boxes is the classic case). The CPE the script returns
+    # (e.g. ``cpe:/o:microsoft:windows_7::sp1:professional``) is also
+    # propagated to the SMB service so the CVE enricher gets a versioned
+    # CPE for MS17-010 / BlueKeep / etc. instead of the versionless
+    # ``cpe:/o:microsoft:windows`` that nmap attaches by default.
+    smb_os_elem = elem.find("hostscript/script[@id='smb-os-discovery']")
+    if smb_os_elem is not None:
+        smb_os_name: str | None = None
+        smb_os_cpe: str | None = None
+        for sub in smb_os_elem.findall("elem"):
+            key = sub.get("key")
+            if key == "os" and sub.text:
+                smb_os_name = sub.text.strip()
+            elif key == "cpe" and sub.text:
+                smb_os_cpe = sub.text.strip()
+        if smb_os_name:
+            host.os_name = smb_os_name
+            # smb-os-discovery is protocol-level truth, not a guess.
+            host.os_accuracy = 100
+            # The OS string is "Windows ..." for every Microsoft target
+            # (Samba targets are rare and surface a different shape we
+            # don't try to canonicalise here).
+            if re.search(r"\bWindows\b", smb_os_name, re.IGNORECASE):
+                host.os_family = "Windows"
+                host.os_vendor = "Microsoft"
+                # Re-derive the structured generation marker so role
+                # rules and exploit-rule ``os_hint`` matchers see the
+                # same enumerated value they'd get from an ``osclass``
+                # element ("7", "10", "2012", "XP", ...).
+                gen_match = re.search(
+                    r"Windows\s+(?:Server\s+)?(\d+(?:\.\d+)?|XP|Vista|NT|ME|2000)",
+                    smb_os_name, re.IGNORECASE,
+                )
+                if gen_match:
+                    host.os_gen = gen_match.group(1)
+        if smb_os_cpe:
+            # Attach the OS CPE to SMB-stack services (139 netbios-ssn,
+            # 445 microsoft-ds). These are the surfaces where OS-level
+            # CVEs (MS17-010, MS08-067, SMBGhost) are exploited, so the
+            # enricher needs a versioned CPE on those edges. Other ports
+            # on the same host are intentionally skipped — pushing the
+            # OS CPE to every port would produce N copies of every
+            # OS-attributed CVE (one per service), which the UI/CLI
+            # dedupe later anyway but at the cost of N× writes.
+            for s in host.services:
+                if s.port in (139, 445) and smb_os_cpe not in s.cpe:
+                    s.cpe.append(smb_os_cpe)
 
     # Traceroute
     for hop_elem in elem.findall("trace/hop"):
