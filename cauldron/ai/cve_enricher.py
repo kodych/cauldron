@@ -327,9 +327,24 @@ _CPE_VENDOR_CORRECTIONS: dict[str, str] = {
 
 # OS CPE products worth querying NVD for (have specific, useful CVEs).
 # NVD registers these as ``o:`` (operating system) type — application-typed
-# queries against them return zero matches. Network/appliance vendors that
-# ship as integrated OS belong here.
+# queries against them return zero matches. Two groups:
+#
+# - **Appliance OSes** (ESXi, IOS, FortiOS, PAN-OS, …): the product name
+#   is generic and the version slot carries the actual release. We
+#   require a concrete version on the queried CPE — a wildcard query
+#   against ``vmware:esxi:*`` would dump every ESXi CVE ever filed.
+# - **Microsoft Windows family** (windows_7, windows_server_2012, …):
+#   the product name already encodes the major OS version, and the CPE
+#   2.2 URIs nmap emits for them have an empty version slot by design
+#   (the SP marker lives in ``update``, the edition in ``edition``). A
+#   wildcard query against ``microsoft:windows_7:*`` returns the bounded
+#   set of Win 7 CVEs — which is what we want for OS-level RCE detection
+#   (MS17-010, BlueKeep). The bare ``microsoft:windows`` form (no
+#   major-version product) is deliberately excluded — nmap attaches it
+#   to every Windows service and a query against it would flood with
+#   every Windows CVE NVD has ever recorded.
 _OS_CPE_PRODUCTS: set[str] = {
+    # Appliance OSes — strict version requirement.
     "vmware:esxi",
     "cisco:ios",
     "cisco:ios_xe",
@@ -338,6 +353,31 @@ _OS_CPE_PRODUCTS: set[str] = {
     "fortinet:fortios",
     "juniper:junos",
     "mikrotik:routeros",
+}
+
+# Microsoft Windows family CPEs — product name encodes the major
+# version, so wildcard version queries are correct and useful here
+# (see ``_OS_CPE_PRODUCTS`` docstring above).
+_OS_CPE_WINDOWS_FAMILIES: set[str] = {
+    "microsoft:windows_7",
+    "microsoft:windows_8",
+    "microsoft:windows_8.1",
+    "microsoft:windows_10",
+    "microsoft:windows_11",
+    "microsoft:windows_xp",
+    "microsoft:windows_vista",
+    "microsoft:windows_nt",
+    "microsoft:windows_2000",
+    "microsoft:windows_server_2003",
+    "microsoft:windows_server_2008",
+    "microsoft:windows_server_2012",
+    "microsoft:windows_server_2016",
+    "microsoft:windows_server_2019",
+    "microsoft:windows_server_2022",
+    # Alternate product names used in older NVD CPE entries.
+    "microsoft:windows_2003",
+    "microsoft:windows_2008",
+    "microsoft:windows_2012",
 }
 
 # Regex to extract base version from fuzzy nmap version strings
@@ -370,12 +410,21 @@ def _cpe22_to_23(cpe: str) -> str | None:
         return f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
 
     if part_type == "o":
-        # Only convert OS CPEs for high-value targets with specific versions
         vendor_l = vendor.lower()
         product_l = product.lower()
         vp_key = f"{vendor_l}:{product_l}"
-        if vp_key in _OS_CPE_PRODUCTS and version != "*":
+        # Appliance OSes require a concrete version — a wildcard query
+        # against ``vmware:esxi:*`` returns every ESXi CVE ever filed.
+        if vp_key in _OS_CPE_PRODUCTS and version != "*" and version != "":
             return f"cpe:2.3:o:{vendor_l}:{product_l}:{version}:*:*:*:*:*:*:*"
+        # Microsoft Windows family CPEs — the product name encodes the
+        # major version (windows_7, windows_server_2012, …), so an
+        # empty/wildcard version slot is the normal shape (the SP and
+        # edition live in update/edition slots that NVD wildcards in
+        # most match expressions anyway). Map an empty slot to ``*``.
+        if vp_key in _OS_CPE_WINDOWS_FAMILIES:
+            cpe_version = version if version else "*"
+            return f"cpe:2.3:o:{vendor_l}:{product_l}:{cpe_version}:*:*:*:*:*:*:*"
 
     return None
 
@@ -419,12 +468,14 @@ def _build_cpe23(vendor: str, product: str, version: str = "*") -> str:
     """Build a CPE 2.3 string from components.
 
     Picks the CPE part type (application ``a`` vs operating system ``o``) based
-    on whether the vendor:product is in the OS-registered set. Products like
-    ESXi, MikroTik RouterOS, PAN-OS, FortiOS, Cisco IOS are registered as
-    ``o:`` in NVD — application-typed queries against them return zero matches.
+    on whether the vendor:product is in the OS-registered sets. Products like
+    ESXi, MikroTik RouterOS, PAN-OS, FortiOS, Cisco IOS — and every member of
+    the Microsoft Windows family — are registered as ``o:`` in NVD;
+    application-typed queries against them return zero matches.
     """
     vp_key = f"{vendor}:{product}".lower()
-    part_type = "o" if vp_key in _OS_CPE_PRODUCTS else "a"
+    is_os = vp_key in _OS_CPE_PRODUCTS or vp_key in _OS_CPE_WINDOWS_FAMILIES
+    part_type = "o" if is_os else "a"
     return f"cpe:2.3:{part_type}:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
 
 

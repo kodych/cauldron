@@ -1755,12 +1755,28 @@ class TestUpsertVulnerabilityLinking:
         assert prefixes == ["cpe:/a:apache:http_server:2.4.49"]
 
     def test_os_cpe_not_in_allowlist_is_dropped_not_misprefixed(self):
-        """``_cpe22_to_23`` only emits OS CPEs for high-value products
-        (ESXi, Cisco IOS, etc.). Other o-types return None — so the
-        linker must not emit *any* prefix rather than fall back to an
-        a-typed guess."""
-        prefixes = self._captured_prefixes("cpe:/o:microsoft:windows_10")
+        """``_cpe22_to_23`` only emits OS CPEs for products that are
+        explicitly registered as ``o:`` in NVD (appliance OSes plus
+        the Microsoft Windows family). For everything else it returns
+        ``None`` — and the linker must emit *no* prefix rather than
+        fall back to an a-typed guess. Linux kernel is a representative
+        OS that NVD records but Cauldron deliberately doesn't query
+        directly (linux_kernel CVEs flood and the kernel version is
+        rarely exposed by remote probes anyway)."""
+        prefixes = self._captured_prefixes("cpe:/o:linux:linux_kernel")
         assert prefixes == []
+
+    def test_windows_family_os_cpe_emits_o_prefix(self):
+        """Microsoft Windows family CPEs are OS-typed and the product
+        name (windows_7, windows_10, …) carries the major-version
+        identity — the prefix must keep the ``cpe:/o:`` part type so
+        the HAS_VULN linking Cypher reaches Service nodes whose
+        ``cpe`` property carries the same OS-typed URI."""
+        prefixes = self._captured_prefixes("cpe:/o:microsoft:windows_7::sp1:professional")
+        # Empty version slot in the 2.2 URI lands as a versionless prefix
+        # ("cpe:/o:microsoft:windows_7") rather than the version-pinned
+        # variant — exactly the surface a Service node receives.
+        assert prefixes == ["cpe:/o:microsoft:windows_7"]
 
 
 @pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
