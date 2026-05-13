@@ -50,6 +50,22 @@ class NvdTransientError(RuntimeError):
 # NVD API base URL
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
+# Retry budget for a single NVD request. Six attempts with exponential
+# backoff gives the largest responses (the ~19 MB
+# ``cpe:/o:linux:linux_kernel:*`` payload is the canonical worst case)
+# a realistic chance of completing — three retries proved insufficient
+# on flaky home connections, where IncompleteRead trips multiple times
+# in a row and the operator's host-OS enrichment silently produced
+# zero edges. ``_execute_nvd_query`` enforces this for every retryable
+# class (IncompleteRead, transient HTTP, network / OS / JSON errors).
+_NVD_RETRY_BUDGET = 6
+
+# Socket timeout per attempt. Stretched from the original 30 s so the
+# multi-megabyte OS-CPE responses get the bandwidth headroom to finish
+# in one go on modest connections — a 19 MB body at 1.5 Mbps barely
+# clears the wire in 30 s before the timer trips.
+_NVD_REQUEST_TIMEOUT = 90
+
 # EPSS (Exploit Prediction Scoring System) API. FIRST.org publishes a
 # per-CVE 0.0-1.0 probability of in-the-wild exploitation in the next 30
 # days. Complements has_exploit (binary PoC existence) and CISA KEV
@@ -1322,7 +1338,7 @@ def _execute_nvd_query(
     req = urllib.request.Request(url, headers=headers)
 
     try:
-        resp = urllib.request.urlopen(req, timeout=30)
+        resp = urllib.request.urlopen(req, timeout=_NVD_REQUEST_TIMEOUT)
         # Chunked read tolerates connections the server closes early —
         # NVD's response for ``cpe:2.3:o:linux:linux_kernel:*`` runs
         # ~19 MB and the default ``resp.read()`` regularly hits
@@ -1344,11 +1360,11 @@ def _execute_nvd_query(
         # poisoning the 7-day cache with a partial answer would
         # silently hide thousands of kernel privesc CVEs from every
         # subsequent boil. Retry budget mirrors the network-error path.
-        if _retries < 3:
+        if _retries < _NVD_RETRY_BUDGET:
             backoff = 5 * (2 ** _retries)
             logger.warning(
-                "NVD IncompleteRead for %s (%d bytes received). Retry %d/3, waiting %ds...",
-                context, len(e.partial), _retries + 1, backoff,
+                "NVD IncompleteRead for %s (%d bytes received). Retry %d/%d, waiting %ds...",
+                context, len(e.partial), _retries + 1, _NVD_RETRY_BUDGET, backoff,
             )
             time.sleep(backoff)
             return _execute_nvd_query(
@@ -1356,19 +1372,19 @@ def _execute_nvd_query(
                 os_cpe, _retries + 1,
             )
         logger.error(
-            "NVD IncompleteRead for %s after 3 retries (%d bytes) — not cacheable",
-            context, len(e.partial),
+            "NVD IncompleteRead for %s after %d retries (%d bytes) — not cacheable",
+            context, _NVD_RETRY_BUDGET, len(e.partial),
         )
         raise NvdTransientError(
             f"NVD truncated response for {context} ({len(e.partial)} bytes)"
         ) from e
     except urllib.error.HTTPError as e:
         # 403 = rate limit, 503 = service unavailable — both retryable
-        if e.code in (403, 429, 500, 502, 503, 504) and _retries < 3:
-            backoff = 15 * (2 ** _retries)  # 15s, 30s, 60s
+        if e.code in (403, 429, 500, 502, 503, 504) and _retries < _NVD_RETRY_BUDGET:
+            backoff = 15 * (2 ** _retries)  # 15s, 30s, 60s, 120s, 240s, 480s
             logger.warning(
-                "NVD API error %d for %s. Retry %d/3, waiting %ds...",
-                e.code, context, _retries + 1, backoff,
+                "NVD API error %d for %s. Retry %d/%d, waiting %ds...",
+                e.code, context, _retries + 1, _NVD_RETRY_BUDGET, backoff,
             )
             time.sleep(backoff)
             return _execute_nvd_query(
@@ -1386,18 +1402,18 @@ def _execute_nvd_query(
         raise NvdTransientError(f"HTTP {e.code} from NVD for {context}") from e
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         # Transient network error — retry with exponential backoff
-        if _retries < 3:
-            backoff = 5 * (2 ** _retries)  # 5s, 10s, 20s
+        if _retries < _NVD_RETRY_BUDGET:
+            backoff = 5 * (2 ** _retries)  # 5s, 10s, 20s, 40s, 80s, 160s
             logger.warning(
-                "NVD API request failed for %s: %s. Retry %d/3, waiting %ds...",
-                context, e, _retries + 1, backoff,
+                "NVD API request failed for %s: %s. Retry %d/%d, waiting %ds...",
+                context, e, _retries + 1, _NVD_RETRY_BUDGET, backoff,
             )
             time.sleep(backoff)
             return _execute_nvd_query(
                 url, context, product_hint, version_hint, version_applies_product,
                 os_cpe, _retries + 1,
             )
-        logger.error("NVD API request failed for %s after 3 retries: %s", context, e)
+        logger.error("NVD API request failed for %s after %d retries: %s", context, _NVD_RETRY_BUDGET, e)
         raise NvdTransientError(f"NVD unreachable for {context}: {e}") from e
 
     # Normalize product hint for matching
@@ -2241,7 +2257,7 @@ def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
     req = urllib.request.Request(url, headers={"User-Agent": "Cauldron/0.1.0"})
 
     try:
-        resp = urllib.request.urlopen(req, timeout=30)
+        resp = urllib.request.urlopen(req, timeout=_NVD_REQUEST_TIMEOUT)
         data = json.loads(resp.read())
     except (urllib.error.HTTPError, urllib.error.URLError,
             OSError, json.JSONDecodeError) as e:

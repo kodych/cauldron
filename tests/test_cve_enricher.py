@@ -1574,14 +1574,18 @@ class TestExecuteNVDRetry:
     def test_403_retries_capped_then_raises(self, mock_sleep, mock_rate, mock_urlopen, mock_settings):
         import pytest
 
-        from cauldron.ai.cve_enricher import NvdTransientError, _execute_nvd_query
+        from cauldron.ai.cve_enricher import (
+            _NVD_RETRY_BUDGET,
+            NvdTransientError,
+            _execute_nvd_query,
+        )
 
         mock_settings.nvd_api_key = None
         mock_urlopen.side_effect = urllib_403_error()
 
         with pytest.raises(NvdTransientError):
             _execute_nvd_query("https://example.com", "test")
-        assert mock_sleep.call_count == 3
+        assert mock_sleep.call_count == _NVD_RETRY_BUDGET
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")
@@ -1593,14 +1597,18 @@ class TestExecuteNVDRetry:
 
         import pytest
 
-        from cauldron.ai.cve_enricher import NvdTransientError, _execute_nvd_query
+        from cauldron.ai.cve_enricher import (
+            _NVD_RETRY_BUDGET,
+            NvdTransientError,
+            _execute_nvd_query,
+        )
 
         mock_settings.nvd_api_key = None
         mock_urlopen.side_effect = urllib.error.URLError("Connection timed out")
 
         with pytest.raises(NvdTransientError):
             _execute_nvd_query("https://example.com", "test")
-        assert mock_sleep.call_count == 3
+        assert mock_sleep.call_count == _NVD_RETRY_BUDGET
 
     @patch("cauldron.ai.cve_enricher.settings")
     @patch("cauldron.ai.cve_enricher.urllib.request.urlopen")

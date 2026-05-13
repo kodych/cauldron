@@ -1192,6 +1192,7 @@ def _run_analysis_pipeline(
     if nvd:
         from cauldron.ai.cve_enricher import (
             enrich_epss_from_graph,
+            enrich_host_os_from_graph,
             enrich_services_from_graph,
         )
         _bump("nvd", "Starting NVD enrichment")
@@ -1200,6 +1201,21 @@ def _run_analysis_pipeline(
             _bump("nvd", message, current, total)
 
         cve_stats = enrich_services_from_graph(progress_callback=_nvd_cb)
+
+        # Host-OS enrichment — kernel privesc backlog + OS-wide RCEs
+        # the service-level pass can't reach. Has to run before EPSS so
+        # the freshly-attached host-level Vulnerability nodes pick up
+        # their EPSS scores in the same boil. The CLI ``cauldron boil``
+        # path already wires this in (cli/commands.py); without this
+        # call the UI-triggered analysis would silently skip the host
+        # pipeline and the operator sees zero ``OS``-chipped rows
+        # despite the function being live in the codebase.
+        _bump("nvd", "Enriching host OS")
+
+        def _host_cb(current: int, total: int, message: str):
+            _bump("nvd", message, current, total)
+
+        enrich_host_os_from_graph(progress_callback=_host_cb)
 
         # Piggy-back on the --nvd flag: once we have CVEs on the graph,
         # fetch EPSS scores for them. Cheap batch API call, 24h-cached,
