@@ -18,6 +18,7 @@ Features:
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import re
@@ -1322,7 +1323,45 @@ def _execute_nvd_query(
 
     try:
         resp = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(resp.read())
+        # Chunked read tolerates connections the server closes early —
+        # NVD's response for ``cpe:2.3:o:linux:linux_kernel:*`` runs
+        # ~19 MB and the default ``resp.read()`` regularly hits
+        # ``http.client.IncompleteRead`` on home connections. Reading
+        # incrementally surfaces the same exception (caught below) but
+        # at least we already have the partial bytes if a future fix
+        # wants to salvage them.
+        body = bytearray()
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            body.extend(chunk)
+        data = json.loads(bytes(body))
+    except http.client.IncompleteRead as e:
+        # NVD truncated the response mid-stream (most common on the
+        # multi-megabyte responses ``cpe:/o:linux:linux_kernel:*``
+        # produces). Treat as transient so the caller skips the cache —
+        # poisoning the 7-day cache with a partial answer would
+        # silently hide thousands of kernel privesc CVEs from every
+        # subsequent boil. Retry budget mirrors the network-error path.
+        if _retries < 3:
+            backoff = 5 * (2 ** _retries)
+            logger.warning(
+                "NVD IncompleteRead for %s (%d bytes received). Retry %d/3, waiting %ds...",
+                context, len(e.partial), _retries + 1, backoff,
+            )
+            time.sleep(backoff)
+            return _execute_nvd_query(
+                url, context, product_hint, version_hint, version_applies_product,
+                os_cpe, _retries + 1,
+            )
+        logger.error(
+            "NVD IncompleteRead for %s after 3 retries (%d bytes) — not cacheable",
+            context, len(e.partial),
+        )
+        raise NvdTransientError(
+            f"NVD truncated response for {context} ({len(e.partial)} bytes)"
+        ) from e
     except urllib.error.HTTPError as e:
         # 403 = rate limit, 503 = service unavailable — both retryable
         if e.code in (403, 429, 500, 502, 503, 504) and _retries < 3:
