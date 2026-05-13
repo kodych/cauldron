@@ -110,6 +110,70 @@ def test_parse_osclass_extracts_family_vendor_gen():
     assert host.os_accuracy == 95
 
 
+def test_parse_osclass_extracts_os_cpe():
+    """nmap's ``<osclass><cpe>`` child carries a CPE 2.2 URI for the
+    host OS (``cpe:/o:linux:linux_kernel:2.6`` etc.). It's the only
+    place in stock nmap output where the OS gets a structured
+    identifier the host-OS enricher can hand to NVD; without it
+    kernel privesc CVEs (CVE-2009-2698 sock_sendpage, …) never
+    surface on legacy Linux targets."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="192.168.1.209" addrtype="ipv4"/>
+            <os>
+                <osmatch name="Linux 2.6.9 - 2.6.30" accuracy="98">
+                    <osclass type="general purpose" vendor="Linux"
+                             osfamily="Linux" osgen="2.6.X" accuracy="98">
+                        <cpe>cpe:/o:linux:linux_kernel:2.6</cpe>
+                    </osclass>
+                </osmatch>
+            </os>
+        </host>
+    </nmaprun>
+    """
+    host = parse_nmap_xml(xml).hosts_up[0]
+    assert host.os_cpe == "cpe:/o:linux:linux_kernel:2.6"
+    assert host.os_family == "Linux"
+
+
+def test_smb_os_discovery_cpe_overrides_osclass_cpe():
+    """smb-os-discovery is protocol-level truth; for Windows targets
+    it returns a more specific CPE than ``<osclass>`` (with SP and
+    edition slots populated). The host-OS enricher needs the specific
+    form so NVD's MS17-010-era records (which key on ``-:sp1``)
+    resolve. When both sources are present the smb-os-discovery CPE
+    must win."""
+    xml = """<?xml version="1.0"?>
+    <nmaprun scanner="nmap" start="1700000000" version="7.94">
+        <host>
+            <status state="up"/>
+            <address addr="10.0.0.60" addrtype="ipv4"/>
+            <os>
+                <osmatch name="Microsoft Windows Server 2012 or 2012 R2" accuracy="97">
+                    <osclass type="general purpose" vendor="Microsoft"
+                             osfamily="Windows" osgen="2012" accuracy="97">
+                        <cpe>cpe:/o:microsoft:windows_server_2012:r2</cpe>
+                    </osclass>
+                </osmatch>
+            </os>
+            <ports/>
+            <hostscript>
+                <script id="smb-os-discovery" output="...">
+                    <elem key="os">Windows 7 Professional 7601 Service Pack 1</elem>
+                    <elem key="cpe">cpe:/o:microsoft:windows_7::sp1:professional</elem>
+                </script>
+            </hostscript>
+        </host>
+    </nmaprun>
+    """
+    host = parse_nmap_xml(xml).hosts_up[0]
+    # smb-os-discovery wins for both os_name and os_cpe.
+    assert host.os_name == "Windows 7 Professional 7601 Service Pack 1"
+    assert host.os_cpe == "cpe:/o:microsoft:windows_7::sp1:professional"
+
+
 def test_parse_service_ostype_fallback_when_no_osclass():
     """Scans without ``-O`` have no <os> element. ``-sV`` sometimes
     populates ``ostype`` on individual services from banner inference;

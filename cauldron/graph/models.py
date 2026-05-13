@@ -101,6 +101,13 @@ class Host:
     os_family: str | None = None
     os_vendor: str | None = None
     os_gen: str | None = None
+    # CPE 2.2 URI for the host's operating system, sourced from nmap's
+    # ``<osclass><cpe>`` element or — when smb-os-discovery ran — the
+    # protocol-reported CPE (more specific because the SP / edition slot
+    # is populated). Used by the host-OS CVE enricher to query NVD for
+    # OS-attributed bugs (Linux kernel privesc, Windows OS RCEs) that
+    # don't surface through any single service-level CPE.
+    os_cpe: str | None = None
     ttl: int | None = None
     services: list[Service] = field(default_factory=list)
     traceroute: list[TracerouteHop] = field(default_factory=list)

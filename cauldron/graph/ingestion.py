@@ -204,6 +204,7 @@ def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
             h.os_family = $os_family,
             h.os_vendor = $os_vendor,
             h.os_gen = $os_gen,
+            h.os_cpe = $os_cpe,
             h.mac = $mac,
             h.mac_vendor = $mac_vendor,
             h.state = $state,
@@ -220,6 +221,7 @@ def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
             h.os_family = COALESCE($os_family, h.os_family),
             h.os_vendor = COALESCE($os_vendor, h.os_vendor),
             h.os_gen = COALESCE($os_gen, h.os_gen),
+            h.os_cpe = COALESCE($os_cpe, h.os_cpe),
             h.mac = COALESCE($mac, h.mac),
             h.mac_vendor = COALESCE($mac_vendor, h.mac_vendor)
         """,
@@ -231,6 +233,7 @@ def _upsert_host(session: Session, host: Host, timestamp: datetime) -> None:
         os_family=host.os_family,
         os_vendor=host.os_vendor,
         os_gen=host.os_gen,
+        os_cpe=host.os_cpe,
         mac=host.mac,
         mac_vendor=host.mac_vendor,
         state=host.state,

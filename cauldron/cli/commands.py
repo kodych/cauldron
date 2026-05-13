@@ -331,6 +331,7 @@ def boil(nvd: bool, ai: bool, run_all: bool):
     if nvd:
         from cauldron.ai.cve_enricher import (
             enrich_epss_from_graph,
+            enrich_host_os_from_graph,
             enrich_services_from_graph,
         )
 
@@ -345,6 +346,36 @@ def boil(nvd: bool, ai: bool, run_all: bool):
             console.print(f"  [dim]  ({cve_stats['skipped']} services skipped — no version/CPE)[/dim]")
         if cve_stats["errors"]:
             console.print(f"  [yellow]  ! {cve_stats['errors']} errors during enrichment[/yellow]")
+
+        # Host-OS enrichment — kernel privesc backlog + OS-wide RCEs
+        # that don't anchor to a single service. Runs after the
+        # service-level pass so the Vulnerability nodes it touches
+        # (which may already exist from the service path on Windows
+        # hosts) get the multi-source merge instead of fighting for
+        # ``ON CREATE`` ordering.
+        with console.status("[bold green]Enriching host OS with CVE data..."):
+            host_cve_stats = enrich_host_os_from_graph()
+
+        if host_cve_stats["hosts_checked"]:
+            console.print(
+                f"  [green]+[/green] Host-OS: {host_cve_stats['total_cves_found']} CVEs"
+                f" across {host_cve_stats['hosts_with_cves']} hosts"
+                f" (checked {host_cve_stats['hosts_checked']})"
+            )
+            if host_cve_stats["from_cache"]:
+                console.print(
+                    f"  [dim]  ({host_cve_stats['from_cache']} from cache, "
+                    f"{host_cve_stats['api_calls']} API calls)[/dim]"
+                )
+            if host_cve_stats["skipped"]:
+                console.print(
+                    f"  [dim]  ({host_cve_stats['skipped']} hosts skipped — "
+                    "OS CPE not in NVD allowlist)[/dim]"
+                )
+            if host_cve_stats["errors"]:
+                console.print(
+                    f"  [yellow]  ! {host_cve_stats['errors']} host-OS errors[/yellow]"
+                )
 
         with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
             epss_stats = enrich_epss_from_graph()

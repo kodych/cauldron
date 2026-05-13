@@ -300,6 +300,22 @@ class TestCPEConversion:
         result = _cpe22_to_23("cpe:/o:cisco:ios:15.1")
         assert result == "cpe:2.3:o:cisco:ios:15.1:*:*:*:*:*:*:*"
 
+    def test_cpe22_os_linux_kernel_with_major_minor(self):
+        """Linux kernel CPE from nmap's ``<osclass>`` lands with a
+        major.minor version slot (``cpe:/o:linux:linux_kernel:2.6``).
+        Must convert so the host-OS enricher can query NVD for the
+        kernel privesc backlog — without it CVE-2009-2698 and the
+        rest of the AV:L Linux kernel CVEs never surface."""
+        result = _cpe22_to_23("cpe:/o:linux:linux_kernel:2.6")
+        assert result == "cpe:2.3:o:linux:linux_kernel:2.6:*:*:*:*:*:*:*"
+
+    def test_cpe22_os_linux_kernel_no_version_returns_none(self):
+        """Versionless ``cpe:/o:linux:linux_kernel`` would flood — NVD
+        has thousands of kernel CVEs and we have no way to filter by
+        applicable major.minor without a concrete version. Drop."""
+        result = _cpe22_to_23("cpe:/o:linux:linux_kernel")
+        assert result is None
+
     def test_cpe22_os_without_version_returns_none(self):
         """OS CPE without version should be None even for known products."""
         result = _cpe22_to_23("cpe:/o:vmware:esxi")
@@ -1152,6 +1168,58 @@ class TestCVEIsGold:
         assert _cve_is_gold(theoretical, versionless=True, os_cpe=True) is False
         kev_ancient = self._cve_with_year(2010, has_exploit=False, in_cisa_kev=True)
         assert _cve_is_gold(kev_ancient, versionless=True, os_cpe=True) is True
+
+    # --- Host-OS context: AV:L kernel privesc survives the gate ---
+
+    def test_host_os_keeps_av_local_cves(self):
+        """Service-level queries drop AV:L (local attack vector) CVEs
+        — for an external-surface scan local privesc isn't reachable
+        from the network. Host-OS queries invert that: the enricher
+        only runs against the Host node when the operator presumes
+        foothold context, and AV:L kernel privesc (CVE-2009-2698,
+        CVE-2010-3904, …) is exactly the gold the host-OS pipeline
+        exists to surface. ``host_os=True`` must keep these."""
+        kernel_privesc = CVEInfo(
+            cve_id="CVE-2009-2698",
+            cvss=7.2,
+            cvss_vector="AV:L/AC:L/Au:N/C:C/I:C/A:C",
+            has_exploit=True,
+            in_cisa_kev=False,
+            published="2009-09-15",
+        )
+        # Service-level: dropped — operator can't reach AV:L from outside.
+        assert _cve_is_gold(kernel_privesc, host_os=False) is False
+        # Host-OS: kept — post-foothold escalation gold.
+        assert _cve_is_gold(kernel_privesc, host_os=True, os_cpe=True) is True
+
+    def test_host_os_still_drops_av_physical(self):
+        """The host-OS carve-out lifts AV:L only. AV:P (physical
+        access) stays out of scope on every network engagement that
+        doesn't involve a hardware lab — that lift would do nothing
+        useful and would flood the result set with TPM / BadUSB-class
+        bugs the operator can't reach."""
+        physical = CVEInfo(
+            cve_id="CVE-X-PHYS",
+            cvss=8.5,
+            cvss_vector="CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            has_exploit=True,
+            published="2024-01-01",
+        )
+        assert _cve_is_gold(physical, host_os=True, os_cpe=True) is False
+
+    def test_host_os_keeps_dos_drop(self):
+        """Pure-DoS CVEs are useless for red-team gold hunting in both
+        service-level and host-OS contexts — operator wants foothold
+        and lateral movement, not crashing the box. The DoS gate
+        must still fire even when ``host_os=True``."""
+        dos = CVEInfo(
+            cve_id="CVE-X-DOS",
+            cvss=7.5,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+            has_exploit=True,
+            published="2023-01-01",
+        )
+        assert _cve_is_gold(dos, host_os=True, os_cpe=True) is False
 
     # --- Priority sort: KEV first, then exploit, then CVSS ---
 

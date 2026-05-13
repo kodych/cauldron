@@ -487,9 +487,22 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
         onClick={() => setExpanded(!expanded)}
         className="w-full px-2 py-1.5 text-left flex items-center gap-2"
       >
-        {ports.length > 0 && (
+        {ports.length > 0 ? (
           <span className="font-mono text-xs text-gray-500 shrink-0" title={ports.join(', ')}>
             :{ports[0]}{ports.length > 1 && <span className="text-gray-600">+{ports.length - 1}</span>}
+          </span>
+        ) : (
+          // Host-level finding (kernel privesc / OS-wide CVE) — no
+          // service port anchors it. Render an OS chip in the same
+          // slot so the row stays visually aligned with port-level
+          // peers and the operator can tell at a glance that this
+          // finding escalates from foothold, not from an exposed
+          // service.
+          <span
+            className="font-mono text-[10px] tracking-wide shrink-0 rounded px-1 py-0 bg-indigo-900/40 text-indigo-300"
+            title="Host-level OS vulnerability — affects this host's operating system, not a specific service"
+          >
+            OS
           </span>
         )}
         {vuln.cvss > 0 && (

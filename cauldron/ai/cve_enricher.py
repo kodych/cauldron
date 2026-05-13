@@ -353,6 +353,12 @@ _OS_CPE_PRODUCTS: set[str] = {
     "fortinet:fortios",
     "juniper:junos",
     "mikrotik:routeros",
+    # Linux kernel — host-OS enrichment surfaces kernel privesc CVEs
+    # (CVE-2009-2698 sock_sendpage, CVE-2010-3904 RDS, …) that the
+    # service-level pipeline can't reach. The version slot here
+    # carries the actual kernel release (``2.6``, ``3.10``, ``5.15``),
+    # so the appliance-style "concrete version required" rule fits.
+    "linux:linux_kernel",
 }
 
 # Microsoft Windows family CPEs — product name encodes the major
@@ -974,6 +980,19 @@ def _cve_is_local_only(cve: CVEInfo) -> bool:
     return "AV:L" in tokens or "AV:P" in tokens
 
 
+def _cve_is_physical_only(cve: CVEInfo) -> bool:
+    """True if the CVE requires physical access (AV:P) — out of scope on
+    every network engagement that doesn't involve a hardware lab.
+
+    Counterpart to ``_cve_is_local_only`` for the host-OS enrichment
+    path: there AV:L kernel privesc IS pentester gold (post-foothold
+    escalation, e.g. CVE-2009-2698 sock_sendpage on Linux 2.6.x) so
+    we still need to filter AV:P without lumping AV:L into the same
+    drop.
+    """
+    return "AV:P" in _cvss_tokens(cve)
+
+
 def _cve_requires_admin(cve: CVEInfo) -> bool:
     """True if the CVE requires high-privileged access (admin/root) to exploit.
 
@@ -1030,7 +1049,12 @@ def _cve_published_year(cve: CVEInfo) -> int | None:
 _VERSIONLESS_RECENCY_YEARS = 5
 
 
-def _cve_is_gold(cve: CVEInfo, versionless: bool = False, os_cpe: bool = False) -> bool:
+def _cve_is_gold(
+    cve: CVEInfo,
+    versionless: bool = False,
+    os_cpe: bool = False,
+    host_os: bool = False,
+) -> bool:
     """Decide whether a CVE clears the "actionable gold" bar for a pentester.
 
     Single gate: a CVE must have a public exploit to count as gold. When we
@@ -1062,7 +1086,16 @@ def _cve_is_gold(cve: CVEInfo, versionless: bool = False, os_cpe: bool = False) 
          Win 7 / 2008 / XP CVE on a clearly-vulnerable legacy host.
       5. Actionable-exploit gate — has_exploit.
     """
-    if _cve_is_local_only(cve):
+    # AV:L vs AV:P split is host-OS-context aware. For service-level
+    # queries the operator is enumerating external attack surface, so
+    # both local and physical CVEs drop. For host-OS queries the
+    # operator already knows they need a foothold (kernel privesc
+    # presumes shell access); AV:L is then the canonical
+    # post-foothold escalation path and must survive the gate.
+    if host_os:
+        if _cve_is_physical_only(cve):
+            return False
+    elif _cve_is_local_only(cve):
         return False
     if _cve_is_dos_only(cve):
         return False
@@ -1090,7 +1123,11 @@ def _has_specific_version(cpe23: str) -> bool:
     return len(parts) >= 6 and parts[5] != "*"
 
 
-def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> list[CVEInfo] | None:
+def _query_nvd_cpe(
+    cpe23: str,
+    service_version_override: str | None = None,
+    host_os: bool = False,
+) -> list[CVEInfo] | None:
     """Query NVD API using CPE-based virtualMatchString.
 
     With specific version: full search, sorted by severity (highest first).
@@ -1109,6 +1146,11 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
             ``esxi:*`` — but we still want range validation to pick the
             CVEs that apply to 8.0.3, not every CVE that ever touched
             ESXi.
+        host_os: True when the caller is enriching a Host node's
+            ``os_cpe`` rather than a Service's ``cpe``. Threaded into
+            the gold filter so AV:L kernel privesc CVEs survive — the
+            host-OS pipeline exists precisely to surface them, since
+            no service-level CPE exposes them.
 
     Returns None if CPE is not recognized by NVD (404), signaling
     the caller to try keyword fallback.
@@ -1186,7 +1228,9 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
     # computed above) suppresses the recency cut so EoL'd OS families
     # retain CVE applicability indefinitely.
     cves = [c for c in cves if _is_pentester_relevant(c)]
-    cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version, os_cpe=is_os_cpe)]
+    cves = [c for c in cves if _cve_is_gold(
+        c, versionless=not has_version, os_cpe=is_os_cpe, host_os=host_os,
+    )]
 
     # Pentester-priority sort: CISA KEV (active in-the-wild exploitation)
     # first, then CVEs with a public exploit, then CVSS descending within
@@ -2008,10 +2052,16 @@ def enrich_services_from_graph(
     # graph consistent with /api/v1/stats — ``MATCH (v:Vulnerability)``
     # always equals "Vulnerabilities reachable from a Service."
     with get_session() as session:
+        # Sweep keeps a Vulnerability alive if EITHER a Service or a
+        # Host still points at it — the host-OS enricher creates
+        # ``(:Host)-[:HAS_VULN]->(v)`` edges (kernel privesc CVEs that
+        # don't anchor to any single service), so the Service-only
+        # check would treat those as orphans and delete them.
         removed = session.run(
             """
             MATCH (v:Vulnerability)
             WHERE NOT EXISTS { (:Service)-[:HAS_VULN]->(v) }
+              AND NOT EXISTS { (:Host)-[:HAS_VULN]->(v) }
             DETACH DELETE v
             RETURN count(v) AS removed
             """
@@ -2019,6 +2069,111 @@ def enrich_services_from_graph(
     stats["orphans_removed"] = removed["removed"] if removed else 0
     if stats["orphans_removed"]:
         logger.info("Removed %d orphan Vulnerability nodes", stats["orphans_removed"])
+
+    return stats
+
+
+def enrich_host_os_from_graph(progress_callback=None) -> dict:
+    """Enrich Host nodes with OS-level CVE findings via NVD.
+
+    Mirrors ``enrich_services_from_graph`` but operates on Host nodes
+    instead of Service nodes, using ``h.os_cpe`` (sourced from nmap's
+    ``<osclass><cpe>`` element or smb-os-discovery when available)
+    instead of ``s.cpe``. Surfaces OS-attributed CVEs that the
+    service-level pipeline can't reach — most importantly the Linux
+    kernel privesc backlog (CVE-2009-2698 sock_sendpage,
+    CVE-2010-3904 RDS, CVE-2009-2692 vmsplice) that's the canonical
+    post-foothold escalation path on legacy targets.
+
+    Differs from the service-level path in two filter knobs:
+
+    - ``host_os=True`` keeps AV:L (local) CVEs through ``_cve_is_gold``.
+      Kernel privesc is local-vector by definition and is the only
+      reason this enricher exists.
+    - Findings attach to the Host via ``(:Host)-[:HAS_VULN]->(:Vulnerability)``
+      rather than a Service. Downstream API merges service-level and
+      host-level vulns on a single host detail response; the UI
+      renders host-level rows with an ``OS`` badge instead of a port
+      label so the operator can tell at a glance which findings
+      escalate from foothold vs which sit on an exposed service.
+    """
+    from cauldron.graph.connection import get_session
+
+    stats = {
+        "hosts_checked": 0,
+        "hosts_with_cves": 0,
+        "total_cves_found": 0,
+        "from_cache": 0,
+        "api_calls": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+
+    cache = CVECache()
+
+    with get_session() as session:
+        hosts = list(session.run(
+            """
+            MATCH (h:Host)
+            WHERE h.os_cpe IS NOT NULL
+            RETURN h.ip AS ip, h.os_cpe AS os_cpe, h.os_name AS os_name
+            ORDER BY h.ip
+            """,
+        ))
+
+    total = len(hosts)
+    for idx, record in enumerate(hosts):
+        ip = record["ip"]
+        cpe22 = record["os_cpe"]
+        cpe23 = _cpe22_to_23(cpe22)
+        if not cpe23:
+            # OS family not in ``_OS_CPE_PRODUCTS`` / Windows allowlist
+            # (e.g. macOS, FreeBSD, generic ``cpe:/o:microsoft:windows``
+            # without a major-version suffix). Skip rather than dump a
+            # noisy "unrecognised CPE" log line per host.
+            stats["skipped"] += 1
+            continue
+
+        stats["hosts_checked"] += 1
+        cache_key = cpe23
+
+        cached = cache.get(cache_key)
+        if cached is not None:
+            cves = cached
+            stats["from_cache"] += 1
+        else:
+            try:
+                fetched = _query_nvd_cpe(cpe23, host_os=True)
+            except NvdTransientError as e:
+                logger.warning("Host-OS NVD failure for %s (%s): %s", ip, cpe23, e)
+                stats["errors"] += 1
+                if progress_callback:
+                    progress_callback(idx + 1, total, f"{ip}: NVD error")
+                continue
+            if fetched is None:
+                # 404 — CPE not recognised by NVD. Cache an empty
+                # result so we don't hit the API again for the same
+                # CPE on the next pass.
+                cves = []
+            else:
+                cves = fetched
+            stats["api_calls"] += 1
+            cache.put(cache_key, cves)
+
+        if not cves:
+            if progress_callback:
+                progress_callback(idx + 1, total, f"{ip}: 0 CVEs")
+            continue
+
+        stats["hosts_with_cves"] += 1
+        stats["total_cves_found"] += len(cves)
+
+        with get_session() as session:
+            for cve in cves:
+                _upsert_host_vulnerability(session, ip, cve)
+
+        if progress_callback:
+            progress_callback(idx + 1, total, f"{ip}: {len(cves)} CVEs")
 
     return stats
 
@@ -2182,6 +2337,51 @@ _VULN_MERGE_CLAUSE = """
             ELSE v.source + '+nvd'
         END
 """
+
+
+def _upsert_host_vulnerability(session, host_ip: str, cve: CVEInfo) -> None:
+    """Link a CVE to a Host node via ``HAS_VULN``.
+
+    Mirror of ``_upsert_vulnerability``'s target-endpoint path, but
+    keyed on the Host rather than a specific Service. Used by the
+    host-OS enricher to attach OS-attributed bugs (kernel privesc,
+    OS-wide RCEs) that don't anchor to any single port.
+
+    The Vulnerability MERGE shares ``_VULN_MERGE_CLAUSE`` with the
+    service path so multi-source handling, EPSS / KEV backfills, and
+    ``v.source = '…+nvd'`` semantics all behave identically — the
+    only difference is the relationship endpoint.
+
+    Orphan-prevention contract holds: the Vulnerability MERGE is
+    gated behind ``MATCH (h:Host)`` in the same statement. If the
+    host vanishes between the enricher's read pass and the upsert,
+    nothing dangles.
+    """
+    version_unconfirmed = not getattr(cve, "matched_version_pinned", False)
+    cve_params = {
+        "cve_id": cve.cve_id,
+        "cvss": cve.cvss,
+        "cvss_vector": cve.cvss_vector,
+        "severity": cve.severity,
+        "description": cve.description,
+        "has_exploit": cve.has_exploit,
+        "exploit_url": cve.exploit_url,
+        "epss": cve.epss,
+        "in_cisa_kev": cve.in_cisa_kev,
+        "cisa_kev_added": cve.cisa_kev_added,
+    }
+    session.run(
+        f"""
+        MATCH (h:Host {{ip: $ip}})
+        {_VULN_MERGE_CLAUSE}
+        MERGE (h)-[rel:HAS_VULN]->(v)
+        ON CREATE SET rel.confidence = 'check'
+        SET rel.version_unconfirmed = $version_unconfirmed
+        """,
+        ip=host_ip,
+        version_unconfirmed=version_unconfirmed,
+        **cve_params,
+    )
 
 
 def _upsert_vulnerability(

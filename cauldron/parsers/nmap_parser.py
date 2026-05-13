@@ -118,6 +118,17 @@ def _parse_host(elem: ET.Element) -> Host | None:
             host.os_family = osclass_elem.get("osfamily") or None
             host.os_vendor = osclass_elem.get("vendor") or None
             host.os_gen = osclass_elem.get("osgen") or None
+            # ``<osclass><cpe>`` is nmap's CPE 2.2 URI for the host OS —
+            # ``cpe:/o:linux:linux_kernel:2.6`` for a Linux 2.6.x box,
+            # ``cpe:/o:microsoft:windows_7`` for Win 7, etc. Captured at
+            # the Host level so the host-OS enricher can query NVD for
+            # OS-attributed bugs (kernel privesc, OS RCEs) without
+            # piggy-backing on a service node. smb-os-discovery further
+            # below overrides this with a more specific CPE when the
+            # target is a Windows SMB endpoint.
+            osclass_cpe = osclass_elem.find("cpe")
+            if osclass_cpe is not None and osclass_cpe.text:
+                host.os_cpe = osclass_cpe.text.strip()
 
     # Ports & Services
     for port_elem in elem.findall("ports/port"):
@@ -178,14 +189,23 @@ def _parse_host(elem: ET.Element) -> Host | None:
                 if gen_match:
                     host.os_gen = gen_match.group(1)
         if smb_os_cpe:
+            # smb-os-discovery beats osclass: it queries the SMB
+            # protocol directly and reports the SP / edition in the
+            # update / edition slots, while osclass typically gives
+            # only ``cpe:/o:microsoft:windows_7`` (no SP). Override the
+            # host-level OS CPE so the host-OS enricher queries the
+            # specific build NVD knows about.
+            host.os_cpe = smb_os_cpe
             # Attach the OS CPE to SMB-stack services (139 netbios-ssn,
             # 445 microsoft-ds). These are the surfaces where OS-level
             # CVEs (MS17-010, MS08-067, SMBGhost) are exploited, so the
-            # enricher needs a versioned CPE on those edges. Other ports
-            # on the same host are intentionally skipped — pushing the
-            # OS CPE to every port would produce N copies of every
-            # OS-attributed CVE (one per service), which the UI/CLI
-            # dedupe later anyway but at the cost of N× writes.
+            # service-level enricher gets a versioned CPE on those
+            # edges and keeps the existing SMB-port-specific findings
+            # (port 445 stays where MS17-010 attaches semantically).
+            # Other ports on the same host are intentionally skipped —
+            # pushing the OS CPE to every port would produce N copies
+            # of every OS-attributed CVE. The host-OS enricher above
+            # picks up the OS-wide bugs as a single per-host edge.
             for s in host.services:
                 if s.port in (139, 445) and smb_os_cpe not in s.cpe:
                     s.cpe.append(smb_os_cpe)
