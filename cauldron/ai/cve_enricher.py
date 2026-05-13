@@ -2168,10 +2168,19 @@ _VULN_MERGE_CLAUSE = """
         v.source = 'nvd'
     ON MATCH SET
         v.cvss = COALESCE($cvss, v.cvss),
+        v.cvss_vector = COALESCE($cvss_vector, v.cvss_vector),
         v.severity = COALESCE($severity, v.severity),
         v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
+        v.exploit_url = COALESCE($exploit_url, v.exploit_url),
+        v.epss = COALESCE($epss, v.epss),
         v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
-        v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added)
+        v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added),
+        v.source = CASE
+            WHEN v.source IS NULL THEN 'nvd'
+            WHEN v.source = 'nvd' THEN 'nvd'
+            WHEN v.source CONTAINS 'nvd' THEN v.source
+            ELSE v.source + '+nvd'
+        END
 """
 
 

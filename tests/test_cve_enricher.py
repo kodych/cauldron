@@ -1869,6 +1869,48 @@ class TestUpsertVulnerabilityLinking:
         assert prefixes == ["cpe:/o:microsoft:windows_7"]
 
 
+class TestVulnMergeClauseMultiSource:
+    """``_VULN_MERGE_CLAUSE`` must extend ``v.source`` rather than only
+    setting it on initial node creation. CVE-2017-0144 was the canary:
+    the local exploit_db matcher (CAULDRON-010) ran first, created the
+    Vulnerability node with ``v.source = 'exploit_db'``, and the NVD
+    enricher's ``ON MATCH`` block then updated cvss / epss / kev but
+    left ``source`` untouched — so the UI rendered MS17-010 as a
+    DB-only finding even though NVD had verified the same CVE in the
+    same boil run.
+
+    This is a Cypher-shape check rather than a live-DB integration
+    test so it runs on every CI tier (the orphan-prevention class
+    further down covers the end-to-end path on workstations that have
+    Neo4j available)."""
+
+    def test_on_match_extends_source(self):
+        from cauldron.ai.cve_enricher import _VULN_MERGE_CLAUSE
+        on_create, on_match = _VULN_MERGE_CLAUSE.split("ON MATCH")
+        # ON CREATE sets nvd as the canonical source for a fresh node.
+        assert "v.source = 'nvd'" in on_create
+        # ON MATCH appends nvd to whatever the existing writer recorded,
+        # idempotent when nvd was already present.
+        assert "v.source = CASE" in on_match
+        assert "v.source CONTAINS 'nvd'" in on_match
+        assert "v.source + '+nvd'" in on_match
+        # Existing-but-not-nvd path: a node previously tagged exploit_db
+        # turns into 'exploit_db+nvd', not silently kept as 'exploit_db'.
+        assert "WHEN v.source IS NULL THEN 'nvd'" in on_match
+
+    def test_on_match_backfills_missing_nvd_fields(self):
+        """When the local matcher created the node it didn't know the
+        CVSS vector / EPSS / exploit URL — NVD's ON MATCH must fill
+        these in via COALESCE, otherwise CVE-2017-0144 stays without
+        ``cvss_vector`` and the UI can't render the attack-vector
+        chip."""
+        from cauldron.ai.cve_enricher import _VULN_MERGE_CLAUSE
+        on_match = _VULN_MERGE_CLAUSE.split("ON MATCH")[1]
+        assert "v.cvss_vector = COALESCE($cvss_vector, v.cvss_vector)" in on_match
+        assert "v.epss = COALESCE($epss, v.epss)" in on_match
+        assert "v.exploit_url = COALESCE($exploit_url, v.exploit_url)" in on_match
+
+
 @pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
 class TestUpsertVulnerabilityOrphanPrevention:
     """The Vulnerability MERGE must never fire when nothing in the

@@ -3,6 +3,7 @@ import { ArrowLeft, Shield, Server, Bug, ChevronDown, ChevronUp, Check, X, Key, 
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor, cvssSeverity, osFamilyTone, osFamilyLabel } from '../utils/colors';
+import { parseSources, sourceLabel } from '../utils/format';
 import type { HostOut, VulnOut, VulnStatus } from '../types';
 import { Badge } from './Badge';
 import { ExploitCommands } from './ExploitCommands';
@@ -584,13 +585,13 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             ServicesList) to avoid repeating the same warning on every
             CVE row. It's still on VulnOut for aggregate views (Vulns
             tab, report) where service context isn't visible. */}
-        {vuln.source && (
-          <span className="shrink-0">
-            <Badge tone="gray" title={`Source: ${vuln.source.toUpperCase()}`}>
-              {vuln.source === 'ai' ? 'AI' : vuln.source === 'exploit_db' ? 'DB' : vuln.source === 'nvd' ? 'NVD' : vuln.source}
+        {parseSources(vuln.source).map((tok) => (
+          <span key={tok} className="shrink-0">
+            <Badge tone="gray" title={`Source: ${tok.toUpperCase()}`}>
+              {sourceLabel(tok)}
             </Badge>
           </span>
-        )}
+        ))}
         {/* Inline status quick-picker — primary triage action, must be
             visibly affordant as a button group, not a row of three
             naked icons that newcomers can't recognize. Implemented as a

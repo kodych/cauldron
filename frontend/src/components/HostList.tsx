@@ -3,6 +3,7 @@ import { Search, ChevronDown, ChevronUp, X, Flame } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getRoleColor, getCvssColor, getConfidenceColor, osFamilyTone, osFamilyLabel } from '../utils/colors';
+import { parseSources, sourceLabel, sourceBadgeClass } from '../utils/format';
 import type { HostListResponse, HostOut } from '../types';
 import { Badge } from './Badge';
 
@@ -238,16 +239,14 @@ function HostRow({ host, selected, onClick }: { host: HostOut; selected: boolean
                         <Badge tone="red">EXPLOIT</Badge>
                       </span>
                     )}
-                    {v.source && (
-                      <span className={`shrink-0 rounded px-1 py-0 ${
-                        v.source === 'ai' ? 'bg-purple-900/30 text-purple-400' :
-                        v.source === 'exploit_db' ? 'bg-amber-900/30 text-amber-400' :
-                        v.source === 'nvd' ? 'bg-cyan-900/30 text-cyan-400' :
-                        'bg-gray-700 text-gray-400'
-                      }`}>
-                        {v.source === 'ai' ? 'AI' : v.source === 'exploit_db' ? 'DB' : v.source === 'nvd' ? 'NVD' : v.source}
+                    {parseSources(v.source).map((tok) => (
+                      <span
+                        key={tok}
+                        className={`shrink-0 rounded px-1 py-0 ${sourceBadgeClass(tok)}`}
+                      >
+                        {sourceLabel(tok)}
                       </span>
-                    )}
+                    ))}
                   </div>
                 ))}
               </div>

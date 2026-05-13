@@ -3,6 +3,7 @@ import { Clipboard, Check, Terminal, Filter, Hash, Bug, ChevronDown, ChevronUp, 
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
 import { getCvssColor } from '../utils/colors';
+import { parseSources, sourceLabel } from '../utils/format';
 import type { CollectResponse, VulnListItem } from '../types';
 import { Badge } from './Badge';
 
@@ -348,7 +349,9 @@ function VulnCollectRow({ vuln }: { vuln: VulnListItem }) {
             <p className="text-xs text-gray-500 mb-1.5">{vuln.description}</p>
           )}
           <div className="flex items-center gap-1 mb-1">
-            <span className="text-xs text-gray-600">{vuln.source}</span>
+            <span className="text-xs text-gray-600">
+              {parseSources(vuln.source).map(sourceLabel).join(' · ')}
+            </span>
             <span className="text-xs text-gray-700">·</span>
             <span className="text-xs text-gray-600">{vuln.confidence}</span>
           </div>
