@@ -94,7 +94,12 @@ class VulnOut(BaseModel):
     checked_status: str | None = None
     ai_fp_reason: str | None = None
     port: int | None = None
-    source: str | None = None  # exploit_db, nvd, ai
+    # ``+``-joined when multiple channels detected the same CVE
+    # (e.g. ``"exploit_db+nvd"`` when CAULDRON-010 and the NVD CPE
+    # pipeline both flag MS17-010). UI splits on ``+`` and renders one
+    # badge per token. Backwards-compatible: single-source strings
+    # ("nvd" / "exploit_db" / "ai") still produce exactly one badge.
+    source: str | None = None
     in_cisa_kev: bool = False  # listed in CISA Known Exploited Vulns catalog
     cisa_kev_added: str | None = None
     # EPSS 0.0-1.0: FIRST.org's prediction that this CVE will be exploited
@@ -1389,7 +1394,10 @@ def get_exploit_commands(ip: str, port: int, vuln_id: str):
     # Get tags from exploit_db if available
     tags: list[str] = []
     module = record.get("module")
-    if record.get("source") == "exploit_db":
+    # ``source`` is a ``+``-joined multi-source string ("exploit_db+nvd"
+    # when both channels detected the CVE), so check membership rather
+    # than exact equality.
+    if "exploit_db" in (record.get("source") or "").split("+"):
         from cauldron.exploits.matcher import ExploitDB
         db = ExploitDB()
         for rule in db._rules:
