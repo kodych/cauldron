@@ -1145,10 +1145,21 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
         extracted = _extract_version(service_version_override) if service_version_override else "*"
         version_hint = extracted if extracted and extracted != "*" else None
 
+    # ``parts[2]`` is the CPE 2.3 part-type slot (``a`` / ``o`` / ``h``).
+    # ``o`` flips two downstream behaviours: the strict-applicability
+    # filter inside ``_execute_nvd_query`` skips its version-slot check
+    # (NVD's OS records use the ``-`` NA marker with the SP and edition
+    # in update/edition slots, which the application rule wrongly treats
+    # as constrained), and the versionless recency cut in
+    # ``_cve_is_gold`` is suppressed (legacy OS families retain CVE
+    # applicability indefinitely).
+    is_os_cpe = len(parts) > 2 and parts[2] == "o"
+
     cves = _execute_nvd_query(
         url, f"CPE:{cpe23}",
         version_hint=version_hint,
         version_applies_product=applies_product,
+        os_cpe=is_os_cpe,
     )
 
     # None = 404 (CPE not in NVD) — signal caller to try keyword fallback
@@ -1171,12 +1182,9 @@ def _query_nvd_cpe(cpe23: str, service_version_override: str | None = None) -> l
     # requires an actionable public exploit (KEV overrides). Hard rejects
     # (local/DoS/admin-required) apply in both paths; the versionless path
     # also cuts CVEs published too long ago to plausibly affect "latest"
-    # — except when the CPE is OS-typed (Win 7, Server 2012, ESXi, …),
-    # where the product name itself encodes the major version and EoL'd
-    # releases retain CVE applicability indefinitely. ``parts[2]`` is the
-    # CPE 2.3 part type slot (``a`` for application, ``o`` for operating
-    # system, ``h`` for hardware) — ``o`` triggers the carve-out.
-    is_os_cpe = len(parts) > 2 and parts[2] == "o"
+    # — except when the CPE is OS-typed, where ``is_os_cpe`` (already
+    # computed above) suppresses the recency cut so EoL'd OS families
+    # retain CVE applicability indefinitely.
     cves = [c for c in cves if _is_pentester_relevant(c)]
     cves = [c for c in cves if _cve_is_gold(c, versionless=not has_version, os_cpe=is_os_cpe)]
 
@@ -1234,6 +1242,7 @@ def _execute_nvd_query(
     product_hint: str | None = None,
     version_hint: str | None = None,
     version_applies_product: str | None = None,
+    os_cpe: bool = False,
     _retries: int = 0,
 ) -> list[CVEInfo] | None:
     """Execute NVD API request and parse results.
@@ -1280,7 +1289,8 @@ def _execute_nvd_query(
             )
             time.sleep(backoff)
             return _execute_nvd_query(
-                url, context, product_hint, version_hint, version_applies_product, _retries + 1,
+                url, context, product_hint, version_hint, version_applies_product,
+                os_cpe, _retries + 1,
             )
         if e.code == 404:
             logger.info("NVD CPE not found (404) for %s — will try keyword fallback", context)
@@ -1301,7 +1311,8 @@ def _execute_nvd_query(
             )
             time.sleep(backoff)
             return _execute_nvd_query(
-                url, context, product_hint, version_hint, version_applies_product, _retries + 1,
+                url, context, product_hint, version_hint, version_applies_product,
+                os_cpe, _retries + 1,
             )
         logger.error("NVD API request failed for %s after 3 retries: %s", context, e)
         raise NvdTransientError(f"NVD unreachable for {context}: {e}") from e
@@ -1329,7 +1340,9 @@ def _execute_nvd_query(
         # service version. Without this check, NVD's wildcard virtualMatchString
         # happily returns CVEs pinned to ancient versions (e.g. CVE-1999-0067
         # tagged at apache:http_server:1.0.3 attaching to modern Apache 2.4).
-        if applies_product and not _cve_applies_to(cve_data, applies_product, version_hint):
+        if applies_product and not _cve_applies_to(
+            cve_data, applies_product, version_hint, os_cpe=os_cpe,
+        ):
             continue
 
         cve = _parse_cve(cve_data)
@@ -1445,7 +1458,12 @@ def _cpe_entry_version_in_range(match: dict, version_str: str) -> bool:
     return ours.major == pinned.major and ours.minor == pinned.minor
 
 
-def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> bool:
+def _cve_applies_to(
+    cve_data: dict,
+    product_lower: str,
+    version: str | None,
+    os_cpe: bool = False,
+) -> bool:
     """Validate that a CVE's CPE configuration actually covers our service.
 
     The NVD ``virtualMatchString`` endpoint is generous: it returns every CVE
@@ -1457,11 +1475,28 @@ def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> 
 
     Logic:
     - No cpeMatch entries for this product → fall back to loose check.
-    - Versionless service → require at least one unconstrained CPE entry
-      for this product. Any CPE pinned to a specific version or bounded
-      range drops the CVE because we cannot confirm applicability.
+    - OS-typed CPE in versionless mode → keep on product match. See ``os_cpe``.
+    - Versionless application service → require at least one unconstrained
+      CPE entry for this product. Any CPE pinned to a specific version or
+      bounded range drops the CVE because we cannot confirm applicability.
     - Versioned service → require at least one CPE entry whose range (or
       pinned specific version at major.minor) covers the service version.
+
+    Args:
+        os_cpe: True when the upstream query was against an OS-typed CPE
+            (``cpe:2.3:o:microsoft:windows_7:*:…``). NVD's older OS CVE
+            records (most of the 2017-and-earlier Windows backlog,
+            including CVE-2017-0144 EternalBlue) use the ``-`` "NA"
+            marker in the version slot with the SP/edition encoded in
+            the ``update`` and ``edition`` slots — e.g.
+            ``cpe:2.3:o:microsoft:windows_7:-:sp1:*:*:*:*:x64:*``. The
+            generic application-CPE rule treats ``-`` as constrained and
+            drops these, taking MS17-010 and most of the Win 7 / 2008 /
+            XP backlog with it. For OS-typed queries the product name
+            itself carries the OS identity and the version slot's value
+            (``-``, ``*``, build number, …) isn't a meaningful
+            applicability filter — skip the version check entirely and
+            rely on the product-name match from ``_iter_matching_cpe_entries``.
     """
     configurations = cve_data.get("configurations", [])
     if not configurations:
@@ -1473,6 +1508,10 @@ def _cve_applies_to(cve_data: dict, product_lower: str, version: str | None) -> 
 
     versionless = not version or _extract_version(version) == "*"
     if versionless:
+        if os_cpe:
+            # See ``os_cpe`` arg docstring — product match is the whole
+            # applicability check for OS CPEs.
+            return True
         # Without a service version we cannot prove a range-bound CVE
         # applies. The old rule kept CVEs whose CPE config had ANY
         # range (versionStart/End*), assuming "range = legitimate

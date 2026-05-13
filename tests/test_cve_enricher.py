@@ -1284,6 +1284,60 @@ class TestCVEAppliesTo:
         """CVEs without CPE configurations aren't filtered here."""
         assert _cve_applies_to(self.NO_CONFIG_CVE, "http_server", None) is True
 
+    # --- OS-typed CPE carve-out ---
+    #
+    # NVD's older OS records (the 2017-and-earlier Windows backlog,
+    # including CVE-2017-0144 EternalBlue) put the SP / edition in the
+    # update / edition slots and leave the version slot as ``-`` ("NA"
+    # baseline marker, not a missing entry). The generic
+    # application-CPE rule reads parts[5]="-" as constrained, so without
+    # the OS-CPE carve-out MS17-010 silently disappears from results
+    # for the very Win 7 SP1 hosts where it's most relevant.
+
+    # CVE-2017-0144 / MS17-010 — every cpeMatch carries ``-`` in the
+    # version slot with the actual SP in the update slot. Reproduces
+    # the exact shape NVD ships for EternalBlue.
+    ETERNALBLUE_CVE = {
+        "configurations": [{
+            "nodes": [{
+                "cpeMatch": [
+                    {"criteria": "cpe:2.3:o:microsoft:windows_7:-:sp1:*:*:*:*:x64:*"},
+                    {"criteria": "cpe:2.3:o:microsoft:windows_7:-:sp1:*:*:*:*:x86:*"},
+                ],
+            }],
+        }],
+    }
+
+    def test_versionless_os_cpe_keeps_dash_version_slot(self):
+        """``os_cpe=True`` skips the version-slot check entirely. The
+        product name (``windows_7``) carries the OS identity; the ``-``
+        in NVD's version slot is the RTM baseline marker, not a missing
+        entry. Without this carve-out CVE-2017-0144 silently drops on
+        every Win 7 scan."""
+        assert _cve_applies_to(
+            self.ETERNALBLUE_CVE, "windows_7", None, os_cpe=True,
+        ) is True
+
+    def test_versionless_application_still_drops_dash_version_slot(self):
+        """The carve-out is OS-only — application-typed queries still
+        treat ``-`` in the version slot as constrained, so the existing
+        protection against ancient ``apache:http_server:-`` style
+        entries is unaffected."""
+        ancient_app = {
+            "configurations": [{
+                "nodes": [{
+                    "cpeMatch": [
+                        {"criteria": "cpe:2.3:a:apache:http_server:-:*:*:*:*:*:*:*"},
+                    ],
+                }],
+            }],
+        }
+        assert _cve_applies_to(ancient_app, "http_server", None) is False
+        # Default ``os_cpe=False`` matches the explicit form.
+        assert _cve_applies_to(
+            ancient_app, "http_server", None, os_cpe=False,
+        ) is False
+
     # --- Versioned service ---
 
     def test_versioned_in_range_keeps(self):
