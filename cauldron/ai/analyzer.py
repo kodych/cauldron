@@ -493,6 +493,7 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
                 v.description = $description,
                 v.has_exploit = $has_exploit,
                 v.exploit_url = $exploit_url,
+                v.exploit_sources = $exploit_sources,
                 v.in_cisa_kev = $in_cisa_kev,
                 v.cisa_kev_added = $cisa_kev_added,
                 v.source = 'ai'
@@ -502,6 +503,12 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
                 v.cvss_vector = coalesce(v.cvss_vector, $vector),
                 v.cisa_kev_added = coalesce(v.cisa_kev_added, $cisa_kev_added),
                 v.exploit_url = coalesce(v.exploit_url, $exploit_url),
+                v.exploit_sources = CASE
+                    WHEN $exploit_sources IS NULL OR $exploit_sources = '' THEN v.exploit_sources
+                    WHEN v.exploit_sources IS NULL OR v.exploit_sources = '' THEN $exploit_sources
+                    WHEN v.exploit_sources = $exploit_sources THEN v.exploit_sources
+                    ELSE v.exploit_sources + '+' + $exploit_sources
+                END,
                 v.source = CASE
                     WHEN v.source IS NULL THEN 'ai'
                     WHEN v.source = 'ai' THEN 'ai'
@@ -516,6 +523,7 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
             description=cve.description,
             has_exploit=cve.has_exploit,
             exploit_url=cve.exploit_url,
+            exploit_sources=getattr(cve, "exploit_sources", "") or "",
             in_cisa_kev=cve.in_cisa_kev,
             cisa_kev_added=cve.cisa_kev_added,
         )

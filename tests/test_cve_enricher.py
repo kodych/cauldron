@@ -179,6 +179,103 @@ class TestParseCVE:
         assert cve.severity == "CRITICAL"
         assert cve.has_exploit is False
 
+    def test_parse_cve_exploit_sources_nvd_only(self):
+        """When the NVD-reference scan finds an Exploit-tagged ref,
+        ``exploit_sources`` is ``"nvd"``."""
+        cve_data = SAMPLE_CVE_RESPONSE["vulnerabilities"][0]["cve"]
+        cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.has_exploit is True
+        # ExploitIndex may or may not have CVE-2021-41773 cached in dev
+        # environments; the only invariant we can pin is that ``nvd`` is
+        # present (the NVD-reference scan above set has_exploit).
+        assert "nvd" in cve.exploit_sources
+
+    def test_parse_cve_augmented_by_exploit_index(self):
+        """NVD-reference scan finds zero Exploit-tagged refs, but the
+        ``ExploitIndex`` has a Metasploit module for the CVE — augmentation
+        flips ``has_exploit`` to True and records ``exploit_sources`` as
+        ``"metasploit"``. Regression for the CVE-2007-2447 Samba usermap
+        case where NVD tagged nothing as Exploit yet the canonical
+        ``exploit/multi/samba/usermap_script`` module exists."""
+        from unittest.mock import patch
+        from cauldron.exploits.exploit_index import ExploitRef
+
+        cve_data = {
+            "id": "CVE-2007-2447",
+            "descriptions": [{"lang": "en", "value": "Samba username map RCE"}],
+            "metrics": {
+                "cvssMetricV2": [{
+                    "cvssData": {"baseScore": 6.0, "vectorString": "AV:N/AC:M/Au:S/C:P/I:P/A:P"},
+                    "baseSeverity": "MEDIUM",
+                }]
+            },
+            "references": [
+                {"url": "http://example.com/advisory", "tags": ["Vendor Advisory"]},
+            ],
+        }
+        # ExploitIndex has the Metasploit module — augmentation should
+        # promote has_exploit from False to True.
+        mock_ref = ExploitRef(
+            source="metasploit",
+            ref_id="exploit/multi/samba/usermap_script",
+            url="https://www.rapid7.com/db/modules/exploit/multi/samba/usermap_script",
+            title="Samba usermap script RCE",
+        )
+        with patch("cauldron.exploits.exploit_index.EXPLOIT_INDEX.references",
+                   return_value=[mock_ref]):
+            cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.has_exploit is True  # promoted by augmentation
+        assert cve.exploit_sources == "metasploit"
+        assert cve.exploit_url == mock_ref.url  # surfaced for UI deep-link
+
+    def test_parse_cve_augmentation_never_demotes(self):
+        """NVD already found an Exploit-tagged ref → ``has_exploit=True``.
+        ExploitIndex must not flip it back to False even if the index
+        has no entry for this CVE (augmentation is one-directional)."""
+        from unittest.mock import patch
+        cve_data = SAMPLE_CVE_RESPONSE["vulnerabilities"][0]["cve"]
+        with patch("cauldron.exploits.exploit_index.EXPLOIT_INDEX.references",
+                   return_value=[]):
+            cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.has_exploit is True
+        assert "nvd" in cve.exploit_sources
+
+    def test_parse_cve_multi_source_combines(self):
+        """NVD Exploit-ref + ExploitDB + Metasploit all present →
+        ``exploit_sources`` records all three in canonical order."""
+        from unittest.mock import patch
+        from cauldron.exploits.exploit_index import ExploitRef
+
+        cve_data = SAMPLE_CVE_RESPONSE["vulnerabilities"][0]["cve"]  # has nvd tag
+        with patch("cauldron.exploits.exploit_index.EXPLOIT_INDEX.references",
+                   return_value=[
+                       ExploitRef("exploitdb", "EDB-50406",
+                                  "https://www.exploit-db.com/exploits/50406", "Apache"),
+                       ExploitRef("metasploit", "exploit/multi/http/apache_path",
+                                  "https://r/m", "Apache path traversal"),
+                   ]):
+            cve = _parse_cve(cve_data)
+        assert cve is not None
+        # Canonical order: nvd → exploitdb → metasploit
+        assert cve.exploit_sources == "nvd+exploitdb+metasploit"
+
+    def test_parse_cve_index_failure_does_not_crash(self):
+        """If ``ExploitIndex.references`` raises (corrupt cache, import
+        failure, anything) ``_parse_cve`` falls back to the NVD-only
+        signal and never propagates the error — augmentation is best-effort,
+        never fatal."""
+        from unittest.mock import patch
+        cve_data = SAMPLE_CVE_RESPONSE["vulnerabilities"][0]["cve"]
+        with patch("cauldron.exploits.exploit_index.EXPLOIT_INDEX.references",
+                   side_effect=RuntimeError("cache corrupt")):
+            cve = _parse_cve(cve_data)
+        assert cve is not None
+        assert cve.has_exploit is True  # NVD tag survives
+        assert cve.exploit_sources == "nvd"
+
     def test_parse_cve_v2_fallback(self):
         cve_data = {
             "id": "CVE-2016-10009",

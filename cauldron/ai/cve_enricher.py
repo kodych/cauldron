@@ -183,6 +183,14 @@ class CVEInfo:
     description: str = ""
     has_exploit: bool = False
     exploit_url: str | None = None
+    # ``+``-joined set of channels that confirmed a public exploit exists
+    # for this CVE: ``"nvd"`` (NVD-tagged ``Exploit`` reference or known
+    # PoC-host URL pattern), ``"exploitdb"`` (entry in the ExploitDB
+    # canonical index), ``"metasploit"`` (Metasploit-Framework module).
+    # An empty string when ``has_exploit`` is False — UI uses this to
+    # render per-source chips (``EXPLOIT [NVD][MSF]``) and the operator
+    # can tell at a glance which channels validated the finding.
+    exploit_sources: str = ""
     epss: float | None = None
     cwe_ids: list[str] = field(default_factory=list)
     published: str | None = None  # ISO date string from NVD
@@ -1758,6 +1766,50 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
             exploit_url = ref_url
             break
 
+    # Cross-reference ExploitDB + Metasploit. NVD's ``Exploit``-tagged
+    # reference signal is incomplete on classic CVEs — the analyst
+    # process tagging is patchy for the 2002-2012 era, where Metasploit
+    # modules and exploit-db entries pre-date the NVD-side tagging
+    # discipline. CVE-2007-2447 (Samba usermap RCE) is the canary: every
+    # searchsploit hit on ``samba 3.0.20`` returns a Metasploit-included
+    # exploit, yet NVD tags zero of its references ``Exploit`` — so the
+    # block above leaves ``has_exploit=False`` and the gold filter
+    # silently drops the finding. ``EXPLOIT_INDEX`` consults the
+    # authoritative ExploitDB CSV + Metasploit modules JSON (both
+    # disk-cached, weekly refresh) to fill that gap.
+    #
+    # Augmentation contract — never demote:
+    #   - NVD True → stays True; the index can add more sources but
+    #     can't flip ``has_exploit`` to False.
+    #   - NVD False → becomes True iff the index has at least one
+    #     reference for this CVE id. The gold filter is unchanged;
+    #     only its ``has_exploit`` input becomes more accurate.
+    #   - The index lookup is a pure dict read (zero network calls per
+    #     CVE) — the ``boil --nvd`` orchestrator refreshes the index
+    #     once per pass via ``EXPLOIT_INDEX.refresh()`` before the
+    #     enrichment loop begins.
+    sources: set[str] = set()
+    if has_exploit:
+        sources.add("nvd")
+    try:
+        from cauldron.exploits.exploit_index import EXPLOIT_INDEX
+        index_refs = EXPLOIT_INDEX.references(cve_id)
+    except Exception:  # noqa: BLE001 — index is augmentation-only; never fatal
+        index_refs = []
+    if index_refs:
+        for r in index_refs:
+            sources.add(r.source)
+        if not has_exploit:
+            has_exploit = True
+            # First index ref's URL becomes the surfaced exploit_url so
+            # the UI can deep-link to e.g. https://www.exploit-db.com/exploits/16320
+            # even when NVD itself didn't carry an Exploit-tagged ref.
+            exploit_url = index_refs[0].url
+
+    # Stable joined order: ``nvd`` first, then ``exploitdb``, then ``metasploit``.
+    # Single source of truth for downstream filtering / display.
+    exploit_sources = "+".join(s for s in ("nvd", "exploitdb", "metasploit") if s in sources)
+
     # Extract CWE IDs
     cwe_ids: list[str] = []
     for weakness in cve_data.get("weaknesses", []):
@@ -1784,6 +1836,7 @@ def _parse_cve(cve_data: dict) -> CVEInfo | None:
         description=_truncate_at_word(description, 1000),
         has_exploit=has_exploit,
         exploit_url=exploit_url,
+        exploit_sources=exploit_sources,
         cwe_ids=cwe_ids,
         published=published,
         in_cisa_kev=in_cisa_kev,
@@ -2372,6 +2425,7 @@ _VULN_MERGE_CLAUSE = """
         v.description = $description,
         v.has_exploit = $has_exploit,
         v.exploit_url = $exploit_url,
+        v.exploit_sources = $exploit_sources,
         v.epss = $epss,
         v.in_cisa_kev = $in_cisa_kev,
         v.cisa_kev_added = $cisa_kev_added,
@@ -2382,6 +2436,12 @@ _VULN_MERGE_CLAUSE = """
         v.severity = COALESCE($severity, v.severity),
         v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
         v.exploit_url = COALESCE($exploit_url, v.exploit_url),
+        v.exploit_sources = CASE
+            WHEN $exploit_sources IS NULL OR $exploit_sources = '' THEN v.exploit_sources
+            WHEN v.exploit_sources IS NULL OR v.exploit_sources = '' THEN $exploit_sources
+            WHEN v.exploit_sources = $exploit_sources THEN v.exploit_sources
+            ELSE v.exploit_sources + '+' + $exploit_sources
+        END,
         v.epss = COALESCE($epss, v.epss),
         v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
         v.cisa_kev_added = COALESCE($cisa_kev_added, v.cisa_kev_added),
@@ -2421,6 +2481,7 @@ def _upsert_host_vulnerability(session, host_ip: str, cve: CVEInfo) -> None:
         "description": cve.description,
         "has_exploit": cve.has_exploit,
         "exploit_url": cve.exploit_url,
+        "exploit_sources": cve.exploit_sources or "",
         "epss": cve.epss,
         "in_cisa_kev": cve.in_cisa_kev,
         "cisa_kev_added": cve.cisa_kev_added,
@@ -2489,6 +2550,7 @@ def _upsert_vulnerability(
         "description": cve.description,
         "has_exploit": cve.has_exploit,
         "exploit_url": cve.exploit_url,
+        "exploit_sources": cve.exploit_sources or "",
         "epss": cve.epss,
         "in_cisa_kev": cve.in_cisa_kev,
         "cisa_kev_added": cve.cisa_kev_added,
