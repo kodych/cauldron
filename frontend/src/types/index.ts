@@ -41,6 +41,12 @@ export interface VulnOut {
   ai_fp_reason: string | null;
   port: number | null;
   source: string | null; // exploit_db, nvd, ai
+  // ``+``-joined set of channels that confirmed a public exploit exists
+  // for this CVE (``nvd``, ``exploitdb``, ``metasploit``). Empty string
+  // when ``has_exploit`` is False. UI splits on ``+`` and renders
+  // per-source chips so the operator can tell at a glance which
+  // public exploit catalogue confirms the finding.
+  exploit_sources: string | null;
   // EPSS 0.0-1.0 — FIRST.org's probability this CVE gets exploited in
   // the next 30 days. Null for CAULDRON-* synthetic ids.
   epss: number | null;

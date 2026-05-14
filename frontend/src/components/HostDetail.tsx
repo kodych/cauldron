@@ -567,8 +567,39 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
           </span>
         )}
         {vuln.has_exploit && !vuln.in_cisa_kev && (
-          <span className="shrink-0">
+          <span className="shrink-0 inline-flex items-center gap-0.5">
             <Badge tone="red">EXPLOIT</Badge>
+            {/* Per-source provenance chips — split ``v.exploit_sources``
+                on ``+`` and render one mini-chip per channel that
+                confirmed a public PoC. Renders only when there's at
+                least one source (the field can be empty even with
+                ``has_exploit=True`` on legacy graphs created before the
+                ExploitDB augmentation landed). Each chip is a
+                ``[NVD]`` / ``[EDB]`` / ``[MSF]`` label so the operator
+                can see at a glance whether the finding rests on NVD's
+                analyst-tagging alone, on the ExploitDB-canonical
+                public-PoC catalogue, or on a real Metasploit module
+                — the latter two are stronger signals for engagement
+                planning. */}
+            {(vuln.exploit_sources ?? '').split('+').filter(Boolean).map((src) => {
+              const label =
+                src === 'nvd' ? 'NVD' :
+                src === 'exploitdb' ? 'EDB' :
+                src === 'metasploit' ? 'MSF' : src.toUpperCase();
+              const title =
+                src === 'nvd' ? 'NVD tagged a reference as Exploit' :
+                src === 'exploitdb' ? 'CVE present in the ExploitDB canonical public-PoC index (searchsploit / exploit-db.com)' :
+                src === 'metasploit' ? 'CVE has a Metasploit Framework module' : src;
+              return (
+                <span
+                  key={src}
+                  className="shrink-0 rounded px-1 py-0 text-[10px] tracking-wide bg-red-900/30 text-red-300 cursor-help"
+                  title={title}
+                >
+                  {label}
+                </span>
+              );
+            })}
           </span>
         )}
         {vuln.epss != null && vuln.epss >= 0.1 && (

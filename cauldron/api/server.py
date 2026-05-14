@@ -92,6 +92,10 @@ class VulnOut(BaseModel):
     cvss: float = 0.0
     has_exploit: bool = False
     exploit_url: str | None = None
+    # ``+``-joined set of channels confirming public-exploit availability
+    # (``nvd``, ``exploitdb``, ``metasploit``). Empty string when
+    # ``has_exploit`` is False. UI renders one chip per token.
+    exploit_sources: str | None = None
     exploit_module: str | None = None
     confidence: str = "check"
     description: str | None = None
@@ -324,6 +328,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         cvss=v.get("cvss") or 0.0,
         has_exploit=bool(v.get("has_exploit")),
         exploit_url=v.get("exploit_url"),
+        exploit_sources=v.get("exploit_sources"),
         exploit_module=v.get("exploit_module"),
         confidence=v.get("confidence") or "check",
         description=v.get("description"),
@@ -523,6 +528,7 @@ def list_hosts(
                    collect(DISTINCT {{
                        cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                        exploit_url: v.exploit_url, exploit_module: v.exploit_module,
+                       exploit_sources: coalesce(v.exploit_sources, ''),
                        confidence: coalesce(r.confidence, 'check'), description: v.description,
                        enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                        port: s.port, source: v.source, epss: v.epss,
@@ -613,6 +619,7 @@ def get_host(ip: str):
                  collect(DISTINCT {
                      cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
                      exploit_url: v.exploit_url, exploit_module: v.exploit_module,
+                     exploit_sources: coalesce(v.exploit_sources, ''),
                      confidence: coalesce(r.confidence, 'check'), description: v.description,
                      enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
                      port: s.port, source: v.source, epss: v.epss,
@@ -630,6 +637,7 @@ def get_host(ip: str):
                  collect(DISTINCT {
                      cve_id: hv.cve_id, cvss: hv.cvss, has_exploit: hv.has_exploit,
                      exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
+                     exploit_sources: coalesce(hv.exploit_sources, ''),
                      confidence: coalesce(hr.confidence, 'check'), description: hv.description,
                      enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason,
                      port: null, source: hv.source, epss: hv.epss,
