@@ -170,14 +170,22 @@ class TestParseCVE:
         assert "exploit-db.com" in cve.exploit_url
 
     def test_parse_cve_without_exploit(self):
+        """NVD refs carry no Exploit tag AND ExploitIndex has no entry
+        → ``has_exploit`` stays False. Mocking the index to empty so
+        the test stays deterministic on systems where the local cache
+        already covers CVE-2021-42013 from a previous refresh."""
+        from unittest.mock import patch
         cve_data = SAMPLE_CVE_RESPONSE["vulnerabilities"][1]["cve"]
-        cve = _parse_cve(cve_data)
+        with patch("cauldron.exploits.exploit_index.EXPLOIT_INDEX.references",
+                   return_value=[]):
+            cve = _parse_cve(cve_data)
 
         assert cve is not None
         assert cve.cve_id == "CVE-2021-42013"
         assert cve.cvss == 9.8
         assert cve.severity == "CRITICAL"
         assert cve.has_exploit is False
+        assert cve.exploit_sources == ""
 
     def test_parse_cve_exploit_sources_nvd_only(self):
         """When the NVD-reference scan finds an Exploit-tagged ref,

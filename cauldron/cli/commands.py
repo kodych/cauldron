@@ -15,6 +15,7 @@ Themed after brewing potions:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -244,6 +245,90 @@ def reset():
     console.print("[bold red]Cauldron emptied.[/bold red] All data has been deleted.")
 
 
+@cli.command(name="refresh-exploits")
+@click.option("--status", is_flag=True, default=False,
+              help="Show coverage stats without refreshing")
+@click.option("--force", is_flag=True, default=False,
+              help="Refresh even when the cache is fresh (<7 days)")
+def refresh_exploits(status: bool, force: bool):
+    """Refresh the public-exploit-availability index.
+
+    Downloads ExploitDB's ``files_exploits.csv`` and the Metasploit
+    Framework's ``modules_metadata_base.json``, parses both, merges
+    into a CVE → references map, and persists at
+    ``~/.cauldron/exploit_index.json``. The NVD enricher consults this
+    index inside ``_parse_cve`` to upgrade ``has_exploit`` from False
+    to True when the canonical exploit databases have a PoC the NVD
+    analyst process didn't tag — the famous example being
+    CVE-2007-2447 (Samba usermap RCE: Metasploit-included, every
+    searchsploit hit, but zero NVD references tagged ``Exploit``).
+
+    ``boil --nvd`` already calls this automatically when the index is
+    stale (cache older than seven days). The standalone command is for
+    when the operator wants a fresh pull immediately — e.g. a new
+    Metasploit module just landed for a CVE seen on the current
+    engagement and they don't want to wait for the weekly TTL.
+    """
+    from cauldron.exploits.exploit_index import EXPLOIT_INDEX
+
+    if status:
+        stats = EXPLOIT_INDEX.coverage_stats
+        fetched_at = stats.get("fetched_at", 0)
+        if fetched_at:
+            age_days = (time.time() - fetched_at) / 86400
+            age_str = f"{age_days:.1f} days ago"
+        else:
+            age_str = "never (no cache)"
+        console.print("[bold cyan]Exploit index status[/bold cyan]")
+        console.print(f"  ExploitDB refs:  [bold]{stats.get('exploitdb', 0)}[/bold]")
+        console.print(f"  Metasploit refs: [bold]{stats.get('metasploit', 0)}[/bold]")
+        console.print(f"  Unique CVEs:     [bold]{stats.get('combined', 0)}[/bold]")
+        console.print(f"  Last refreshed:  {age_str}")
+        is_stale = EXPLOIT_INDEX.is_stale()
+        if is_stale:
+            console.print("  [yellow]Stale — next boil --nvd will refresh automatically[/yellow]")
+        else:
+            console.print("  [green]Fresh — within 7-day TTL[/green]")
+        return
+
+    if not EXPLOIT_INDEX.is_stale() and not force:
+        stats = EXPLOIT_INDEX.coverage_stats
+        age_days = (time.time() - stats.get("fetched_at", 0)) / 86400
+        console.print(
+            f"[dim]Cache is fresh ({age_days:.1f} days old, "
+            f"{stats.get('combined', 0)} CVEs covered). "
+            f"Use --force to refresh anyway.[/dim]"
+        )
+        return
+
+    with console.status("[bold green]Fetching ExploitDB CSV + Metasploit JSON..."):
+        refresh_stats = EXPLOIT_INDEX.refresh(force=force)
+
+    if refresh_stats.get("refreshed"):
+        console.print(
+            f"[green]+[/green] Refreshed: "
+            f"{refresh_stats.get('exploitdb', 0)} ExploitDB refs + "
+            f"{refresh_stats.get('metasploit', 0)} MSF refs "
+            f"across [bold]{refresh_stats.get('combined', 0)}[/bold] unique CVEs"
+        )
+        if refresh_stats.get("edb_error"):
+            console.print(
+                f"  [yellow]ExploitDB partial failure: {refresh_stats['edb_error']}[/yellow]"
+            )
+        if refresh_stats.get("msf_error"):
+            console.print(
+                f"  [yellow]Metasploit partial failure: {refresh_stats['msf_error']}[/yellow]"
+            )
+    else:
+        reason = refresh_stats.get("reason", "unknown")
+        console.print(f"[bold red]x Refresh failed:[/bold red] {reason}")
+        if refresh_stats.get("edb_error"):
+            console.print(f"  ExploitDB: {refresh_stats['edb_error']}")
+        if refresh_stats.get("msf_error"):
+            console.print(f"  Metasploit: {refresh_stats['msf_error']}")
+        raise SystemExit(1)
+
+
 @cli.command()
 @click.option("--nvd", is_flag=True, default=False, help="Enable NVD CVE enrichment (network API, may take minutes)")
 @click.option("--ai", is_flag=True, default=False, help="Enable AI analysis (requires CAULDRON_ANTHROPIC_API_KEY)")
@@ -334,6 +419,41 @@ def boil(nvd: bool, ai: bool, run_all: bool):
             enrich_host_os_from_graph,
             enrich_services_from_graph,
         )
+        from cauldron.exploits.exploit_index import EXPLOIT_INDEX
+
+        # Refresh the exploit-availability index BEFORE the CVE-parse
+        # loop so ``_parse_cve``'s augmentation hook sees fresh data on
+        # this pass. Idempotent: ``refresh()`` is a noop when the cache
+        # is fresh (<7 days), so re-running boil daily doesn't spam the
+        # raw URLs. First-time install pays a ~5-10 s download once.
+        idx_stats_before = EXPLOIT_INDEX.coverage_stats
+        if EXPLOIT_INDEX.is_stale():
+            with console.status("[bold green]Refreshing exploit index (ExploitDB + Metasploit)..."):
+                refresh_stats = EXPLOIT_INDEX.refresh()
+            if refresh_stats.get("refreshed"):
+                console.print(
+                    f"  [green]+[/green] Exploit index refreshed: "
+                    f"{refresh_stats.get('exploitdb', 0)} ExploitDB refs + "
+                    f"{refresh_stats.get('metasploit', 0)} MSF refs "
+                    f"across {refresh_stats.get('combined', 0)} unique CVEs"
+                )
+            elif refresh_stats.get("reason") == "both fetches failed":
+                console.print(
+                    "  [yellow]! Exploit index refresh failed (both ExploitDB and Metasploit "
+                    "unreachable) — proceeding with stale cache.[/yellow]"
+                )
+                if idx_stats_before.get("combined", 0) == 0:
+                    console.print(
+                        "  [yellow]  Note: no stale cache available; ExploitDB augmentation "
+                        "will be inactive on this pass.[/yellow]"
+                    )
+        else:
+            stats = idx_stats_before
+            age_days = max(0, int((time.time() - stats.get("fetched_at", 0)) / 86400))
+            console.print(
+                f"  [dim]Exploit index: {stats.get('combined', 0)} CVEs covered "
+                f"(refreshed {age_days}d ago)[/dim]"
+            )
 
         with console.status("[bold green]Enriching services with CVE data (this may take a while)..."):
             cve_stats = enrich_services_from_graph()
