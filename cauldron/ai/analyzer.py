@@ -358,13 +358,14 @@ def _ai_cpes_for_batch(batch: list[tuple[str, list[dict]]]) -> list[dict]:
 Each line is labelled "#N" where N is the service index. Respond with CPE 2.3 format:
   cpe:2.3:a:<vendor>:<product>:<version>:*:*:*:*:*:*:*
 
-Use part type "a" for applications and "o" for operating systems. Use the NVD-registered vendor/product names — e.g. apache:http_server, openbsd:openssh, postgresql:postgresql, microsoft:exchange_server, f5:nginx (NVD uses "f5" for nginx post-acquisition), vmware:esxi, mikrotik:routeros.
+Use part type "a" for applications and "o" for operating systems. Use the NVD-registered vendor/product names — e.g. apache:http_server, openbsd:openssh, postgresql:postgresql, microsoft:exchange_server, f5:nginx (NVD uses "f5" for nginx post-acquisition), vmware:esxi, mikrotik:routeros, samba:samba, isc:bind, distcc:distcc, gnu:bash, openssl:openssl, proftpd:proftpd, vsftpd_project:vsftpd, dovecot:dovecot.
 
 Rules:
 - One service may expose multiple products (e.g. nginx fronting tomcat). Return each as a separate CPE in the cpes list.
 - If version cannot be determined, use "*".
 - If you CANNOT confidently identify the product, return an empty cpes list. DO NOT GUESS. Empty is better than wrong — a wrong CPE pins CVEs for a different product onto this service.
 - Skip entries where the service is clearly generic Microsoft RPC / netbios-ssn / similar protocol-level listeners with no specific vendor product.
+- DAEMON vs DISPATCHED-TOOL: when a network daemon delegates work to a local utility (distccd → invokes local gcc, build farms → invoke compilers, CI runners → invoke language interpreters), the CPE identifies the DAEMON, not the dispatched tool. distccd on TCP/3632 is ``cpe:2.3:a:distcc:distcc:<version>`` — even though the banner mentions GCC, the listening attack surface is distcc itself, and the CVE history (CVE-2004-2687 distccd RCE) is on the distcc product page, not the GCC one.
 
 === SERVICES ===
 {chr(10).join(host_blocks)}
