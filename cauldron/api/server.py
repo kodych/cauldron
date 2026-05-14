@@ -76,6 +76,11 @@ class ServiceOut(BaseModel):
     name: str | None = None
     product: str | None = None
     version: str | None = None
+    # True when product/version were filled by AI Phase 1's banner /
+    # servicefp distillation rather than nmap's signature library
+    # match — UI surfaces a small "AI-inferred" chip so the operator
+    # knows the identity is heuristic and may warrant manual verification.
+    ai_inferred: bool = False
     bruteforceable: bool = False
     notes: str | None = None
     is_new: bool = False
@@ -399,6 +404,7 @@ def _parse_service_record(s: dict, host_first_seen: str | None = None,
         name=s.get("name"),
         product=s.get("product"),
         version=s.get("version"),
+        ai_inferred=bool(s.get("ai_inferred")),
         bruteforceable=bool(s.get("bruteforceable") or s.get("bruteforceable_manual")),
         notes=s.get("notes"),
         is_new=is_new,
@@ -600,6 +606,7 @@ def get_host(ip: str):
                  collect(DISTINCT {
                      port: s.port, protocol: s.protocol, state: s.state,
                      name: s.name, product: s.product, version: s.version,
+                     ai_inferred: coalesce(s.ai_inferred, false),
                      bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual, notes: s.notes,
                      first_seen: s.first_seen, last_seen: s.last_seen
                  }) AS services,
@@ -1215,7 +1222,20 @@ def _run_analysis_pipeline(
         def _host_cb(current: int, total: int, message: str):
             _bump("nvd", message, current, total)
 
-        enrich_host_os_from_graph(progress_callback=_host_cb)
+        host_cve_stats = enrich_host_os_from_graph(progress_callback=_host_cb)
+        # ``hosts_checked == 0`` means no host in the graph has ``os_cpe`` set
+        # (parser couldn't extract one — usually because the scan was run
+        # without ``-O`` / ``--script smb-os-discovery``). Surface as a
+        # warning bump so the UI's progress panel can show "Host-OS phase
+        # skipped — rescan with nmap -O for kernel/OS CVEs" rather than
+        # appearing to complete silently.
+        if host_cve_stats.get("hosts_checked", 0) == 0:
+            _bump(
+                "nvd",
+                "Host-OS phase skipped — 0 hosts have OS CPE "
+                "(rescan with nmap -O or --script smb-os-discovery for "
+                "kernel/OS CVE coverage)",
+            )
 
         # Piggy-back on the --nvd flag: once we have CVEs on the graph,
         # fetch EPSS scores for them. Cheap batch API call, 24h-cached,

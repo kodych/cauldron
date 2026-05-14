@@ -376,6 +376,23 @@ def boil(nvd: bool, ai: bool, run_all: bool):
                 console.print(
                     f"  [yellow]  ! {host_cve_stats['errors']} host-OS errors[/yellow]"
                 )
+        else:
+            # ``hosts_checked == 0`` means the Cypher selector returned no
+            # rows: zero hosts in the graph have ``h.os_cpe`` populated.
+            # Almost always a scan-input problem — nmap was run without
+            # ``-O`` (OS fingerprinting) and without ``--script smb-os-discovery``,
+            # so neither the parser's ``<osclass><cpe>`` path nor the SMB
+            # protocol-level override could write the OS CPE. Without the
+            # warning the operator sees Phase 3 finish cleanly and assumes
+            # they got the full pipeline — but the entire kernel-privesc /
+            # OS-level RCE class (MS17-010 / BlueKeep / SambaCry / Linux
+            # kernel) silently never ran.
+            console.print(
+                "  [yellow]  ! Host-OS phase skipped — 0 hosts have an OS CPE."
+                " Re-scan with [bold]nmap -O[/bold] (or [bold]-A[/bold] for full"
+                " scripts incl. smb-os-discovery) to enable host-level CVE"
+                " enrichment (kernel privesc, OS RCEs).[/yellow]"
+            )
 
         with console.status("[bold green]Fetching EPSS exploit-prediction scores..."):
             epss_stats = enrich_epss_from_graph()

@@ -926,6 +926,20 @@ function ServicesList({ services, vulns, hostIp, onUpdated }: {
                     </span>
                   )}
                 </span>
+                {/* AI-inferred chip — product / version came from AI
+                    Phase 1's banner / servicefp distillation rather
+                    than nmap's signature library match. Distinct chip
+                    so the operator knows the identity is heuristic
+                    and may warrant manual verification (nc, ssh -v,
+                    nmap --version-intensity 9). */}
+                {s.ai_inferred && (
+                  <span
+                    className="shrink-0 rounded px-1 py-0 text-[10px] tracking-wide bg-purple-900/30 text-purple-400 cursor-help"
+                    title="Product / version inferred by AI from the raw servicefp / banner — nmap couldn't match its signature library. Distinct chip because heuristic identification is less reliable than a probe-match: verify with nc / ssh -v / nmap --version-intensity 9 if it changes your exploitation plan."
+                  >
+                    AI
+                  </span>
+                )}
                 {s.is_new && <span className="shrink-0"><Badge tone="green">NEW</Badge></span>}
                 {s.is_stale && <span className="shrink-0"><Badge tone="gray">GONE</Badge></span>}
                 {vCount > 0 && (

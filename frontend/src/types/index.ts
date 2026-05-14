@@ -17,6 +17,11 @@ export interface ServiceOut {
   name: string | null;
   product: string | null;
   version: string | null;
+  // True when product/version came from AI Phase 1 servicefp/banner
+  // distillation rather than nmap's signature match. UI renders an
+  // "AI-inferred" chip so the operator can tell at a glance the
+  // identity is heuristic.
+  ai_inferred: boolean;
   bruteforceable: boolean;
   notes: string | null;
   is_new: boolean;

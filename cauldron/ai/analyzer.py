@@ -260,10 +260,21 @@ def _ai_extract_cpes() -> tuple[int, int]:
         batch_services = 0
         for entry in extracted:
             linked_here = 0
-            for cpe23 in entry.get("cpes", []):
-                if not _is_valid_cpe23(cpe23):
-                    logger.info("AI returned invalid CPE, dropping: %s", cpe23)
-                    continue
+            cpes_for_service = [
+                c for c in entry.get("cpes", []) if _is_valid_cpe23(c)
+            ]
+            # Persist the AI-extracted CPE list on the Service node BEFORE
+            # NVD enrichment so the operator sees ``product/version`` in
+            # the UI even when zero CVEs come back from NVD — otherwise
+            # an empty NVD response (rare but legitimate, e.g. an obscure
+            # appliance) silently swallows the AI's identification work.
+            # The persist call fills product/version only when nmap left
+            # them null and flags the service ``ai_inferred=true`` so the
+            # UI can render an "AI-inferred" chip distinguishing
+            # heuristic identification from real probe matches.
+            if cpes_for_service:
+                _persist_ai_extracted_cpes(entry, cpes_for_service)
+            for cpe23 in cpes_for_service:
                 try:
                     cves = _query_nvd_cpe(cpe23)
                 except Exception:  # noqa: BLE001
@@ -275,6 +286,8 @@ def _ai_extract_cpes() -> tuple[int, int]:
                     if _link_ai_cve_to_service(entry, cve):
                         linked_here += 1
                         batch_vulns += 1
+            for invalid in (c for c in entry.get("cpes", []) if not _is_valid_cpe23(c)):
+                logger.info("AI returned invalid CPE, dropping: %s", invalid)
             if linked_here:
                 batch_services += 1
         return batch_vulns, batch_services
@@ -387,6 +400,83 @@ Respond with ONLY JSON, no prose, no markdown fences:
     return out
 
 
+def _cpe23_to_22(cpe23: str) -> str:
+    """Convert CPE 2.3 (``cpe:2.3:a:vendor:product:version:...``) to the
+    CPE 2.2 URI form Cauldron stores on Service nodes
+    (``cpe:/a:vendor:product:version``). Trailing wildcard slots are
+    stripped — both forms are semantically identical when the upper
+    slots are unset, and the shorter form keeps the semicolon-joined
+    ``s.cpe`` field readable.
+    """
+    parts = cpe23.split(":")
+    if len(parts) < 4 or parts[0] != "cpe" or parts[1] != "2.3":
+        return cpe23
+    type_part = parts[2]
+    components = parts[3:]
+    while components and components[-1] == "*":
+        components.pop()
+    return f"cpe:/{type_part}:" + ":".join(components)
+
+
+def _persist_ai_extracted_cpes(coords: dict, cpes_23: list[str]) -> None:
+    """Write AI Phase 1's CPE extraction back to the Service node.
+
+    Surfaces the AI's identification work in the UI even when zero CVEs
+    come back from the subsequent NVD lookup. Without this the operator
+    sees a bare ``ssh`` row with no product/version on a host that AI
+    successfully fingerprinted via ``servicefp`` — they have no way to
+    distinguish "AI couldn't tell" from "AI knew, but didn't write it".
+
+    Three updates per service:
+
+    - ``s.product`` / ``s.version`` filled **only when nmap left them
+      null**. A real nmap probe-match is more reliable than AI's banner
+      interpretation, so we never overwrite. The first AI-returned CPE
+      drives both values (services that expose multiple products — e.g.
+      nginx fronting tomcat — get one primary identity, the rest land
+      as extras in the cpe list below).
+    - ``s.cpe`` extended with the CPE 2.2 form of every AI-returned
+      ``cpe:2.3:`` URI. Existing nmap-emitted CPEs stay; this only
+      appends.
+    - ``s.ai_inferred = true`` so the frontend can render an
+      "AI-inferred" chip alongside the version, distinguishing
+      heuristic identification from a cure-grade nmap fingerprint.
+    """
+    if not cpes_23:
+        return
+    first_parts = cpes_23[0].split(":")
+    if len(first_parts) < 6:
+        return
+    product_from_cpe = first_parts[4] if first_parts[4] not in ("*", "-") else None
+    version_from_cpe = first_parts[5] if first_parts[5] not in ("*", "-") else None
+
+    cpes_22 = [_cpe23_to_22(c) for c in cpes_23]
+    cpes_22_join = ";".join(cpes_22)
+
+    with get_session() as session:
+        session.run(
+            """
+            MATCH (s:Service {host_ip: $ip, port: $port, protocol: $proto})
+            SET
+              s.product = coalesce(s.product, $product),
+              s.version = coalesce(s.version, $version),
+              s.cpe = CASE
+                WHEN s.cpe IS NULL THEN $cpes_join
+                WHEN s.cpe CONTAINS $first_cpe THEN s.cpe
+                ELSE s.cpe + ';' + $cpes_join
+              END,
+              s.ai_inferred = true
+            """,
+            ip=coords["ip"],
+            port=coords["port"],
+            proto=coords["protocol"],
+            product=product_from_cpe,
+            version=version_from_cpe,
+            cpes_join=cpes_22_join,
+            first_cpe=cpes_22[0],
+        )
+
+
 def _link_ai_cve_to_service(coords: dict, cve) -> bool:
     """Create / refresh a Vulnerability node and link it to the exact service
     that produced the CPE match. Returns True if a new HAS_VULN was created.
@@ -407,7 +497,16 @@ def _link_ai_cve_to_service(coords: dict, cve) -> bool:
                 v.source = 'ai'
             ON MATCH SET
                 v.has_exploit = CASE WHEN $has_exploit THEN true ELSE v.has_exploit END,
-                v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END
+                v.in_cisa_kev = CASE WHEN $in_cisa_kev THEN true ELSE v.in_cisa_kev END,
+                v.cvss_vector = coalesce(v.cvss_vector, $vector),
+                v.cisa_kev_added = coalesce(v.cisa_kev_added, $cisa_kev_added),
+                v.exploit_url = coalesce(v.exploit_url, $exploit_url),
+                v.source = CASE
+                    WHEN v.source IS NULL THEN 'ai'
+                    WHEN v.source = 'ai' THEN 'ai'
+                    WHEN v.source CONTAINS 'ai' THEN v.source
+                    ELSE v.source + '+ai'
+                END
             """,
             cve_id=cve.cve_id,
             cvss=cve.cvss,
@@ -612,6 +711,7 @@ def _contextual_vuln_triage() -> tuple[int, int, int, int]:
                    all_services,
                    s.port AS port, s.product AS product, s.version AS version,
                    s.name AS service_name,
+                   coalesce(s.ai_inferred, false) AS ai_inferred,
                    v.cve_id AS cve_id, v.cvss AS cvss, v.has_exploit AS has_exploit,
                    v.description AS description, v.source AS source,
                    v.cvss_vector AS cvss_vector,
@@ -654,6 +754,7 @@ def _contextual_vuln_triage() -> tuple[int, int, int, int]:
             "service_name": row.get("service_name"),
             "product": row["product"],
             "version": row["version"],
+            "ai_inferred": bool(row.get("ai_inferred")),
             "cve_id": row["cve_id"],
             "cvss": row["cvss"],
             "has_exploit": row["has_exploit"],
@@ -746,6 +847,15 @@ def _triage_batch(
             lines.append("  Findings:")
         for v in h["vulns"]:
             prod = f"{v['product']} {v['version']}" if v.get("version") else (v.get("product") or "")
+            # ``[ai-cpe]`` annotation when the product / version came
+            # from AI Phase 1's banner-distillation rather than a real
+            # nmap probe-match. Tells Phase 3 the identity is heuristic
+            # — when the CVE description names a version that contradicts
+            # the inferred one, the dismissal can still fire, but the
+            # reasoning should acknowledge the inference (previous wording
+            # of "no version fingerprint" was misleading when the version
+            # WAS extracted, just by AI not nmap).
+            ai_inferred_tag = " [ai-cpe]" if v.get("ai_inferred") else ""
             local_tag = " [LOCAL]" if v.get("is_local") else ""
             exploit_tag = " EXPLOIT" if v.get("has_exploit") else ""
             # CISA KEV = confirmed in-the-wild exploitation. Surface it so
@@ -755,7 +865,7 @@ def _triage_batch(
             kev_tag = " KEV" if v.get("in_cisa_kev") else ""
             svc_name = v.get("service_name") or "?"
             lines.append(
-                f"    :{v['port']}/{svc_name} {prod}  {v['cve_id']} "
+                f"    :{v['port']}/{svc_name} {prod}{ai_inferred_tag}  {v['cve_id']} "
                 f"CVSS:{v['cvss'] or '?'}{exploit_tag}{kev_tag}{local_tag} [{v['source']}]"
             )
             if v.get("description"):
@@ -799,6 +909,12 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     but the listed product line shows OpenSSH 7.4), DISMISS with reason "wrong
     version". Prefer the description-stated affected range over an empty/wildcard
     product line — wildcard-CPE NVD matches pull in CVEs for any release.
+    The product/version on the service line IS the live identification —
+    nmap probe-match if shown plain, or AI Phase 1 banner extraction if
+    suffixed with ``[ai-cpe]``. Both are usable for this rule (do NOT
+    reason "no version fingerprint" when ``[ai-cpe]`` shows a version —
+    the version is there, just sourced from servicefp distillation rather
+    than nmap's signature library).
 11. Surface compatibility: read the CVE description and compare the
     attack vector it describes against the service this CVE is attached
     to AND the host's full Services list.
