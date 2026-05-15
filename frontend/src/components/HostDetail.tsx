@@ -330,23 +330,30 @@ export function HostDetail({ ip, onBack, onDataChanged, refreshKey = 0 }: Props)
   );
 }
 
-/** Group vulns by cve_id, split active vs dismissed edges per CVE.
+/** Group vulns by cve_id; preserve per-edge data for per-port triage.
  *
- * Per-port FP is a real case (AI marks CVE-2009-3555 SSL renegotiation as
- * FP on :80 because there is no TLS on plain HTTP, keeps it on :443).
- * Folding both edges into one row was confusing: the operator saw the
- * dismissed :80 port in the ports list of a row that was otherwise
- * "active", and bulk-dismissing the row would flip the :443 edge to FP
- * too. We now keep both edges in the same grouped row but track the
- * port lists separately:
- *   - ``activePorts`` drives the displayed port badges and the dismiss
- *     button's scope (clicking dismiss FPs only the active ports).
- *   - ``dismissedPorts`` surfaces as a muted "(× :80)" pill so the
- *     operator can see at a glance which ports were already triaged
- *     without polluting the live port list.
- * Representative ``vuln`` is picked from the active edges when any
- * exist (so the row's status colour reflects the active state); when
- * every edge is dismissed we fall back to a dismissed edge.
+ * Cauldron's data model is per-port: every ``(:Service)-[:HAS_VULN]->
+ * (:Vulnerability)`` edge is anchored to one port and carries its own
+ * ``checked_status`` and ``ai_fp_reason``. AI Phase 3 dismisses per-
+ * port too — TLS renegotiation CVE on Apache stays active on :443 and
+ * gets FP'd on :80 because plain HTTP has no TLS to renegotiate.
+ *
+ * The earlier "merge ports into the row" rendering hid that granularity
+ * from the operator: they couldn't see per-port FP state, couldn't
+ * dismiss one port without dismissing the rest, and couldn't tell that
+ * the same CVE-id grouped under one row was actually two independent
+ * triage decisions. The new shape keeps the per-edge list intact and
+ * the row renders aggregate info in the collapsed view, per-port
+ * sub-rows in the expanded view.
+ *
+ * Returns one entry per CVE-id with:
+ *   - ``vuln`` — aggregate representative for collapsed display
+ *     (highest CVSS, OR-merged has_exploit/KEV/EPSS/version_unconfirmed;
+ *     ``checked_status`` only set when EVERY edge is FP'd, otherwise
+ *     null so the row reads as "still has active findings").
+ *   - ``edges`` — raw per-port VulnOut entries (one per
+ *     ``[:HAS_VULN]`` relationship), sorted by port ascending with
+ *     host-OS edges (``port: null``) first.
  */
 function VulnsList({ vulns, hostIp, onUpdated }: {
   vulns: HostOut['vulnerabilities'];
@@ -354,79 +361,66 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
   onUpdated: () => void;
 }) {
   const grouped = useMemo(() => {
-    interface Group {
-      activeVuln: VulnOut | null;
-      dismissedVuln: VulnOut | null;
-      activePorts: number[];
-      dismissedPorts: number[];
-    }
-    const map = new Map<string, Group>();
-
-    const isActive = (v: VulnOut) => v.checked_status !== 'false_positive';
-    const mergeMeta = (target: VulnOut, src: VulnOut): VulnOut => {
-      let out = target;
-      if (src.cvss > out.cvss) out = { ...out, cvss: src.cvss };
-      if (src.has_exploit && !out.has_exploit) out = { ...out, has_exploit: true };
-      if (src.exploit_url && !out.exploit_url) out = { ...out, exploit_url: src.exploit_url };
-      if (src.exploit_module && !out.exploit_module) out = { ...out, exploit_module: src.exploit_module };
-      // OR-merge ``version_unconfirmed`` across port-instances. Without
-      // this the badge flickered on re-fetch — the API returns one row
-      // per (cve_id, port) and Neo4j's ``collect(DISTINCT ...)`` order
-      // is arbitrary, so whichever instance came first decided the
-      // badge. Asymmetric cost favours "show if any": false positive
-      // is one extra '?' the operator can dismiss; false negative is
-      // the operator chasing a CVE on a service whose version is
-      // actually unknown.
-      if (src.version_unconfirmed && !out.version_unconfirmed) {
-        out = { ...out, version_unconfirmed: true };
-      }
-      return out;
-    };
+    const map = new Map<string, { vuln: VulnOut; edges: VulnOut[] }>();
+    const orMerge = (a: VulnOut, b: VulnOut): VulnOut => ({
+      ...a,
+      cvss: Math.max(a.cvss, b.cvss),
+      has_exploit: a.has_exploit || b.has_exploit,
+      in_cisa_kev: a.in_cisa_kev || b.in_cisa_kev,
+      cisa_kev_added: a.cisa_kev_added ?? b.cisa_kev_added,
+      epss: a.epss ?? b.epss,
+      exploit_url: a.exploit_url ?? b.exploit_url,
+      exploit_module: a.exploit_module ?? b.exploit_module,
+      exploit_sources: a.exploit_sources ?? b.exploit_sources,
+      enables_pivot: a.enables_pivot ?? b.enables_pivot,
+      description: a.description ?? b.description,
+      version_unconfirmed: a.version_unconfirmed || b.version_unconfirmed,
+      source: a.source ?? b.source,
+    });
 
     for (const v of vulns) {
-      let entry = map.get(v.cve_id);
-      if (!entry) {
-        entry = { activeVuln: null, dismissedVuln: null, activePorts: [], dismissedPorts: [] };
-        map.set(v.cve_id, entry);
-      }
-      if (isActive(v)) {
-        entry.activeVuln = entry.activeVuln ? mergeMeta(entry.activeVuln, v) : v;
-        if (v.port != null && !entry.activePorts.includes(v.port)) {
-          entry.activePorts.push(v.port);
-        }
+      const entry = map.get(v.cve_id);
+      if (entry) {
+        entry.vuln = orMerge(entry.vuln, v);
+        entry.edges.push(v);
       } else {
-        entry.dismissedVuln = entry.dismissedVuln ? mergeMeta(entry.dismissedVuln, v) : v;
-        if (v.port != null && !entry.dismissedPorts.includes(v.port)) {
-          entry.dismissedPorts.push(v.port);
-        }
+        map.set(v.cve_id, { vuln: { ...v }, edges: [v] });
       }
     }
 
     return [...map.values()].map(g => {
-      g.activePorts.sort((a, b) => a - b);
-      g.dismissedPorts.sort((a, b) => a - b);
-      // Prefer active vuln as row representative when any active edge
-      // exists; ``vuln.checked_status`` then reflects the row's true
-      // state and the dismiss button operates on the active ports
-      // only. Empty-active rows (everything dismissed) fall back to
-      // the dismissed vuln so the row still renders.
-      const vuln = (g.activeVuln ?? g.dismissedVuln) as VulnOut;
-      const ports = g.activeVuln ? g.activePorts : g.dismissedPorts;
-      return { vuln, ports, dismissedPorts: g.activeVuln ? g.dismissedPorts : [] };
+      // Sort edges: host-OS (port=null) first, then ports ascending.
+      g.edges.sort((a, b) => {
+        if (a.port == null && b.port == null) return 0;
+        if (a.port == null) return -1;
+        if (b.port == null) return 1;
+        return a.port - b.port;
+      });
+      // Aggregate ``checked_status``: 'false_positive' only when every
+      // edge is FP. Mixed and all-active rows read as active so the
+      // collapsed view's "FP styling" reflects "no active surfaces left"
+      // truthfully — operator scanning the list sees mixed-state CVEs
+      // as live findings that still need action on at least one port.
+      const allFp = g.edges.every(e => e.checked_status === 'false_positive');
+      g.vuln = { ...g.vuln, checked_status: allFp ? 'false_positive' : null };
+      return g;
     });
   }, [vulns]);
 
-  // Header counts: "active CVE / total active findings". Findings here
-  // counts edges (port-instances), so a CVE on 2 ports contributes 2.
-  // FP'd ports don't count toward findings — the operator already
-  // triaged them away.
+  // Header counts: "active CVEs / total active findings". Findings
+  // counts edges (port-instances), so a CVE on 2 active ports
+  // contributes 2. FP'd edges don't count toward findings — the
+  // operator already triaged them away.
   const headerLabel = (() => {
     const total = grouped.length;
     if (total === 0) return 'Vulnerabilities';
     const active = grouped.filter(g => g.vuln.checked_status !== 'false_positive').length;
     const dismissed = total - active;
-    const portCount = grouped.reduce((n, g) => n + g.ports.length, 0);
-    const portSuffix = portCount > active ? ` · ${portCount} findings` : '';
+    const activeFindings = grouped.reduce(
+      (n, g) => n + g.edges.filter(e => e.checked_status !== 'false_positive').length,
+      0,
+    );
+    const portSuffix = activeFindings > active ? ` · ${activeFindings} findings` : '';
     if (dismissed === 0) return `Vulnerabilities · ${active}${portSuffix}`;
     if (active === 0) return `Vulnerabilities · ${dismissed} dismissed${portSuffix}`;
     return `Vulnerabilities · ${active} active, ${dismissed} dismissed${portSuffix}`;
@@ -439,12 +433,11 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
         <span className="text-xs font-medium text-gray-400">{headerLabel}</span>
       </div>
       <div className="px-3 pb-2 space-y-1">
-        {grouped.map(({ vuln, ports, dismissedPorts }) => (
+        {grouped.map(({ vuln, edges }) => (
           <VulnRow
             key={vuln.cve_id}
             vuln={vuln}
-            ports={ports}
-            dismissedPorts={dismissedPorts}
+            edges={edges}
             hostIp={hostIp}
             onUpdated={onUpdated}
           />
@@ -457,31 +450,54 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
   );
 }
 
-function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
+function VulnRow({ vuln, edges, hostIp, onUpdated }: {
+  // Aggregate representation used by the collapsed row header
+  // (highest CVSS / has_exploit OR'd across edges / KEV / EPSS).
+  // ``vuln.checked_status`` is 'false_positive' only when EVERY
+  // edge is FP'd; mixed and all-active rows have ``null`` here so
+  // the row reads as "still actionable on at least one port."
   vuln: VulnOut;
-  ports: number[];
-  // Ports for this CVE that have already been FP-dismissed (per-port
-  // triage from AI Phase 3 — e.g. TLS CVE flagged FP on :80 because
-  // there's no TLS on plain HTTP, kept active on :443). Rendered as
-  // a muted strikethrough pill so the operator can see at a glance
-  // which ports were triaged without polluting the live port badges.
-  dismissedPorts: number[];
+  // Per-port edges (one VulnOut per ``[:HAS_VULN]`` relationship).
+  // Each carries its own ``checked_status`` / ``ai_fp_reason`` /
+  // ``port`` and is triaged independently in the expanded view.
+  // Host-OS edges (kernel privesc) sort first with ``port: null``.
+  edges: VulnOut[];
   hostIp: string;
   onUpdated: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [updating, setUpdating] = useState(false);
-  // Unified FP modal: click "False Positive" status button → modal asks
-  // for reason + scope (this host vs all hosts). "All hosts" path
-  // requires a second confirmation step before firing the bulk endpoint.
+  // FP modal: opened with a target port to dismiss. ``fpTargetPort``
+  // is set when the operator clicks the × icon on a per-port sub-row
+  // (specific port scope) or on the aggregate row (port=null → all
+  // currently-active ports on this host). ``fpConfirmAll`` opens the
+  // graph-wide bulk-dismiss confirmation flow.
   const [fpOpen, setFpOpen] = useState(false);
   const [fpReason, setFpReason] = useState('');
+  const [fpTargetPort, setFpTargetPort] = useState<number | null | 'aggregate'>(null);
   const [fpConfirmAll, setFpConfirmAll] = useState(false);
   const [fpBusy, setFpBusy] = useState(false);
   const [fpError, setFpError] = useState<string | null>(null);
   const [cveCopied, setCveCopied] = useState(false);
   const currentStatus = vuln.checked_status || null;
-
+  // Active vs dismissed edges drive collapsed-row port chips and the
+  // aggregate-button bulk action target list. Computed once per render.
+  const activeEdges = useMemo(
+    () => edges.filter(e => e.checked_status !== 'false_positive'),
+    [edges],
+  );
+  const dismissedEdges = useMemo(
+    () => edges.filter(e => e.checked_status === 'false_positive'),
+    [edges],
+  );
+  const activePorts = useMemo(
+    () => activeEdges.map(e => e.port).filter((p): p is number => p != null),
+    [activeEdges],
+  );
+  const dismissedPorts = useMemo(
+    () => dismissedEdges.map(e => e.port).filter((p): p is number => p != null),
+    [dismissedEdges],
+  );
   const handleCopyCve = useCallback(async () => {
     await navigator.clipboard.writeText(vuln.cve_id);
     setCveCopied(true);
@@ -492,33 +508,64 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
     if (fpBusy) return;
     setFpOpen(false);
     setFpReason('');
+    setFpTargetPort(null);
     setFpConfirmAll(false);
     setFpError(null);
   }, [fpBusy]);
 
-  const handleStatusChange = useCallback(async (status: VulnStatus) => {
-    // FP is a special case — needs a reason and a scope. Open the
-    // modal instead of firing immediately, except when toggling OFF
-    // an already-FP'd edge (un-FP needs no annotation).
-    if (status === 'false_positive' && currentStatus !== 'false_positive') {
-      setFpOpen(true);
-      return;
-    }
+  /** Open the FP modal scoped to a specific edge (single port) or to
+   * the aggregate (every currently-active edge). 'aggregate' is the
+   * collapsed-row × button; numeric port is a per-port sub-row × in
+   * the expanded view. ``null`` is for host-OS edges where ``port``
+   * is intrinsically null on the edge itself. */
+  const openFpModalForScope = useCallback((scope: number | null | 'aggregate') => {
+    setFpTargetPort(scope);
+    setFpOpen(true);
+  }, []);
+
+  /** Apply a non-FP status (exploited / mitigated / clear) to a
+   * specific edge. ``port=null`` targets a host-OS edge. */
+  const applyEdgeStatus = useCallback(async (port: number | null, status: VulnStatus) => {
     setUpdating(true);
     try {
-      const newStatus = status === currentStatus ? null : status;
-      await Promise.all(
-        ports.length > 0
-          ? ports.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, p))
-          : [api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, vuln.port)]
-      );
+      await api.updateVulnStatus(hostIp, vuln.cve_id, status, port);
       onUpdated();
     } catch (e) {
       console.error('Failed to update vuln status:', e);
     } finally {
       setUpdating(false);
     }
-  }, [hostIp, vuln.cve_id, vuln.port, ports, currentStatus, onUpdated]);
+  }, [hostIp, vuln.cve_id, onUpdated]);
+
+  /** Aggregate-row inline status button. Applies to every currently-
+   * active edge (or every dismissed edge when clearing FP). FP requires
+   * a reason → routes through the modal. */
+  const handleAggregateStatusChange = useCallback(async (status: VulnStatus) => {
+    if (status === 'false_positive' && currentStatus !== 'false_positive') {
+      openFpModalForScope('aggregate');
+      return;
+    }
+    setUpdating(true);
+    try {
+      const newStatus = status === currentStatus ? null : status;
+      // When clearing FP, target the dismissed edges (the active ones
+      // already have status=null). Otherwise target active edges.
+      const targets = (currentStatus === 'false_positive' && newStatus === null)
+        ? dismissedEdges
+        : activeEdges;
+      const targetEntries = targets.length > 0
+        ? targets.map(e => ({ port: e.port }))
+        : [{ port: vuln.port }];
+      await Promise.all(targetEntries.map(t =>
+        api.updateVulnStatus(hostIp, vuln.cve_id, newStatus, t.port)
+      ));
+      onUpdated();
+    } catch (e) {
+      console.error('Failed to update vuln status:', e);
+    } finally {
+      setUpdating(false);
+    }
+  }, [hostIp, vuln.cve_id, vuln.port, activeEdges, dismissedEdges, currentStatus, onUpdated, openFpModalForScope]);
 
   const applyFpThisHost = useCallback(async () => {
     const reason = fpReason.trim();
@@ -529,10 +576,18 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
     setFpBusy(true);
     setFpError(null);
     try {
+      // Resolve scope: numeric port → that one edge; 'aggregate' →
+      // every currently-active edge on this host; null → host-OS edge.
+      let targetPorts: (number | null)[];
+      if (fpTargetPort === 'aggregate') {
+        targetPorts = activeEdges.length > 0
+          ? activeEdges.map(e => e.port)
+          : [vuln.port];
+      } else {
+        targetPorts = [fpTargetPort];
+      }
       await Promise.all(
-        ports.length > 0
-          ? ports.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, 'false_positive', p, reason))
-          : [api.updateVulnStatus(hostIp, vuln.cve_id, 'false_positive', vuln.port, reason)]
+        targetPorts.map(p => api.updateVulnStatus(hostIp, vuln.cve_id, 'false_positive', p, reason))
       );
       onUpdated();
       closeFpModal();
@@ -542,7 +597,7 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
     } finally {
       setFpBusy(false);
     }
-  }, [hostIp, vuln.cve_id, vuln.port, ports, fpReason, onUpdated, closeFpModal]);
+  }, [hostIp, vuln.cve_id, vuln.port, activeEdges, fpTargetPort, fpReason, onUpdated, closeFpModal]);
 
   const applyFpAllHosts = useCallback(async () => {
     const reason = fpReason.trim();
@@ -571,9 +626,21 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
         onClick={() => setExpanded(!expanded)}
         className="w-full px-2 py-1.5 text-left flex items-center gap-2"
       >
-        {ports.length > 0 ? (
-          <span className="font-mono text-xs text-gray-500 shrink-0" title={ports.join(', ')}>
-            :{ports[0]}{ports.length > 1 && <span className="text-gray-600">+{ports.length - 1}</span>}
+        {/* Port chip selection for the collapsed row:
+            - any active port → show active port (operator wants to act here)
+            - no active ports, but FP'd ports exist → show dismissed (strikethrough),
+              so all-FP rows still surface the port number for context
+            - no service ports at all → host-OS finding, render OS chip */}
+        {activePorts.length > 0 ? (
+          <span className="font-mono text-xs text-gray-500 shrink-0" title={activePorts.join(', ')}>
+            :{activePorts[0]}{activePorts.length > 1 && <span className="text-gray-600">+{activePorts.length - 1}</span>}
+          </span>
+        ) : dismissedPorts.length > 0 ? (
+          <span
+            className="font-mono text-xs text-gray-600 shrink-0 line-through decoration-gray-600"
+            title={`All ports FP-dismissed: ${dismissedPorts.join(', ')}`}
+          >
+            :{dismissedPorts[0]}{dismissedPorts.length > 1 && <span>+{dismissedPorts.length - 1}</span>}
           </span>
         ) : (
           // Host-level finding (kernel privesc / OS-wide CVE) — no
@@ -589,15 +656,14 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
             OS
           </span>
         )}
-        {dismissedPorts.length > 0 && (
-          // Per-port FP indicator. The CVE has at least one active port
-          // shown above; this pill surfaces the other port(s) the AI
-          // (or operator) already marked FP so the operator knows the
-          // grouping isn't hiding a partial dismissal. Strikethrough
-          // styling reinforces "this port was already triaged away."
+        {activePorts.length > 0 && dismissedPorts.length > 0 && (
+          // Per-port FP indicator on a mixed-state row (some ports
+          // active, some FP'd). Strikethrough pill surfaces the
+          // already-triaged ports so the grouping doesn't hide them.
+          // Expand the row to act on individual ports.
           <span
             className="font-mono text-[10px] text-gray-600 shrink-0 line-through decoration-gray-600"
-            title={`FP-dismissed on port${dismissedPorts.length > 1 ? 's' : ''} ${dismissedPorts.join(', ')} — different surface (e.g. CVE applies to HTTPS but not HTTP)`}
+            title={`FP-dismissed on port${dismissedPorts.length > 1 ? 's' : ''} ${dismissedPorts.join(', ')} — expand row to view reason or re-activate`}
           >
             ×:{dismissedPorts[0]}{dismissedPorts.length > 1 && <span>+{dismissedPorts.length - 1}</span>}
           </span>
@@ -714,13 +780,19 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
         >
           {STATUS_OPTIONS.map((opt) => {
             const isActive = currentStatus === opt.value;
+            const portCount = activeEdges.length || (vuln.port != null || edges.some(e => e.port == null) ? 1 : 0);
+            const tooltip = isActive
+              ? `Clear ${opt.label}`
+              : edges.length > 1
+                ? `Mark all ${portCount} active port${portCount === 1 ? '' : 's'} as ${opt.label}${edges.length > 1 ? ' — use expanded view for per-port' : ''}`
+                : `Mark as ${opt.label}`;
             return (
               <button
                 key={opt.value}
                 disabled={updating}
-                onClick={() => handleStatusChange(opt.value)}
-                title={isActive ? `Clear ${opt.label}` : `Mark as ${opt.label}`}
-                aria-label={isActive ? `Clear ${opt.label}` : `Mark as ${opt.label}`}
+                onClick={() => handleAggregateStatusChange(opt.value)}
+                title={tooltip}
+                aria-label={tooltip}
                 className={`flex items-center px-1.5 py-0.5 transition-colors ${
                   isActive
                     ? 'font-semibold'
@@ -740,14 +812,8 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
 
       {expanded && (
         <div className="px-2 pb-2 space-y-1.5">
-          {ports.length > 1 && (
-            <p className="text-xs text-gray-500 font-mono">Ports: {ports.join(', ')}</p>
-          )}
           {vuln.description && (
             <p className="text-xs text-gray-500">{vuln.description}</p>
-          )}
-          {vuln.ai_fp_reason && (
-            <p className="text-xs text-yellow-600 italic">AI: {vuln.ai_fp_reason}</p>
           )}
           <div className="flex items-center gap-1 flex-wrap text-xs text-gray-600">
             {vuln.enables_pivot === true && (
@@ -773,11 +839,31 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
               {vuln.exploit_url}
             </a>
           )}
-          {/* Exploit Commands */}
-          <ExploitCommands hostIp={hostIp} port={ports[0] || vuln.port || 0} vulnId={vuln.cve_id} />
-          {/* Status pickers live in the collapsed row now (compact,
-              always visible). The expanded view doesn't duplicate them
-              — the inline icons reach the same handler / modal. */}
+          {/* Per-port edge breakdown — each edge has its own status
+              buttons. Lets the operator triage ":80 FP, :443 active"
+              from the UI (mirrors AI Phase 3's per-port granularity).
+              Single-edge rows still get the sub-row for consistency
+              (and to surface the edge's ai_fp_reason inline). */}
+          <div className="rounded border border-gray-800/70 divide-y divide-gray-800/50">
+            {edges.map((edge) => (
+              <EdgeStatusRow
+                key={`${edge.cve_id}:${edge.port ?? 'os'}`}
+                edge={edge}
+                updating={updating}
+                onApplyStatus={(status) => applyEdgeStatus(edge.port, status)}
+                onOpenFpModal={() => openFpModalForScope(edge.port)}
+              />
+            ))}
+          </div>
+          {/* Exploit Commands — wired to the first active port (or the
+              first edge's port if all are dismissed) so the operator
+              can copy a ready-to-run command without picking the port
+              themselves. */}
+          <ExploitCommands
+            hostIp={hostIp}
+            port={activePorts[0] || edges[0]?.port || vuln.port || 0}
+            vulnId={vuln.cve_id}
+          />
         </div>
       )}
       {fpOpen && (
@@ -791,7 +877,17 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
           >
             <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-200">
               <X size={14} className="text-gray-400" />
-              Mark <span className="font-mono">{vuln.cve_id}</span> as False Positive
+              Mark <span className="font-mono">{vuln.cve_id}</span>
+              {typeof fpTargetPort === 'number' && (
+                <> on <span className="font-mono">:{fpTargetPort}</span></>
+              )}
+              {fpTargetPort === null && edges.some(e => e.port == null) && (
+                <> (host OS edge)</>
+              )}
+              {fpTargetPort === 'aggregate' && activeEdges.length > 1 && (
+                <> on <span className="font-mono">{activeEdges.length} active ports</span></>
+              )}
+              {' '}as False Positive
             </h3>
             <label className="block text-xs text-gray-500 mb-1">
               Reason (required):
@@ -848,13 +944,23 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
                   disabled={fpBusy || !fpReason.trim()}
                   onClick={applyFpThisHost}
                   className="rounded bg-gray-700 px-3 py-1 text-xs text-gray-200 hover:bg-gray-600 disabled:opacity-50"
+                  title={typeof fpTargetPort === 'number'
+                    ? `Mark FP only on port ${fpTargetPort}`
+                    : 'Mark FP on every active port of this CVE on this host'}
                 >
-                  {fpBusy ? 'Applying...' : 'Apply to this host'}
+                  {fpBusy
+                    ? 'Applying...'
+                    : typeof fpTargetPort === 'number'
+                      ? `Apply to :${fpTargetPort}`
+                      : 'Apply to this host'}
                 </button>
                 <button
-                  disabled={fpBusy || !fpReason.trim()}
+                  disabled={fpBusy || !fpReason.trim() || typeof fpTargetPort === 'number'}
                   onClick={() => { setFpError(null); setFpConfirmAll(true); }}
                   className="rounded bg-red-900/40 px-3 py-1 text-xs font-semibold text-red-200 hover:bg-red-900/60 disabled:opacity-50"
+                  title={typeof fpTargetPort === 'number'
+                    ? 'Bulk dismiss-all is incompatible with per-port scope — open the modal from the collapsed row × instead'
+                    : 'Mark FP on every host where this CVE is currently active'}
                 >
                   Apply to all hosts
                 </button>
@@ -863,6 +969,95 @@ function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Per-edge sub-row inside an expanded VulnRow. One sub-row per
+ * ``[:HAS_VULN]`` relationship, each with independent status buttons.
+ * The clear-status button (when status is set) and the ✓/⊘ buttons
+ * fire immediately; the × FP button routes through the parent's
+ * modal so a reason can be required. */
+function EdgeStatusRow({
+  edge,
+  updating,
+  onApplyStatus,
+  onOpenFpModal,
+}: {
+  edge: VulnOut;
+  updating: boolean;
+  onApplyStatus: (status: VulnStatus) => void;
+  onOpenFpModal: () => void;
+}) {
+  const status = edge.checked_status || null;
+  const portLabel = edge.port == null ? 'OS' : `:${edge.port}`;
+  return (
+    <div className="px-2 py-1 flex items-center gap-2">
+      <span
+        className={`font-mono text-[11px] shrink-0 min-w-[3rem] ${
+          edge.port == null
+            ? 'text-indigo-300/80'
+            : status === 'false_positive'
+              ? 'text-gray-600 line-through decoration-gray-600'
+              : 'text-gray-400'
+        }`}
+        title={edge.port == null ? 'Host-OS edge — kernel/OS-wide finding' : `Port ${edge.port}`}
+      >
+        {portLabel}
+      </span>
+      {status && (
+        <span
+          className="text-[10px] uppercase tracking-wide font-semibold shrink-0"
+          style={{
+            color: STATUS_OPTIONS.find(o => o.value === status)?.color ?? '#9ca3af',
+          }}
+        >
+          {STATUS_OPTIONS.find(o => o.value === status)?.label ?? status}
+        </span>
+      )}
+      {edge.ai_fp_reason && (
+        <span
+          className="text-[11px] italic text-yellow-600/80 truncate flex-1 min-w-0"
+          title={edge.ai_fp_reason}
+        >
+          AI: {edge.ai_fp_reason}
+        </span>
+      )}
+      {!edge.ai_fp_reason && <span className="flex-1" />}
+      <span
+        className="flex items-stretch shrink-0 rounded border border-gray-700 overflow-hidden divide-x divide-gray-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {STATUS_OPTIONS.map((opt) => {
+          const isActive = status === opt.value;
+          return (
+            <button
+              key={opt.value}
+              disabled={updating}
+              onClick={() => {
+                if (opt.value === 'false_positive' && status !== 'false_positive') {
+                  onOpenFpModal();
+                } else {
+                  // Toggle off if already in this state; otherwise set
+                  // to new state. Clearing FP needs no reason.
+                  onApplyStatus(isActive ? null : opt.value);
+                }
+              }}
+              title={isActive ? `Clear ${opt.label}` : `Mark ${portLabel} as ${opt.label}`}
+              className={`flex items-center px-1.5 py-0.5 transition-colors ${
+                isActive
+                  ? 'font-semibold'
+                  : 'text-gray-400 hover:bg-gray-800 hover:text-gray-100'
+              }`}
+              style={isActive
+                ? { color: opt.color, backgroundColor: opt.color + '22' }
+                : undefined}
+            >
+              {opt.icon}
+            </button>
+          );
+        })}
+      </span>
     </div>
   );
 }
