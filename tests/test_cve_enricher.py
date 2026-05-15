@@ -18,6 +18,7 @@ from cauldron.ai.cve_enricher import (
     PRODUCT_CPE_MAP,
     _cpe22_to_23,
     _cve_applies_to,
+    _cve_is_av_local,
     _cve_is_dos_only,
     _cve_is_gold,
     _cve_is_local_only,
@@ -25,6 +26,7 @@ from cauldron.ai.cve_enricher import (
     _cve_priority_key,
     _cve_requires_admin,
     _extract_version,
+    _filter_host_os_cves_by_ownership,
     _get_cpe_for_service,
     _is_pentester_relevant,
     _parse_cve,
@@ -1363,6 +1365,82 @@ class TestCVEIsGold:
         b = CVEInfo(cve_id="B", cvss=9.0, has_exploit=True)
         ordered = sorted([a, b], key=_cve_priority_key)
         assert ordered[0].cve_id == "B"
+
+
+class TestFilterHostOSCVEsByOwnership:
+    """Per-CVE AV:L gate at host-OS upsert time.
+
+    The cache (``CVECache`` keyed by CPE) carries the full AV:L + AV:N
+    result for every OS CPE the pipeline has queried. This filter is
+    the per-host upsert decision: AV:L kernel-privesc CVEs only flow
+    through to ``(:Host)-[:HAS_VULN]->(:Vulnerability)`` when the host
+    is already marked owned. Pre-foothold AV:L is dead weight competing
+    with AV:N attack-surface findings; Mark-as-Owned is the event that
+    flips them into actionability (v0.2.0 piece B re-runs this filter).
+    """
+
+    AV_N_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    AV_L_VECTOR = "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+    def _cve(self, cve_id: str, vector: str) -> CVEInfo:
+        return CVEInfo(
+            cve_id=cve_id, cvss=7.5, cvss_vector=vector, has_exploit=True,
+        )
+
+    def test_av_local_detected(self):
+        assert _cve_is_av_local(self._cve("X", self.AV_L_VECTOR)) is True
+        assert _cve_is_av_local(self._cve("X", self.AV_N_VECTOR)) is False
+
+    def test_av_local_missing_vector_returns_false(self):
+        """Defensive — no vector string means we can't conclude AV:L,
+        so we don't apply the ownership gate and let the CVE through."""
+        no_vector = CVEInfo(cve_id="X", cvss=7.5, cvss_vector=None,
+                            has_exploit=True)
+        assert _cve_is_av_local(no_vector) is False
+
+    def test_owned_host_keeps_everything(self):
+        """When the operator has shell on the box, every CVE the gold
+        filter accepted at NVD-query time stays — AV:L kernel privesc
+        becomes the exact gold the host-OS pipeline exists to surface."""
+        cves = [
+            self._cve("CVE-N-1", self.AV_N_VECTOR),
+            self._cve("CVE-L-1", self.AV_L_VECTOR),
+            self._cve("CVE-L-2", self.AV_L_VECTOR),
+        ]
+        kept, skipped = _filter_host_os_cves_by_ownership(cves, host_is_owned=True)
+        assert [c.cve_id for c in kept] == ["CVE-N-1", "CVE-L-1", "CVE-L-2"]
+        assert skipped == 0
+
+    def test_unowned_host_drops_av_local(self):
+        """Pre-foothold the AV:L entries are noise — operator can't run
+        a local privesc against a box they don't have shell on. AV:N
+        external attack surface stays."""
+        cves = [
+            self._cve("CVE-N-1", self.AV_N_VECTOR),
+            self._cve("CVE-L-1", self.AV_L_VECTOR),
+            self._cve("CVE-L-2", self.AV_L_VECTOR),
+        ]
+        kept, skipped = _filter_host_os_cves_by_ownership(cves, host_is_owned=False)
+        assert [c.cve_id for c in kept] == ["CVE-N-1"]
+        assert skipped == 2
+
+    def test_empty_input(self):
+        kept, skipped = _filter_host_os_cves_by_ownership([], host_is_owned=False)
+        assert kept == []
+        assert skipped == 0
+
+    def test_unowned_all_av_local_returns_empty(self):
+        """A host whose entire CVE list is kernel-privesc (Linux 2.6
+        with only AV:L kernel CVEs surviving the gold filter) produces
+        an empty upsert list pre-foothold, but the cache still holds
+        the full result for the eventual Mark-as-Owned re-enrichment."""
+        cves = [
+            self._cve("CVE-L-1", self.AV_L_VECTOR),
+            self._cve("CVE-L-2", self.AV_L_VECTOR),
+        ]
+        kept, skipped = _filter_host_os_cves_by_ownership(cves, host_is_owned=False)
+        assert kept == []
+        assert skipped == 2
 
 
 class TestKEVParsing:

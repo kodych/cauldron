@@ -1018,6 +1018,18 @@ def _cve_is_physical_only(cve: CVEInfo) -> bool:
     return "AV:P" in _cvss_tokens(cve)
 
 
+def _cve_is_av_local(cve: CVEInfo) -> bool:
+    """True if the CVE's attack vector is local (AV:L).
+
+    Host-OS enrichment uses this to gate AV:L kernel-privesc entries
+    to owned hosts only. A 500-host engagement with a mostly-Linux
+    fleet otherwise ends up with every host detail panel showing
+    kernel privesc CVEs the operator cannot exercise yet — Mark-as-
+    Owned is the event that flips them into actionability.
+    """
+    return "AV:L" in _cvss_tokens(cve)
+
+
 def _cve_requires_admin(cve: CVEInfo) -> bool:
     """True if the CVE requires high-privileged access (admin/root) to exploit.
 
@@ -2187,6 +2199,39 @@ def enrich_services_from_graph(
     return stats
 
 
+def _filter_host_os_cves_by_ownership(
+    cves: list[CVEInfo], host_is_owned: bool,
+) -> tuple[list[CVEInfo], int]:
+    """Apply the AV:L gate at host-OS upsert time.
+
+    AV:L kernel-privesc CVEs only become actionable after the operator
+    has shell on the box — pre-foothold they sit in every host detail
+    panel as dead weight competing with AV:N attack-surface findings.
+    Mark-as-Owned is the event that should flip them into the graph;
+    until then we skip the upsert for AV:L on un-owned hosts.
+
+    The cache (``CVECache`` keyed by CPE) keeps the full result set —
+    AV:L entries are NOT dropped at cache-write time. When the host
+    later flips to owned, the Mark-as-Owned trigger (v0.2.0 piece B)
+    re-runs this filter with ``host_is_owned=True`` and the cached
+    AV:L entries flow through the upsert without a fresh NVD round-trip.
+
+    Returns:
+        (kept, av_l_skipped_count) — list of CVEs to upsert plus the
+        count of AV:L entries the ownership gate dropped (for stats).
+    """
+    if host_is_owned:
+        return cves, 0
+    kept: list[CVEInfo] = []
+    skipped = 0
+    for cve in cves:
+        if _cve_is_av_local(cve):
+            skipped += 1
+            continue
+        kept.append(cve)
+    return kept, skipped
+
+
 def enrich_host_os_from_graph(progress_callback=None) -> dict:
     """Enrich Host nodes with OS-level CVE findings via NVD.
 
@@ -2199,17 +2244,28 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
     CVE-2010-3904 RDS, CVE-2009-2692 vmsplice) that's the canonical
     post-foothold escalation path on legacy targets.
 
-    Differs from the service-level path in two filter knobs:
+    Three-stage architecture (cache as source of truth):
 
-    - ``host_os=True`` keeps AV:L (local) CVEs through ``_cve_is_gold``.
-      Kernel privesc is local-vector by definition and is the only
-      reason this enricher exists.
-    - Findings attach to the Host via ``(:Host)-[:HAS_VULN]->(:Vulnerability)``
-      rather than a Service. Downstream API merges service-level and
-      host-level vulns on a single host detail response; the UI
-      renders host-level rows with an ``OS`` badge instead of a port
-      label so the operator can tell at a glance which findings
-      escalate from foothold vs which sit on an exposed service.
+    1. **NVD query, once per unique OS CPE.** ``_query_nvd_cpe(cpe,
+       host_os=True)`` keeps both AV:L and AV:N — only AV:P / DoS /
+       PR:H / non-exploit get dropped. All results land in
+       ``CVECache`` keyed by the CPE string. A 500-host engagement
+       with ~10 distinct OS CPEs only ever hits NVD ~10 times.
+    2. **Per-host upsert decision.** For each host with ``os_cpe``,
+       read the cache and apply the AV:L-by-ownership gate
+       (``_filter_host_os_cves_by_ownership``). AV:N OS CVEs
+       (MS17-010, BlueKeep, SMBGhost) land on every host — external
+       attack surface, ownership-independent. AV:L kernel privesc
+       only lands on hosts already marked owned.
+    3. **Mark-as-Owned re-enrichment** (v0.2.0 piece B, not in this
+       commit) reads from the same cache, applies the filter with
+       ``host_is_owned=True``, and writes the previously-skipped AV:L
+       edges without any NVD round-trip.
+
+    Findings attach to the Host via ``(:Host)-[:HAS_VULN]->(:Vulnerability)``
+    rather than a Service. Downstream API merges service-level and
+    host-level vulns on a single host detail response; the UI renders
+    host-level rows with an ``OS`` badge instead of a port label.
     """
     from cauldron.graph.connection import get_session
 
@@ -2221,6 +2277,10 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
         "api_calls": 0,
         "errors": 0,
         "skipped": 0,
+        # Per-host AV:L-by-ownership gate stats — visibility on noise
+        # the ownership filter removed from the upsert path.
+        "av_l_skipped": 0,
+        "av_l_skipped_hosts": 0,
     }
 
     cache = CVECache()
@@ -2230,7 +2290,8 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
             """
             MATCH (h:Host)
             WHERE h.os_cpe IS NOT NULL
-            RETURN h.ip AS ip, h.os_cpe AS os_cpe, h.os_name AS os_name
+            RETURN h.ip AS ip, h.os_cpe AS os_cpe, h.os_name AS os_name,
+                   coalesce(h.owned, false) AS owned
             ORDER BY h.ip
             """,
         ))
@@ -2239,6 +2300,7 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
     for idx, record in enumerate(hosts):
         ip = record["ip"]
         cpe22 = record["os_cpe"]
+        host_is_owned = bool(record["owned"])
         cpe23 = _cpe22_to_23(cpe22)
         if not cpe23:
             # OS family not in ``_OS_CPE_PRODUCTS`` / Windows allowlist
@@ -2274,20 +2336,37 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
             stats["api_calls"] += 1
             cache.put(cache_key, cves)
 
-        if not cves:
+        # Per-host AV:L ownership gate. Cache always carries the full
+        # AV:L+AV:N result for the CPE; the filter happens here at
+        # upsert time so a single NVD-side fetch can serve both owned
+        # and un-owned hosts that share an OS CPE.
+        upsert_cves, av_l_skipped = _filter_host_os_cves_by_ownership(
+            cves, host_is_owned=host_is_owned,
+        )
+        if av_l_skipped > 0:
+            stats["av_l_skipped"] += av_l_skipped
+            stats["av_l_skipped_hosts"] += 1
+
+        if not upsert_cves:
             if progress_callback:
-                progress_callback(idx + 1, total, f"{ip}: 0 CVEs")
+                msg = f"{ip}: 0 CVEs"
+                if av_l_skipped > 0:
+                    msg += f" ({av_l_skipped} AV:L gated by ownership)"
+                progress_callback(idx + 1, total, msg)
             continue
 
         stats["hosts_with_cves"] += 1
-        stats["total_cves_found"] += len(cves)
+        stats["total_cves_found"] += len(upsert_cves)
 
         with get_session() as session:
-            for cve in cves:
+            for cve in upsert_cves:
                 _upsert_host_vulnerability(session, ip, cve)
 
         if progress_callback:
-            progress_callback(idx + 1, total, f"{ip}: {len(cves)} CVEs")
+            msg = f"{ip}: {len(upsert_cves)} CVEs"
+            if av_l_skipped > 0:
+                msg += f" (+{av_l_skipped} AV:L gated by ownership)"
+            progress_callback(idx + 1, total, msg)
 
     return stats
 
