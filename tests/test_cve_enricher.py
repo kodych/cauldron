@@ -18,6 +18,7 @@ from cauldron.ai.cve_enricher import (
     PRODUCT_CPE_MAP,
     _cpe22_to_23,
     _cve_applies_to,
+    _cve_configurations_match,
     _cve_is_av_local,
     _cve_is_dos_only,
     _cve_is_gold,
@@ -29,7 +30,9 @@ from cauldron.ai.cve_enricher import (
     _filter_host_os_cves_by_ownership,
     _get_cpe_for_service,
     _is_pentester_relevant,
+    _normalize_os_family,
     _parse_cve,
+    _running_os_matches_cpe,
     enrich_service,
 )
 
@@ -1824,6 +1827,293 @@ class TestCVEAppliesTo:
             }]
         }
         assert _cve_applies_to(cve, "http_server", "2.4.51") is True
+
+
+class TestNormalizeOSFamily:
+    """OS family normalization for the strict-eval cache key.
+
+    Folding ``cpe:/o:linux:linux_kernel:2.6`` and ``cpe:/o:ubuntu:ubuntu_linux:22.04``
+    both to ``'linux'`` keeps the CVE cache from fragmenting per kernel
+    version. AND-config platform contexts only ever distinguish Linux vs
+    Windows vs hardware vendor, never major.minor.
+    """
+
+    @pytest.mark.parametrize("cpe,expected", [
+        ("cpe:/o:linux:linux_kernel:2.6", "linux"),
+        ("cpe:/o:linux:linux_kernel:5.10", "linux"),
+        ("cpe:/o:redhat:enterprise_linux:8.0", "linux"),
+        ("cpe:/o:canonical:ubuntu_linux:22.04", "linux"),
+        ("cpe:/o:debian:debian_linux:11", "linux"),
+        ("cpe:/o:fedoraproject:fedora:38", "linux"),
+        ("cpe:/o:microsoft:windows_10:1809", "windows"),
+        ("cpe:/o:microsoft:windows_server_2019:-", "windows"),
+        ("cpe:/o:apple:macos:13.0", "macos"),
+        ("cpe:/o:freebsd:freebsd:14.0", "bsd"),
+        ("cpe:/o:openbsd:openbsd:7.3", "bsd"),
+        ("cpe:/o:oracle:solaris:11.4", "solaris"),
+        ("cpe:/o:unknown:weird_os:1.0", "unknown"),
+        (None, "unknown"),
+        ("", "unknown"),
+    ])
+    def test_normalize(self, cpe, expected):
+        assert _normalize_os_family(cpe) == expected
+
+
+class TestRunningOSMatchesCPE:
+    """Platform context evaluator — does our host's os_cpe satisfy a
+    vulnerable=false constraint node from an NVD AND-configuration?"""
+
+    LINUX_2_6 = "cpe:/o:linux:linux_kernel:2.6"
+    WIN_10 = "cpe:/o:microsoft:windows_10:1809"
+
+    def test_os_context_matches_same_family(self):
+        # AND-config saying "running on Windows" — Windows host matches.
+        win_ctx = "cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(win_ctx, self.WIN_10) is True
+
+    def test_os_context_rejects_foreign_family(self):
+        # AND-config saying "running on Windows" — Linux host doesn't.
+        # This is the heart of the mod_isapi rejection.
+        win_ctx = "cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(win_ctx, self.LINUX_2_6) is False
+
+    def test_os_context_matches_linux_distro(self):
+        # NVD encodes Linux contexts as specific distros (RHEL, Debian,
+        # Ubuntu, …). For our coarse family check, the vendor+product
+        # need to appear in the host's os_cpe — kernel-only os_cpe
+        # won't satisfy a "running on RHEL 8" constraint and the
+        # function correctly stays conservative there.
+        linux_ctx = "cpe:2.3:o:linux:linux_kernel:*:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(linux_ctx, self.LINUX_2_6) is True
+
+    def test_hardware_context_rejects_general_host(self):
+        # AND-config requiring a specific NetApp/SonicWall/Fujitsu
+        # appliance — a general-purpose Linux box never matches.
+        # This is what cleanly drops OpenSSH CVEs whose AND-config
+        # is gated by vendor hardware.
+        netapp = "cpe:2.3:h:netapp:cn1610:-:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(netapp, self.LINUX_2_6) is False
+        sonicwall = "cpe:2.3:h:sonicwall:sma_6200:-:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(sonicwall, self.LINUX_2_6) is False
+
+    def test_application_context_defers_to_true(self):
+        # ``part='a'`` context (e.g. "vulnerable when used with OpenSSL")
+        # needs install-level knowledge we don't have. Defer rather than
+        # over-filter.
+        app_ctx = "cpe:2.3:a:openssl:openssl:*:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(app_ctx, self.LINUX_2_6) is True
+
+    def test_unknown_host_os_defers_to_true(self):
+        # When we don't know what the host runs (no nmap -O), strict
+        # eval must never reject — defer to ``True`` so the existing
+        # version-range and AI filters take it from here.
+        win_ctx = "cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"
+        assert _running_os_matches_cpe(win_ctx, None) is True
+
+    def test_malformed_cpe_defers_to_true(self):
+        assert _running_os_matches_cpe("not:a:cpe", self.LINUX_2_6) is True
+        assert _running_os_matches_cpe("", self.LINUX_2_6) is True
+
+
+class TestCVEConfigurationsMatchStrict:
+    """Strict NVD configuration-tree evaluator — full AND/OR/negate semantics.
+
+    The cheap ``_cve_applies_to`` flow handles version-range filtering;
+    this evaluator catches the residue of CVEs whose AND-configs require
+    a platform / hardware context we can't satisfy. Mathematical reject
+    when EVERY top-level configuration unambiguously fails.
+    """
+
+    LINUX_2_6 = "cpe:/o:linux:linux_kernel:2.6"
+    WIN_10 = "cpe:/o:microsoft:windows_10:1809"
+
+    # Fixture: simplified copy of CVE-2010-0425 (mod_isapi). The AND
+    # config requires Apache in range AND running on Windows.
+    CVE_2010_0425_LIKE = {
+        "configurations": [
+            {
+                "operator": "AND",
+                "nodes": [
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": True,
+                                "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                                "versionStartIncluding": "2.0.37",
+                                "versionEndExcluding": "2.0.64",
+                            },
+                        ],
+                    },
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": False,
+                                "criteria": "cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+
+    def test_and_config_with_windows_rejected_on_linux(self):
+        """Apache 2.0.52 on Linux: version matches but Windows-context
+        node fails → AND fails → CVE doesn't apply. The reject Cauldron
+        used to miss."""
+        assert _cve_configurations_match(
+            self.CVE_2010_0425_LIKE, "http_server", "2.0.52", self.LINUX_2_6
+        ) is False
+
+    def test_and_config_with_windows_kept_on_windows(self):
+        """Same Apache 2.0.52 hypothetically running on Windows: both
+        nodes match → AND passes → CVE applies."""
+        assert _cve_configurations_match(
+            self.CVE_2010_0425_LIKE, "http_server", "2.0.52", self.WIN_10
+        ) is True
+
+    def test_and_config_defers_when_host_os_unknown(self):
+        """Unknown platform context must never reject — only the strong
+        Windows-mismatch case rejects mathematically."""
+        assert _cve_configurations_match(
+            self.CVE_2010_0425_LIKE, "http_server", "2.0.52", None
+        ) is True
+
+    def test_and_config_with_version_outside_range_fails(self):
+        """Apache 1.3.x on Windows: version doesn't match the vuln node,
+        so AND fails regardless of platform context."""
+        assert _cve_configurations_match(
+            self.CVE_2010_0425_LIKE, "http_server", "1.3.42", self.WIN_10
+        ) is False
+
+    # Fixture: simple OR-config (Apache 2.4 vulnerable). No platform
+    # context — the kind ``_cve_applies_to`` already handles cleanly.
+    SIMPLE_APACHE_CVE = {
+        "configurations": [
+            {
+                "operator": "OR",
+                "nodes": [
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": True,
+                                "criteria": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+                                "versionStartIncluding": "2.4.0",
+                                "versionEndExcluding": "2.4.49",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+
+    def test_simple_or_config_matches_version_in_range(self):
+        assert _cve_configurations_match(
+            self.SIMPLE_APACHE_CVE, "http_server", "2.4.48", self.LINUX_2_6
+        ) is True
+
+    def test_simple_or_config_rejects_version_out_of_range(self):
+        assert _cve_configurations_match(
+            self.SIMPLE_APACHE_CVE, "http_server", "2.4.50", self.LINUX_2_6
+        ) is False
+
+    # Fixture: multi-config CVE — top-level OR. Config 1 is a flat
+    # OR matching Apache regardless of platform; Config 2 is AND
+    # requiring SonicWall hardware. Linux Apache should KEEP via
+    # Config 1 (top-level OR semantics).
+    MULTI_CONFIG_OR_KEEPS = {
+        "configurations": [
+            {
+                "operator": "OR",
+                "nodes": [
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": True,
+                                "criteria": "cpe:2.3:a:openssh:openssh:*:*:*:*:*:*:*:*",
+                                "versionStartIncluding": "8.5",
+                                "versionEndExcluding": "9.8",
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "operator": "AND",
+                "nodes": [
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": True,
+                                "criteria": "cpe:2.3:a:openssh:openssh:*:*:*:*:*:*:*:*",
+                                "versionStartIncluding": "8.5",
+                                "versionEndExcluding": "9.8",
+                            },
+                        ],
+                    },
+                    {
+                        "operator": "OR",
+                        "negate": False,
+                        "cpeMatch": [
+                            {
+                                "vulnerable": False,
+                                "criteria": "cpe:2.3:h:sonicwall:sma_6200:-:*:*:*:*:*:*:*",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ]
+    }
+
+    def test_multi_config_or_keeps_when_any_matches(self):
+        """OpenSSH 9.0 on Linux: matches the flat OR-config (no platform
+        context), the SonicWall AND-config fails — but top-level OR makes
+        the CVE apply."""
+        assert _cve_configurations_match(
+            self.MULTI_CONFIG_OR_KEEPS, "openssh", "9.0", self.LINUX_2_6
+        ) is True
+
+    def test_multi_config_rejects_when_no_config_matches(self):
+        """OpenSSH 3.9p1 on Linux: version doesn't match the OR-config's
+        range (8.5..9.8), the SonicWall AND-config also fails → all
+        configs fail → reject."""
+        assert _cve_configurations_match(
+            self.MULTI_CONFIG_OR_KEEPS, "openssh", "3.9p1", self.LINUX_2_6
+        ) is False
+
+    def test_no_configurations_defers_to_true(self):
+        """A CVE without ``configurations`` (description-only) must
+        defer — the description-based match path owns it."""
+        assert _cve_configurations_match(
+            {"id": "CVE-X"}, "anything", "1.0", self.LINUX_2_6
+        ) is True
+
+    def test_empty_configurations_defers_to_true(self):
+        assert _cve_configurations_match(
+            {"configurations": []}, "anything", "1.0", self.LINUX_2_6
+        ) is True
+
+    def test_unknown_host_never_over_filters(self):
+        """The strict eval must never reject when host context is
+        unknown — that would over-filter on every host with no
+        ``-O`` scan. Defer to ``_cve_applies_to``."""
+        # Apache 2.0.52 + mod_isapi-like config + unknown host →
+        # version matches, platform context defers to True → CVE kept.
+        assert _cve_configurations_match(
+            self.CVE_2010_0425_LIKE, "http_server", "2.0.52", None
+        ) is True
 
 
 class TestExecuteNVDRetry:

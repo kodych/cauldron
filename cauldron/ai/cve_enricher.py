@@ -1170,6 +1170,7 @@ def _query_nvd_cpe(
     cpe23: str,
     service_version_override: str | None = None,
     host_os: bool = False,
+    host_os_cpe: str | None = None,
 ) -> list[CVEInfo] | None:
     """Query NVD API using CPE-based virtualMatchString.
 
@@ -1194,6 +1195,11 @@ def _query_nvd_cpe(
             the gold filter so AV:L kernel privesc CVEs survive — the
             host-OS pipeline exists precisely to surface them, since
             no service-level CPE exposes them.
+        host_os_cpe: The hosting box's OS CPE (CPE 2.2 or 2.3 form)
+            used by the strict configuration-tree evaluator. For
+            service-level enrichment this is the host that runs the
+            service; for host-OS enrichment it's the same CPE we're
+            querying. When ``None`` the strict eval defers.
 
     Returns None if CPE is not recognized by NVD (404), signaling
     the caller to try keyword fallback.
@@ -1240,11 +1246,17 @@ def _query_nvd_cpe(
     # applicability indefinitely).
     is_os_cpe = len(parts) > 2 and parts[2] == "o"
 
+    # For host-OS queries the queried CPE IS the host's OS — use it as
+    # platform context too. For service queries the caller threads the
+    # host's os_cpe in via ``host_os_cpe``.
+    effective_platform = host_os_cpe or (cpe23 if is_os_cpe else None)
+
     cves = _execute_nvd_query(
         url, f"CPE:{cpe23}",
         version_hint=version_hint,
         version_applies_product=applies_product,
         os_cpe=is_os_cpe,
+        host_os_cpe=effective_platform,
     )
 
     # None = 404 (CPE not in NVD) — signal caller to try keyword fallback
@@ -1283,7 +1295,9 @@ def _query_nvd_cpe(
     return cves[:20 if has_version else 50]
 
 
-def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
+def _query_nvd_keyword(
+    product: str, version: str, host_os_cpe: str | None = None,
+) -> list[CVEInfo]:
     """Query NVD API using keywordSearch (fallback, less precise).
 
     Validates results against CVE's CPE configurations to ensure the CVE
@@ -1294,6 +1308,10 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
     query we drop ``keywordExactMatch`` to allow vendor-only searches (e.g.
     "Veeam Backup" finding CVEs assigned to full "Veeam Backup & Replication"
     products); the pentester CWE filter + severity sort compensates.
+
+    ``host_os_cpe`` flows into the strict configuration-tree evaluator so
+    keyword-search results also benefit from AND-config / platform-context
+    rejection.
     """
     _rate_limit()
 
@@ -1308,6 +1326,7 @@ def _query_nvd_keyword(product: str, version: str) -> list[CVEInfo]:
         url, f"keyword:{keyword}",
         product_hint=product,
         version_hint=version if not versionless else None,
+        host_os_cpe=host_os_cpe,
     ) or []
 
     # Same two-stage filter as the CPE path — coarse CWE+pattern relevance,
@@ -1330,6 +1349,7 @@ def _execute_nvd_query(
     version_hint: str | None = None,
     version_applies_product: str | None = None,
     os_cpe: bool = False,
+    host_os_cpe: str | None = None,
     _retries: int = 0,
 ) -> list[CVEInfo] | None:
     """Execute NVD API request and parse results.
@@ -1351,6 +1371,13 @@ def _execute_nvd_query(
             CPE-query path sets this without the substring filter because
             NVD already constrained product server-side — we only need
             to validate the version range.
+        host_os_cpe: Host's OS CPE (CPE 2.2 or 2.3 form) used by the
+            strict configuration-tree evaluator to reject CVEs whose
+            NVD AND-configs require a platform context our host doesn't
+            satisfy (e.g. mod_isapi requires Microsoft Windows; a
+            general-purpose Linux box can never match). When ``None``
+            the strict eval defers — it never over-filters on missing
+            context.
         _retries: Internal retry counter (max 2 retries on 403).
 
     Returns:
@@ -1395,7 +1422,7 @@ def _execute_nvd_query(
             time.sleep(backoff)
             return _execute_nvd_query(
                 url, context, product_hint, version_hint, version_applies_product,
-                os_cpe, _retries + 1,
+                os_cpe, host_os_cpe, _retries + 1,
             )
         logger.error(
             "NVD IncompleteRead for %s after %d retries (%d bytes) — not cacheable",
@@ -1415,7 +1442,7 @@ def _execute_nvd_query(
             time.sleep(backoff)
             return _execute_nvd_query(
                 url, context, product_hint, version_hint, version_applies_product,
-                os_cpe, _retries + 1,
+                os_cpe, host_os_cpe, _retries + 1,
             )
         if e.code == 404:
             logger.info("NVD CPE not found (404) for %s — will try keyword fallback", context)
@@ -1437,7 +1464,7 @@ def _execute_nvd_query(
             time.sleep(backoff)
             return _execute_nvd_query(
                 url, context, product_hint, version_hint, version_applies_product,
-                os_cpe, _retries + 1,
+                os_cpe, host_os_cpe, _retries + 1,
             )
         logger.error("NVD API request failed for %s after %d retries: %s", context, _NVD_RETRY_BUDGET, e)
         raise NvdTransientError(f"NVD unreachable for {context}: {e}") from e
@@ -1470,6 +1497,18 @@ def _execute_nvd_query(
         ):
             continue
 
+        # Strict configuration-tree evaluation. ``_cve_applies_to`` checked
+        # that the version-range alone fits; this layer verifies the full
+        # AND/OR/negate/vulnerable-flag structure of NVD's configurations.
+        # Catches CVEs whose AND-configs require a platform/hardware context
+        # that our host can never satisfy (mod_isapi requiring Windows; an
+        # OpenSSH bug gated by SonicWall/NetApp appliance). Defers when
+        # host_os_cpe is unknown — never over-filters on missing context.
+        if applies_product and not _cve_configurations_match(
+            cve_data, applies_product, version_hint, host_os_cpe,
+        ):
+            continue
+
         cve = _parse_cve(cve_data)
         if cve:
             cves.append(cve)
@@ -1494,6 +1533,234 @@ def _iter_matching_cpe_entries(cve_data: dict, product_lower: str):
                 criteria = match.get("criteria", "")
                 if _cpe_matches_product(criteria, product_lower):
                     yield match
+
+
+# ---------------------------------------------------------------------------
+# Strict NVD configuration-tree evaluation
+# ---------------------------------------------------------------------------
+#
+# ``_cve_applies_to`` (above) handles the common case: does our service version
+# fall in the cpeMatch range for our product? But NVD encodes a richer truth
+# in ``configurations[]``: AND/OR operators, ``vulnerable: true|false`` per
+# match, ``negate`` on nodes. The flat per-product version-range check
+# silently drops every constraint that involves the *running environment*
+# rather than just the product version.
+#
+# Concrete miss: CVE-2010-0425 (mod_isapi) ships an AND-config that says
+# "vulnerable Apache 2.0.37..2.0.64 AND running on Microsoft Windows". A
+# Linux Apache 2.0.52 install hits the first node (version in range) and
+# Cauldron stops there — but the AND requires the Windows node too, which
+# never matches Linux. The CVE is mathematically inapplicable and we used
+# to attach it anyway.
+#
+# The helpers below evaluate the configuration tree strictly. They are an
+# ADDITIVE filter on top of ``_cve_applies_to``: a CVE that already passed
+# the version-range gate must also satisfy at least one top-level config
+# under proper AND/OR/negate semantics. When the platform context is
+# unknown (no os_cpe on the host), the check defers — we cannot prove
+# rejection, so we keep the finding for the existing filters to handle.
+
+
+def _cpe_parts(cpe: str) -> tuple[str, str, str, str, str, str] | None:
+    """Split a CPE 2.3 criteria string into ``(part, vendor, product, version,
+    update, target_sw)``. Returns ``None`` on malformed input."""
+    parts = cpe.lower().split(":")
+    if len(parts) < 11:
+        return None
+    return (parts[2], parts[3], parts[4], parts[5], parts[6], parts[10])
+
+
+def _running_os_matches_cpe(criteria: str, our_os_cpe: str | None) -> bool:
+    """True if our scanned host's OS (``our_os_cpe``) plausibly satisfies the
+    given CPE criteria string. Used to evaluate AND-config *context* nodes
+    that constrain "running on platform X".
+
+    Conservative defaults — we only reject when the platform mismatch is
+    unambiguous; ambiguous cases (unknown host OS, application-level
+    contexts we can't verify) defer to ``True``:
+
+    - ``part='o'`` (OS context): matches when the criteria's vendor and
+      product appear in our os_cpe. ``cpe:/o:microsoft:windows:-`` is rejected
+      by a Linux host because neither "microsoft" nor "windows" appear in
+      ``cpe:/o:linux:linux_kernel:2.6``.
+    - ``part='h'`` (hardware context): only matches when our os_cpe (rare)
+      explicitly references the same vendor/product. A Linux host running on
+      generic x86 never matches a SonicWall / NetApp / Fujitsu hardware
+      criteria — this is where AND-configs for vendor-specific appliances
+      cleanly drop on a general-purpose box.
+    - ``part='a'`` (application context, e.g. "vulnerable when used with
+      Apache"): defers to ``True``. The scan may have the app installed
+      under a different banner; rejecting on app-context would generate
+      false negatives we can't recover from.
+    - Unknown ``part`` / malformed CPE: defers to ``True``.
+    """
+    cpe_parts = _cpe_parts(criteria)
+    if cpe_parts is None:
+        return True
+    part, vendor, product, _ver, _update, _target_sw = cpe_parts
+
+    if part == "a":
+        # Application-context constraints (e.g. "vulnerable when used with
+        # OpenSSL") need install-level knowledge we don't have at NVD-query
+        # time. Defer to the version-range filter and AI Phase 3.
+        return True
+
+    if our_os_cpe is None:
+        # No host OS context — can't prove a mismatch, must defer.
+        return True
+
+    our = our_os_cpe.lower()
+
+    if part == "o":
+        # OS context: the criteria's vendor and product must appear in our
+        # os_cpe. ``cpe:/o:linux:linux_kernel`` is matched by a context CPE
+        # like ``cpe:2.3:o:linux:linux_kernel:*`` but not by
+        # ``cpe:2.3:o:microsoft:windows:-``.
+        return vendor in our and product in our
+
+    if part == "h":
+        # Hardware context (router / appliance / NAS): only matches when
+        # the same hardware vendor+product appears in our os_cpe. General-
+        # purpose Linux/Windows hosts never carry that info, so AND-configs
+        # gated by ``h:netapp:cn1610`` etc. fail cleanly.
+        return vendor in our and product in our
+
+    return True
+
+
+def _evaluate_config_node(
+    node: dict,
+    product_lower: str | None,
+    version: str | None,
+    our_os_cpe: str | None,
+) -> bool:
+    """Evaluate a single configuration node against our scan context.
+
+    A node is a list of ``cpeMatch`` entries joined by OR (one-of). The
+    ``negate`` flag inverts the result.
+
+    Each cpeMatch entry is one of two kinds:
+
+    - ``vulnerable: true`` — describes the vulnerable software. Matches
+      when criteria.product equals our product and our version falls in
+      the entry's range (or matches the entry's pinned version).
+    - ``vulnerable: false`` — describes the running environment context.
+      Matches when our host's OS plausibly satisfies the criteria
+      (``_running_os_matches_cpe``).
+
+    We default to a permissive match (return True) when the scan context
+    is incomplete — strict eval is meant to *reject*, never to over-filter
+    a finding the cheaper checks already kept.
+    """
+    for match in node.get("cpeMatch", []):
+        criteria = match.get("criteria", "")
+        is_vuln_entry = match.get("vulnerable", True)
+
+        if is_vuln_entry:
+            if product_lower and _cpe_matches_product(criteria, product_lower):
+                if version:
+                    if _cpe_entry_version_in_range(match, version):
+                        return not node.get("negate", False)
+                else:
+                    if not _cpe_entry_has_version_constraint(match):
+                        return not node.get("negate", False)
+            # Vuln entry that doesn't match our product — keep scanning the
+            # other entries in this node.
+            continue
+
+        # Context (vulnerable=false) entry — match against host OS.
+        if _running_os_matches_cpe(criteria, our_os_cpe):
+            return not node.get("negate", False)
+
+    return node.get("negate", False)
+
+
+def _evaluate_top_config(
+    config: dict,
+    product_lower: str | None,
+    version: str | None,
+    our_os_cpe: str | None,
+) -> bool:
+    """Evaluate one top-level configuration entry.
+
+    Nodes are combined according to the config's ``operator`` field
+    (``AND`` or ``OR``, defaulting to ``OR``).
+    """
+    nodes = config.get("nodes", [])
+    if not nodes:
+        return True  # malformed config — defer
+    op = config.get("operator", "OR")
+    if op == "AND":
+        return all(
+            _evaluate_config_node(n, product_lower, version, our_os_cpe)
+            for n in nodes
+        )
+    return any(
+        _evaluate_config_node(n, product_lower, version, our_os_cpe)
+        for n in nodes
+    )
+
+
+def _normalize_os_family(os_cpe: str | None) -> str:
+    """Collapse an os_cpe (CPE 2.2 or 2.3 form) into a coarse family token.
+
+    The strict configuration-tree evaluator only needs the OS family to
+    answer "could this platform-context node match?"; AND-config nodes
+    distinguish Linux vs Windows vs hardware-vendor, never major-minor
+    kernel version. Folding "Linux 2.6" / "Linux 5.10" / "Ubuntu 22" all
+    to ``'linux'`` keeps the CVE cache from fragmenting per-kernel-version
+    while still letting us reject Windows-only AND-configs on Linux hosts.
+
+    Returns ``'unknown'`` when the CPE doesn't carry enough info — the
+    strict eval defers in that case.
+    """
+    if not os_cpe:
+        return "unknown"
+    c = os_cpe.lower()
+    if "linux" in c or "fedora" in c or "debian" in c or "ubuntu" in c or "redhat" in c or "rhel" in c or "centos" in c:
+        return "linux"
+    if "windows" in c or "microsoft" in c:
+        return "windows"
+    if "macos" in c or "mac_os" in c or "darwin" in c or "apple" in c:
+        return "macos"
+    if "bsd" in c:
+        return "bsd"
+    if "solaris" in c or "sunos" in c:
+        return "solaris"
+    return "unknown"
+
+
+def _cve_configurations_match(
+    cve_data: dict,
+    product_lower: str | None,
+    version: str | None,
+    our_os_cpe: str | None,
+) -> bool:
+    """Strict mathematical applicability check against NVD's configuration tree.
+
+    Returns False ONLY when every top-level configuration unambiguously
+    fails to match our scan context — that proves the CVE cannot apply.
+    Returns True when at least one configuration matches OR when ambiguity
+    prevents proof of rejection (no configurations on the CVE, unknown
+    host platform, application-context constraints we can't verify, etc.).
+
+    The top level of ``configurations[]`` is OR — a CVE applies if ANY
+    top-level config matches. Per-config AND/OR is handled by
+    ``_evaluate_top_config``.
+
+    This is layered on top of ``_cve_applies_to``: cheap version-range
+    filtering catches most noise, then strict eval rejects the residue of
+    CVEs whose AND-configs require a platform / hardware context we don't
+    satisfy (Apache mod_isapi requiring Windows, OpenSSH CVE gated by a
+    specific NetApp appliance, etc.).
+    """
+    configs = cve_data.get("configurations", [])
+    if not configs:
+        return True  # description-based match owns this case
+    return any(
+        _evaluate_top_config(cfg, product_lower, version, our_os_cpe)
+        for cfg in configs
+    )
 
 
 def _cpe_entry_has_version_constraint(match: dict) -> bool:
@@ -1893,6 +2160,7 @@ def enrich_service(
     cpe_list: list[str] | None = None,
     extra_info: str | None = None,
     script_outputs: list[str] | None = None,
+    host_os_cpe: str | None = None,
 ) -> EnrichmentResult:
     """Find CVEs for a specific service.
 
@@ -1911,6 +2179,10 @@ def enrich_service(
             that doesn't reach the structured product/version fields.
         script_outputs: NSE script outputs for this service (e.g.
             http-server-header), used to extract sub-product tokens.
+        host_os_cpe: Hosting box's OS CPE, threaded into the strict
+            configuration-tree evaluator so service-level CVEs with
+            AND-config / platform-context constraints can be rejected
+            mathematically.
 
     Returns:
         EnrichmentResult with found CVEs.
@@ -1932,11 +2204,15 @@ def enrich_service(
     # Cache key. Multi-candidate services pin to the full sorted candidate
     # list so re-runs with the same nmap data hit cache, but a service that
     # gains an extra sub-product (e.g. operator added http-server-header to
-    # the scan) doesn't read a stale empty list from before.
+    # the scan) doesn't read a stale empty list from before. The host's OS
+    # family is appended so strict-eval rejection (Apache mod_isapi on a
+    # Linux host vs Windows host) doesn't share a cache slot between
+    # platforms that get different filter results.
+    os_family = _normalize_os_family(host_os_cpe)
     if candidates:
-        cache_key = "+".join(sorted(candidates))
+        cache_key = "+".join(sorted(candidates)) + f"|os={os_family}"
     else:
-        cache_key = f"kw:{product.lower().strip()}:{(version or '').lower().strip()}"
+        cache_key = f"kw:{product.lower().strip()}:{(version or '').lower().strip()}|os={os_family}"
 
     cached = cache.get(cache_key)
     if cached is not None:
@@ -1952,7 +2228,9 @@ def enrich_service(
         if candidates:
             unioned: dict[str, CVEInfo] = {}
             for cpe23 in candidates:
-                cpe_result = _query_nvd_cpe(cpe23, service_version_override=version)
+                cpe_result = _query_nvd_cpe(
+                    cpe23, service_version_override=version, host_os_cpe=host_os_cpe,
+                )
                 if cpe_result is None:
                     # NVD 404 on this CPE -- skip silently. Other candidates
                     # may still resolve. We try keyword fallback only when
@@ -1965,7 +2243,9 @@ def enrich_service(
                     # honest -- see _query_nvd_cpe docstring.
                     relaxed = _relax_cpe_version(cpe23)
                     if relaxed and relaxed != cpe23:
-                        cpe_result = _query_nvd_cpe(relaxed, service_version_override=version) or []
+                        cpe_result = _query_nvd_cpe(
+                            relaxed, service_version_override=version, host_os_cpe=host_os_cpe,
+                        ) or []
                 for cve in cpe_result:
                     if cve.cve_id not in unioned:
                         unioned[cve.cve_id] = cve
@@ -1981,11 +2261,11 @@ def enrich_service(
                     "All %d CPE candidates returned empty for %s, trying keyword %s %s",
                     len(candidates), product, product, clean_ver,
                 )
-                cves = _query_nvd_keyword(product, clean_ver)
+                cves = _query_nvd_keyword(product, clean_ver, host_os_cpe=host_os_cpe)
         elif version:
             clean_ver = _extract_version(version)
             if clean_ver != "*":
-                cves = _query_nvd_keyword(product, clean_ver)
+                cves = _query_nvd_keyword(product, clean_ver, host_os_cpe=host_os_cpe)
             else:
                 return EnrichmentResult(product=product, version=version or "", error="No parseable version")
         else:
@@ -2064,6 +2344,7 @@ def enrich_services_from_graph(
             AND NOT (s)-[:HAS_VULN]->(:Vulnerability {source: 'nvd'})
             RETURN
                 h.ip AS host_ip,
+                h.os_cpe AS host_os_cpe,
                 s.port AS port,
                 s.protocol AS protocol,
                 s.product AS product,
@@ -2076,7 +2357,7 @@ def enrich_services_from_graph(
 
         services = [
             (
-                r["host_ip"], r["port"], r["protocol"],
+                r["host_ip"], r["host_os_cpe"], r["port"], r["protocol"],
                 r["product"], r["version"], r["cpe"],
                 r["extra_info"], r["script_outputs"] or [],
             )
@@ -2089,23 +2370,32 @@ def enrich_services_from_graph(
     # candidate list (including resolved sub-products), so two services
     # with the same primary CPE but different sub-products (mod_ssl on
     # one, not on the other) get separate NVD passes.
+    # Normalize host OS CPE to a coarse family ('linux' / 'windows' / 'macos'
+    # / 'unknown'). The strict configuration-tree filter only needs the OS
+    # family to evaluate AND-config platform contexts — splitting at major-
+    # version granularity would explode cache cardinality without changing
+    # the rejection outcome (an AND-config requiring Windows fails for any
+    # Linux distro identically). Hosts with no os_cpe end up under
+    # ``'unknown'``: the strict eval defers there, same as before.
     from collections import defaultdict
     groups: dict[str, dict] = defaultdict(lambda: {"endpoints": [], "rep": None})
-    for host_ip, port, protocol, product, version, cpe_str, extra_info, script_outputs in services:
+    for (host_ip, host_os_cpe, port, protocol, product, version, cpe_str,
+         extra_info, script_outputs) in services:
         cpe_list = cpe_str.split(";") if cpe_str else []
         candidates = _build_cpe_candidates(
             cpe_list, product, version, extra_info=extra_info, script_outputs=script_outputs,
         )
+        os_family = _normalize_os_family(host_os_cpe)
         if candidates:
-            key = "+".join(sorted(candidates))
+            key = "+".join(sorted(candidates)) + f"|os={os_family}"
         else:
-            key = f"kw:{(product or '').lower()}:{(version or '').lower()}"
+            key = f"kw:{(product or '').lower()}:{(version or '').lower()}|os={os_family}"
         groups[key]["endpoints"].append((host_ip, port, protocol))
         if groups[key]["rep"] is None:
-            groups[key]["rep"] = (product, version, cpe_list, extra_info, script_outputs)
+            groups[key]["rep"] = (product, version, cpe_list, extra_info, script_outputs, host_os_cpe)
 
     unique_services = [
-        (g["rep"][0], g["rep"][1], g["rep"][2], g["rep"][3], g["rep"][4], g["endpoints"])
+        (g["rep"][0], g["rep"][1], g["rep"][2], g["rep"][3], g["rep"][4], g["rep"][5], g["endpoints"])
         for g in groups.values()
     ]
 
@@ -2116,7 +2406,7 @@ def enrich_services_from_graph(
     )
 
     total = len(unique_services)
-    for idx, (product, version, cpe_list, extra_info, script_outputs, endpoints) in enumerate(unique_services, 1):
+    for idx, (product, version, cpe_list, extra_info, script_outputs, host_os_cpe, endpoints) in enumerate(unique_services, 1):
         stats["services_checked"] += 1
         if progress_callback:
             label = f"{product or '?'}{(' ' + version) if version else ''}"
@@ -2127,6 +2417,7 @@ def enrich_services_from_graph(
         enrichment = enrich_service(
             product or "", version or "", cache, cpe_list,
             extra_info=extra_info, script_outputs=script_outputs,
+            host_os_cpe=host_os_cpe,
         )
 
         if enrichment.error:
