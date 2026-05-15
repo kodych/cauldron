@@ -90,6 +90,13 @@ class ServiceOut(BaseModel):
 class VulnOut(BaseModel):
     cve_id: str
     cvss: float = 0.0
+    # Raw CVSS vector string (e.g. ``CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H``).
+    # The UI parses ``AV:L`` out to surface an LPE badge on post-foothold
+    # findings — kernel privesc and other AV:L CVEs only become actionable
+    # after Mark-as-Owned, and the badge tells the operator at a glance
+    # which entries in the list belong to that "what next, after shell"
+    # category vs the external attack surface above.
+    cvss_vector: str | None = None
     has_exploit: bool = False
     exploit_url: str | None = None
     # ``+``-joined set of channels confirming public-exploit availability
@@ -341,6 +348,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         confidence=v.get("confidence") or "check",
         description=v.get("description"),
         enables_pivot=v.get("enables_pivot"),
+        cvss_vector=v.get("cvss_vector"),
         checked_status=v.get("checked_status"),
         ai_fp_reason=v.get("ai_fp_reason"),
         fp_source=v.get("fp_source"),
@@ -529,7 +537,7 @@ def list_hosts(
                      first_seen: s.first_seen, last_seen: s.last_seen
                  }}) AS services,
                  collect(DISTINCT {{
-                     cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
+                     cve_id: v.cve_id, cvss: v.cvss, cvss_vector: v.cvss_vector, has_exploit: v.has_exploit,
                      exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                      exploit_sources: coalesce(v.exploit_sources, ''),
                      confidence: coalesce(r.confidence, 'check'), description: v.description,
@@ -551,7 +559,7 @@ def list_hosts(
             OPTIONAL MATCH (h)-[hr:HAS_VULN]->(hv:Vulnerability)
             WITH h, seg, source_first, source_latest, is_pivot, services, svc_vulns,
                  collect(DISTINCT {{
-                     cve_id: hv.cve_id, cvss: hv.cvss, has_exploit: hv.has_exploit,
+                     cve_id: hv.cve_id, cvss: hv.cvss, cvss_vector: hv.cvss_vector, has_exploit: hv.has_exploit,
                      exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
                      exploit_sources: coalesce(hv.exploit_sources, ''),
                      confidence: coalesce(hr.confidence, 'check'), description: hv.description,
@@ -647,7 +655,7 @@ def get_host(ip: str):
                      first_seen: s.first_seen, last_seen: s.last_seen
                  }) AS services,
                  collect(DISTINCT {
-                     cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
+                     cve_id: v.cve_id, cvss: v.cvss, cvss_vector: v.cvss_vector, has_exploit: v.has_exploit,
                      exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                      exploit_sources: coalesce(v.exploit_sources, ''),
                      confidence: coalesce(r.confidence, 'check'), description: v.description,
@@ -665,7 +673,7 @@ def get_host(ip: str):
             OPTIONAL MATCH (h)-[hr:HAS_VULN]->(hv:Vulnerability)
             WITH h, seg, source_first, source_latest, is_pivot, services, svc_vulns,
                  collect(DISTINCT {
-                     cve_id: hv.cve_id, cvss: hv.cvss, has_exploit: hv.has_exploit,
+                     cve_id: hv.cve_id, cvss: hv.cvss, cvss_vector: hv.cvss_vector, has_exploit: hv.has_exploit,
                      exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
                      exploit_sources: coalesce(hv.exploit_sources, ''),
                      confidence: coalesce(hr.confidence, 'check'), description: hv.description,

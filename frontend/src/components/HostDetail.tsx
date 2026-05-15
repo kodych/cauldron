@@ -734,6 +734,55 @@ function VulnRow({ vuln, edges, hostIp, onUpdated }: {
             <Badge tone="red">EXPLOIT</Badge>
           </span>
         )}
+        {/* MSF / EDB chip — single signal that a ready-to-run module or
+            PoC exists in a canonical public catalogue, not just an
+            NVD-tagged reference. MSF wins when both are present (a
+            Metasploit module is the strongest "copy-paste ready" signal
+            for a pentester); falls back to EDB when only ExploitDB
+            indexed the CVE. NVD-tagged exploits get no extra chip —
+            the EXPLOIT badge already covers that case and a third pill
+            saying "nvd" alongside the source-line ``nvd`` token would
+            be the kind of duplication the operator already cut. */}
+        {(() => {
+          const sources = (vuln.exploit_sources ?? '').split('+').filter(Boolean);
+          if (sources.includes('metasploit')) {
+            return (
+              <span className="shrink-0">
+                <Badge tone="red" title="Metasploit Framework module available — exploit/...">
+                  MSF
+                </Badge>
+              </span>
+            );
+          }
+          if (sources.includes('exploitdb')) {
+            return (
+              <span className="shrink-0">
+                <Badge tone="red" title="Indexed in ExploitDB — searchsploit will find a PoC">
+                  EDB
+                </Badge>
+              </span>
+            );
+          }
+          return null;
+        })()}
+        {/* LPE badge — AV:L (local attack vector) findings only become
+            actionable after Mark-as-Owned. The badge lets the operator
+            tell at a glance which entries belong to the "post-foothold
+            escalation backlog" category (kernel privesc on Linux,
+            service-binary-path / token-impersonation on Windows) vs
+            the network attack surface above. Hidden on FP'd rows
+            because triaged-out findings shouldn't compete for the
+            visual budget of active ones. */}
+        {vuln.cvss_vector?.includes('AV:L') && vuln.checked_status !== 'false_positive' && (
+          <span className="shrink-0">
+            <Badge
+              tone="purple"
+              title="Local attack vector — requires shell on this host. Becomes actionable after Mark-as-Owned (kernel privesc, post-exploitation escalation)."
+            >
+              LPE
+            </Badge>
+          </span>
+        )}
         {vuln.epss != null && vuln.epss >= 0.1 && (
           <span className="shrink-0">
             <Badge

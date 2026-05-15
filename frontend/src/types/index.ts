@@ -31,6 +31,11 @@ export interface ServiceOut {
 export interface VulnOut {
   cve_id: string;
   cvss: number;
+  // Raw CVSS vector. UI parses ``AV:L`` to render an LPE badge on
+  // post-foothold findings (kernel privesc and friends that only
+  // become actionable after Mark-as-Owned), parses ``AV:N`` for
+  // external attack surface ordering, etc.
+  cvss_vector: string | null;
   has_exploit: boolean;
   exploit_url: string | null;
   exploit_module: string | null;
