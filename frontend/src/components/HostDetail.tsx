@@ -989,7 +989,13 @@ function VulnRow({ vuln, edges, hostIp, onUpdated }: {
  * ``[:HAS_VULN]`` relationship, each with independent status buttons.
  * The clear-status button (when status is set) and the ✓/⊘ buttons
  * fire immediately; the × FP button routes through the parent's
- * modal so a reason can be required. */
+ * modal so a reason can be required. Reason text (when present)
+ * renders on its own indented line below the port row so a long
+ * AI-triage explanation can wrap freely without pushing the action
+ * buttons off-screen. Status is implicit: the active button is
+ * highlighted in its colour, plus the port label strikes through
+ * when FP'd — operator complaint that an explicit "FALSE POSITIVE"
+ * label next to a "Reason:" prefix was duplicate signalling. */
 function EdgeStatusRow({
   edge,
   updating,
@@ -1004,78 +1010,73 @@ function EdgeStatusRow({
   const status = edge.checked_status || null;
   const portLabel = edge.port == null ? 'OS' : `:${edge.port}`;
   return (
-    <div className="px-2 py-1 flex items-center gap-2">
-      <span
-        className={`font-mono text-[11px] shrink-0 min-w-[3rem] ${
-          edge.port == null
-            ? 'text-indigo-300/80'
-            : status === 'false_positive'
-              ? 'text-gray-600 line-through decoration-gray-600'
-              : 'text-gray-400'
-        }`}
-        title={edge.port == null ? 'Host-OS edge — kernel/OS-wide finding' : `Port ${edge.port}`}
-      >
-        {portLabel}
-      </span>
-      {status && (
+    <div className="px-2 py-1">
+      <div className="flex items-center gap-2">
         <span
-          className="text-[10px] uppercase tracking-wide font-semibold shrink-0"
-          style={{
-            color: STATUS_OPTIONS.find(o => o.value === status)?.color ?? '#9ca3af',
-          }}
+          className={`font-mono text-[11px] shrink-0 min-w-[3rem] ${
+            edge.port == null
+              ? 'text-indigo-300/80'
+              : status === 'false_positive'
+                ? 'text-gray-600 line-through decoration-gray-600'
+                : 'text-gray-400'
+          }`}
+          title={edge.port == null ? 'Host-OS edge — kernel/OS-wide finding' : `Port ${edge.port}`}
         >
-          {STATUS_OPTIONS.find(o => o.value === status)?.label ?? status}
+          {portLabel}
         </span>
-      )}
-      {edge.ai_fp_reason && (
-        // Label depends on who entered the reason:
-        //   - AI Phase 3 triage → "AI: …" (yellow italic, operator may want to spot-check)
-        //   - operator FP modal → "Reason: …" (no source attribution)
-        //   - legacy edges without ``fp_source`` → "Reason: …" (we can't claim AI authored it)
+        <span className="flex-1" />
         <span
-          className={`text-[11px] italic truncate flex-1 min-w-0 ${
+          className="flex items-stretch shrink-0 rounded border border-gray-700 overflow-hidden divide-x divide-gray-700"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {STATUS_OPTIONS.map((opt) => {
+            const isActive = status === opt.value;
+            return (
+              <button
+                key={opt.value}
+                disabled={updating}
+                onClick={() => {
+                  if (opt.value === 'false_positive' && status !== 'false_positive') {
+                    onOpenFpModal();
+                  } else {
+                    // Toggle off if already in this state; otherwise set
+                    // to new state. Clearing FP needs no reason.
+                    onApplyStatus(isActive ? null : opt.value);
+                  }
+                }}
+                title={isActive ? `Clear ${opt.label}` : `Mark ${portLabel} as ${opt.label}`}
+                className={`flex items-center px-1.5 py-0.5 transition-colors ${
+                  isActive
+                    ? 'font-semibold'
+                    : 'text-gray-400 hover:bg-gray-800 hover:text-gray-100'
+                }`}
+                style={isActive
+                  ? { color: opt.color, backgroundColor: opt.color + '22' }
+                  : undefined}
+              >
+                {opt.icon}
+              </button>
+            );
+          })}
+        </span>
+      </div>
+      {edge.ai_fp_reason && (
+        // Reason text on its own line below the port row. Wrap freely
+        // (``break-words`` handles long URLs / lorem-ipsum paragraphs
+        // that an earlier ``truncate`` was clipping). Label prefix
+        // signals authorship: "AI: …" (yellow) for AI Phase 3,
+        // "Reason: …" (gray) for operator-entered or legacy edges.
+        <p
+          className={`mt-0.5 pl-[3rem] text-[11px] italic break-words ${
             edge.fp_source === 'ai' ? 'text-yellow-600/80' : 'text-gray-400/80'
           }`}
-          title={edge.ai_fp_reason}
         >
-          {edge.fp_source === 'ai' ? 'AI: ' : 'Reason: '}{edge.ai_fp_reason}
-        </span>
+          <span className="font-semibold not-italic mr-1 text-gray-500">
+            {edge.fp_source === 'ai' ? 'AI:' : 'Reason:'}
+          </span>
+          {edge.ai_fp_reason}
+        </p>
       )}
-      {!edge.ai_fp_reason && <span className="flex-1" />}
-      <span
-        className="flex items-stretch shrink-0 rounded border border-gray-700 overflow-hidden divide-x divide-gray-700"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {STATUS_OPTIONS.map((opt) => {
-          const isActive = status === opt.value;
-          return (
-            <button
-              key={opt.value}
-              disabled={updating}
-              onClick={() => {
-                if (opt.value === 'false_positive' && status !== 'false_positive') {
-                  onOpenFpModal();
-                } else {
-                  // Toggle off if already in this state; otherwise set
-                  // to new state. Clearing FP needs no reason.
-                  onApplyStatus(isActive ? null : opt.value);
-                }
-              }}
-              title={isActive ? `Clear ${opt.label}` : `Mark ${portLabel} as ${opt.label}`}
-              className={`flex items-center px-1.5 py-0.5 transition-colors ${
-                isActive
-                  ? 'font-semibold'
-                  : 'text-gray-400 hover:bg-gray-800 hover:text-gray-100'
-              }`}
-              style={isActive
-                ? { color: opt.color, backgroundColor: opt.color + '22' }
-                : undefined}
-            >
-              {opt.icon}
-            </button>
-          );
-        })}
-      </span>
     </div>
   );
 }
