@@ -660,9 +660,13 @@ class TestEnrichService:
         assert result.error is not None
 
     def test_cpe_used_for_cache_key(self, tmp_path: Path):
-        """When CPE is available, it should be the cache key."""
+        """When CPE is available, it should be the cache key. The host-OS
+        family suffix (``|os=unknown`` when no host context threaded in)
+        is part of the key — different platforms can yield different
+        strict-eval verdicts for the same product+version, so they live
+        in separate cache slots."""
         cache = CVECache(tmp_path / "cache.json")
-        cpe_key = "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"
+        cpe_key = "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*|os=unknown"
         cache.put(cpe_key, [CVEInfo(cve_id="CVE-2021-41773", cvss=7.5)])
 
         result = enrich_service("Apache httpd", "2.4.49", cache, cpe_list=["cpe:/a:apache:http_server:2.4.49"])
@@ -686,7 +690,9 @@ class TestEnrichService:
 
         result = enrich_service("UnknownProduct", "3.1", cache, cpe_list=[])
         assert len(result.cves) == 1
-        mock_kw_query.assert_called_once_with("UnknownProduct", "3.1")
+        # host_os_cpe=None is threaded through for strict eval — the keyword
+        # fallback gets called with the same kwargs as the CPE path.
+        mock_kw_query.assert_called_once_with("UnknownProduct", "3.1", host_os_cpe=None)
 
     @patch("cauldron.ai.cve_enricher._query_nvd_cpe")
     def test_caches_api_results(self, mock_query, tmp_path: Path):
@@ -736,7 +742,9 @@ class TestEnrichService:
         mock_kw.return_value = [CVEInfo(cve_id="CVE-2024-0001", cvss=9.0)]
 
         result = enrich_service("nginx", "1.14.1", cache, cpe_list=["cpe:/a:igor_sysoev:nginx:1.14.1"])
-        mock_kw.assert_called_once_with("nginx", "1.14.1")
+        # host_os_cpe=None threaded through for strict eval (no host context
+        # in this test path) — fallback receives it as a kwarg.
+        mock_kw.assert_called_once_with("nginx", "1.14.1", host_os_cpe=None)
         assert len(result.cves) == 1
 
     @patch("cauldron.ai.cve_enricher._query_nvd_keyword")
@@ -1455,34 +1463,67 @@ class TestReenrichHostOSOnOwnership:
     Neo4j live elsewhere.
     """
 
-    def test_host_missing_returns_gracefully(self):
+    @staticmethod
+    def _fake_session_returning(record):
+        """Build a fake ``get_session`` context manager that returns the
+        given record dict from any ``session.run(...).single()`` call.
+        Lets the host-missing / low-os-accuracy / no-os-cpe branches be
+        exercised in CI environments without a live Neo4j (test_api.py
+        and friends share that setup, this just adds the same idea
+        directly to the cve_enricher tests)."""
+        from contextlib import contextmanager
+
+        class _FakeRun:
+            def single(_self):
+                return record
+
+        class _FakeSession:
+            def run(_self, *args, **kwargs):
+                return _FakeRun()
+            def __enter__(_self):
+                return _self
+            def __exit__(_self, *args):
+                pass
+
+        @contextmanager
+        def fake_get_session():
+            yield _FakeSession()
+
+        return fake_get_session
+
+    def test_host_missing_returns_gracefully(self, monkeypatch):
         """The PATCH endpoint already validated the host exists before
         scheduling this BackgroundTask, but a concurrent reset/wipe
         could remove the host between PATCH commit and task start.
         Function must return cleanly with ``host_missing=true``, not
         raise — re-enrichment failure cannot break the ownership flip."""
         from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+        from cauldron.graph import connection
 
-        # No setup — bogus IP guaranteed to miss
+        monkeypatch.setattr(connection, "get_session", self._fake_session_returning(None))
         stats = reenrich_host_os_on_ownership("203.0.113.255", owned=True)
         assert stats["host_missing"] is True
         assert stats["av_l_added"] == 0
         assert stats["av_l_removed"] == 0
 
-    def test_host_missing_unowned_path(self):
+    def test_host_missing_unowned_path(self, monkeypatch):
         """Symmetric path for owned=False — still no exception, same
         graceful return shape."""
         from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+        from cauldron.graph import connection
 
+        monkeypatch.setattr(connection, "get_session", self._fake_session_returning(None))
         stats = reenrich_host_os_on_ownership("203.0.113.255", owned=False)
         assert stats["host_missing"] is True
 
-    def test_stats_shape_contract(self):
+    def test_stats_shape_contract(self, monkeypatch):
         """The BackgroundTask runner needs a stable return shape so
         future logging / metrics can read fields without defensive
         gets. Lock the key set."""
         from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+        from cauldron.graph import connection
 
+        monkeypatch.setattr(connection, "get_session", self._fake_session_returning(None))
         stats = reenrich_host_os_on_ownership("203.0.113.255", owned=True)
         expected_keys = {
             "ip", "owned", "av_l_added", "av_l_removed",
@@ -2476,9 +2517,17 @@ class TestEnrichEPSSFromGraph:
 
 
 def urllib_403_error():
-    """Create a sequence of 403 errors for testing."""
+    """Yield a stream of 403 errors for retry-exhaustion testing.
+
+    The retry path consumes one error for the initial call plus one per
+    retry up to ``_NVD_RETRY_BUDGET`` (currently 6) before raising
+    ``NvdTransientError``. A finite generator that ran out before the
+    budget did broke the test with ``StopIteration`` instead of the
+    expected exception — use an infinite stream to decouple the fixture
+    from the budget constant.
+    """
     import urllib.error
-    for _ in range(4):
+    while True:
         yield urllib.error.HTTPError("https://nvd.nist.gov", 403, "Forbidden", {}, None)
 
 
