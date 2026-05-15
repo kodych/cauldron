@@ -512,6 +512,45 @@ def list_hosts(
                  pivot_src IS NOT NULL AS is_pivot
             OPTIONAL MATCH (h)-[:HAS_SERVICE]->(s:Service)
             OPTIONAL MATCH (s)-[r:HAS_VULN]->(v:Vulnerability)
+            WITH h, seg, source_first, source_latest, is_pivot,
+                 collect(DISTINCT {{
+                     port: s.port, protocol: s.protocol, state: s.state,
+                     name: s.name, product: s.product, version: s.version,
+                     bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual, notes: s.notes,
+                     first_seen: s.first_seen, last_seen: s.last_seen
+                 }}) AS services,
+                 collect(DISTINCT {{
+                     cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
+                     exploit_url: v.exploit_url, exploit_module: v.exploit_module,
+                     exploit_sources: coalesce(v.exploit_sources, ''),
+                     confidence: coalesce(r.confidence, 'check'), description: v.description,
+                     enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
+                     port: s.port, source: v.source, epss: v.epss,
+                     in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
+                     version_unconfirmed: coalesce(
+                         r.version_unconfirmed,
+                         s.version IS NULL OR s.version = '' OR s.version = '*'
+                     )
+                 }}) AS svc_vulns
+            // Host-OS vulns — surfaced by ``enrich_host_os_from_graph``.
+            // Carry ``port: null`` so HostList vuln counters and graph-canvas
+            // node labels include kernel/OS findings alongside service ones.
+            // Without this gather the list endpoint silently undercounted
+            // every host that had OS-CPE findings (the detail endpoint
+            // already unions svc_vulns + os_vulns; the list endpoint did
+            // not, so per-host counters disagreed with the detail panel).
+            OPTIONAL MATCH (h)-[hr:HAS_VULN]->(hv:Vulnerability)
+            WITH h, seg, source_first, source_latest, is_pivot, services, svc_vulns,
+                 collect(DISTINCT {{
+                     cve_id: hv.cve_id, cvss: hv.cvss, has_exploit: hv.has_exploit,
+                     exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
+                     exploit_sources: coalesce(hv.exploit_sources, ''),
+                     confidence: coalesce(hr.confidence, 'check'), description: hv.description,
+                     enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason,
+                     port: null, source: hv.source, epss: hv.epss,
+                     in_cisa_kev: hv.in_cisa_kev, cisa_kev_added: hv.cisa_kev_added,
+                     version_unconfirmed: coalesce(hr.version_unconfirmed, false)
+                 }}) AS os_vulns
             RETURN h.ip AS ip, h.hostname AS hostname, h.role AS role,
                    h.role_confidence AS role_confidence, h.os_name AS os_name,
                    h.os_family AS os_family, h.os_vendor AS os_vendor,
@@ -519,25 +558,7 @@ def list_hosts(
                    h.first_seen AS h_first_seen, h.last_seen AS h_last_seen,
                    h.owned AS owned, h.target AS target, h.notes AS notes,
                    seg.cidr AS segment, source_first, source_latest, is_pivot,
-                   collect(DISTINCT {{
-                       port: s.port, protocol: s.protocol, state: s.state,
-                       name: s.name, product: s.product, version: s.version,
-                       bruteforceable: s.bruteforceable, bruteforceable_manual: s.bruteforceable_manual, notes: s.notes,
-                       first_seen: s.first_seen, last_seen: s.last_seen
-                   }}) AS services,
-                   collect(DISTINCT {{
-                       cve_id: v.cve_id, cvss: v.cvss, has_exploit: v.has_exploit,
-                       exploit_url: v.exploit_url, exploit_module: v.exploit_module,
-                       exploit_sources: coalesce(v.exploit_sources, ''),
-                       confidence: coalesce(r.confidence, 'check'), description: v.description,
-                       enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
-                       port: s.port, source: v.source, epss: v.epss,
-                       in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
-                       version_unconfirmed: coalesce(
-                           r.version_unconfirmed,
-                           s.version IS NULL OR s.version = '' OR s.version = '*'
-                       )
-                   }}) AS vulns
+                   services, svc_vulns + os_vulns AS vulns
             """,
             **params,
             offset=offset,

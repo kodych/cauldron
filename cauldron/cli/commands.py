@@ -1004,7 +1004,27 @@ def serve(host: str, port: int, reload: bool):
     console.print(f"[dim]  Docs: http://{display_host}:{port}/docs[/dim]")
     console.print()
 
+    import logging as _logging
     import uvicorn
+
+    # Filter uvicorn access logs to keep 4xx/5xx (and any non-HTTP line)
+    # while dropping the 2xx/3xx noise that floods the console during
+    # SPA load — every static asset request and every refetch logs a
+    # 200 or 304 line otherwise, and real errors get buried in it.
+    class _DropSuccessAccess(_logging.Filter):
+        def filter(self, record: _logging.LogRecord) -> bool:
+            # uvicorn.access uses positional args: (client, method, path, http_version, status)
+            args = record.args or ()
+            if len(args) >= 5:
+                try:
+                    status = int(args[4])
+                except (TypeError, ValueError):
+                    return True
+                # Keep client/server errors; drop 1xx/2xx/3xx.
+                return status >= 400
+            return True
+
+    _logging.getLogger("uvicorn.access").addFilter(_DropSuccessAccess())
 
     uvicorn.run(
         "cauldron.api.server:app",
