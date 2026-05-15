@@ -2345,6 +2345,7 @@ def enrich_services_from_graph(
             RETURN
                 h.ip AS host_ip,
                 h.os_cpe AS host_os_cpe,
+                h.os_accuracy AS host_os_accuracy,
                 s.port AS port,
                 s.protocol AS protocol,
                 s.product AS product,
@@ -2355,9 +2356,20 @@ def enrich_services_from_graph(
             """
         )
 
+        # Strict configuration-tree eval only fires when the host's OS is
+        # confirmed at 100% accuracy — smb-os-discovery (protocol-level
+        # truth) or nmap -O on a stack clear enough to return an exact
+        # match. Anything below that is a guess (nmap routinely returns
+        # "Linux 89% / BSD 87%" on ambiguous stacks); passing such a
+        # guess through to the AND-config rejector would FALSE-REJECT
+        # legitimate CVEs when nmap misidentified the family. ``None``
+        # for host_os_cpe at strict-eval time means "defer" — the
+        # existing version-range filter handles those hosts as before.
         services = [
             (
-                r["host_ip"], r["host_os_cpe"], r["port"], r["protocol"],
+                r["host_ip"],
+                r["host_os_cpe"] if r["host_os_accuracy"] == 100 else None,
+                r["port"], r["protocol"],
                 r["product"], r["version"], r["cpe"],
                 r["extra_info"], r["script_outputs"] or [],
             )
@@ -2577,10 +2589,23 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
     cache = CVECache()
 
     with get_session() as session:
+        # Host-OS NVD enrichment requires the OS identification to be
+        # protocol-level certain. ``smb-os-discovery`` sets accuracy=100
+        # because it reads the OS string directly from the SMB protocol;
+        # nmap -O returns 100 only when its TCP/IP fingerprint matches a
+        # single signature unambiguously. Anything below that is a guess
+        # (a "Linux 89% / BSD 87%" osmatch) — querying NVD for kernel
+        # CVEs against a CPE that might be wrong would attach a whole
+        # branch of platform-specific findings to a host that doesn't
+        # actually run that OS. We'd rather skip the host-OS pass than
+        # pollute the graph with mis-attributed kernel privesc CVEs.
+        # Hosts without accuracy=100 just don't get the OS-level CVE
+        # pass; service-level enrichment still runs from the service
+        # CPE list and is unaffected.
         hosts = list(session.run(
             """
             MATCH (h:Host)
-            WHERE h.os_cpe IS NOT NULL
+            WHERE h.os_cpe IS NOT NULL AND h.os_accuracy = 100
             RETURN h.ip AS ip, h.os_cpe AS os_cpe, h.os_name AS os_name,
                    coalesce(h.owned, false) AS owned
             ORDER BY h.ip
@@ -2702,12 +2727,18 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
         "cache_miss": False,
         "no_os_cpe": False,
         "host_missing": False,
+        # New: re-enrichment was skipped because the host's OS was not
+        # 100%-confirmed. Mirrors the same gate as ``enrich_host_os_from_graph``
+        # so Mark-as-Owned can never add AV:L kernel-privesc CVEs based
+        # on a low-confidence OS guess.
+        "low_os_confidence": False,
     }
 
     try:
         with get_session() as session:
             record = session.run(
-                "MATCH (h:Host {ip: $ip}) RETURN h.os_cpe AS os_cpe",
+                "MATCH (h:Host {ip: $ip}) "
+                "RETURN h.os_cpe AS os_cpe, h.os_accuracy AS os_accuracy",
                 ip=ip,
             ).single()
 
@@ -2717,11 +2748,16 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
             return stats
 
         cpe22 = record.get("os_cpe")
+        os_accuracy = record.get("os_accuracy")
 
         if not owned:
             # Un-own — purge AV:L host-OS edges. AV:N stays; the next
             # boil's orphan sweep handles any Vulnerability that loses
-            # its last edge.
+            # its last edge. We delete unconditionally regardless of
+            # OS-accuracy: if a previous boil DID populate AV:L (back
+            # when the host was owned with high-confidence OS), un-
+            # owning should still clean them up. The gate only blocks
+            # writing new edges, not purging existing ones.
             with get_session() as session:
                 result = session.run(
                     """
@@ -2747,6 +2783,24 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
                 "Mark-as-Owned re-enrichment: %s has no os_cpe — nothing to add. "
                 "Run `cauldron boil --nvd` after a scan with OS fingerprinting.",
                 ip,
+            )
+            return stats
+
+        # OS-accuracy gate. ``enrich_host_os_from_graph`` only populates
+        # the host-OS CVE cache for hosts with 100%-confirmed OS; running
+        # Mark-as-Owned re-enrichment on a low-confidence host either
+        # finds no cache (cache_miss) or worse, finds a cache populated
+        # under a different host's high-confidence OS CPE (cache is
+        # keyed by CPE, not by host). Block early either way — we never
+        # want Mark-as-Owned to add AV:L kernel privesc CVEs based on a
+        # guessed OS.
+        if os_accuracy != 100:
+            stats["low_os_confidence"] = True
+            logger.info(
+                "Mark-as-Owned re-enrichment: %s has os_accuracy=%s (< 100). "
+                "Re-run nmap with -O against this host for protocol-level OS "
+                "confirmation, then re-mark to enrich kernel privesc CVEs.",
+                ip, os_accuracy,
             )
             return stats
 

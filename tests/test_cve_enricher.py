@@ -1487,8 +1487,55 @@ class TestReenrichHostOSOnOwnership:
         expected_keys = {
             "ip", "owned", "av_l_added", "av_l_removed",
             "cache_miss", "no_os_cpe", "host_missing",
+            "low_os_confidence",
         }
         assert set(stats.keys()) == expected_keys
+
+    def test_low_os_accuracy_blocks_enrichment(self, monkeypatch):
+        """Mark-as-Owned must never add AV:L kernel-privesc CVEs based on
+        a guessed OS — nmap routinely returns "Linux 89% / BSD 87%" on
+        ambiguous TCP stacks and attaching CVEs for the top-1 guess
+        would mis-attribute findings to a host that doesn't actually
+        run that OS.
+
+        Gates by ``h.os_accuracy = 100`` (smb-os-discovery sets 100;
+        nmap -O hits 100 only on unambiguous fingerprints). Anything
+        below returns ``low_os_confidence=True`` without writing any
+        edges. The cache is also untouched — the AV:L wave only lands
+        after a fresh nmap -O run confirms the OS at 100%.
+        """
+        from cauldron.ai import cve_enricher
+        from cauldron.graph import connection
+
+        # Fake session that returns a low-accuracy host.
+        class _FakeRun:
+            def single(self):
+                return {
+                    "os_cpe": "cpe:/o:linux:linux_kernel:2.6",
+                    "os_accuracy": 89,
+                }
+
+        class _FakeSession:
+            def run(self, *args, **kwargs):
+                return _FakeRun()
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_get_session():
+            yield _FakeSession()
+
+        monkeypatch.setattr(connection, "get_session", fake_get_session)
+        stats = cve_enricher.reenrich_host_os_on_ownership("10.0.0.1", owned=True)
+        assert stats["low_os_confidence"] is True
+        assert stats["av_l_added"] == 0
+        assert stats["host_missing"] is False
+        assert stats["no_os_cpe"] is False
+        assert stats["cache_miss"] is False
 
     def test_never_raises_on_unexpected_failure(self, monkeypatch):
         """BackgroundTask contract: exceptions inside the task must not
