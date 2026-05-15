@@ -98,13 +98,20 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
     setToggleBusy(true);
     try {
       // PATCH returns only after the server-side host-OS re-enrichment
-      // has finished writing AV:L edges (or removed them on un-own),
-      // so a single refetch here is guaranteed to see the new state.
-      // No delayed second refetch / "refreshing" toast — the operator
-      // sees the disabled spinner state during the ~1s PATCH and
-      // then the host detail re-renders with the new vuln list.
+      // has finished writing AV:L edges (or removed them on un-own).
+      // ``await refetch()`` then blocks until the GET response and
+      // ``setData`` have landed — the button does not re-enable until
+      // the new vuln list (including the freshly-attached AV:L kernel
+      // privesc rows) is in component state. A fire-and-forget
+      // ``refetch()`` was racing the re-render: the await above
+      // completed in one microtask, ``setToggleBusy(false)`` ran in
+      // the next, and React batched both before the GET response
+      // arrived — leaving the UI showing the old vuln list with the
+      // button already enabled, so the operator could click around
+      // before the new CVEs ever rendered. The explicit await closes
+      // that window.
       await api.setHostOwned(ip, !data.owned);
-      refetch();
+      await refetch();
       onDataChanged?.();
     } finally {
       setToggleBusy(false);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import warnings
 from contextlib import contextmanager
 from typing import Generator
@@ -14,6 +15,17 @@ from cauldron.config import settings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="neo4j")
 
 _driver: Driver | None = None
+# verify_connection() cache. ``driver.verify_connectivity()`` does a full
+# Bolt handshake on first call after each new TCP connection and can take
+# ~2 s on Windows even against a healthy local Neo4j. Every API endpoint
+# guards itself with ``_check_neo4j()``, so without caching every request
+# without keep-alive pays that 2 s — which is exactly what made the
+# HostDetail refetch after Mark-as-Owned appear "stuck" until the
+# operator hit F5. A 30 s TTL is safe: Neo4j outages are caught the next
+# time the cache expires and a fresh ping is attempted.
+_VERIFY_TTL_SECONDS = 30.0
+_verify_cached_at: float = 0.0
+_verify_cached_result: bool = False
 
 
 def get_driver() -> Driver:
@@ -55,13 +67,25 @@ def get_session() -> Generator[Session, None, None]:
 
 
 def verify_connection() -> bool:
-    """Check if Neo4j is reachable."""
+    """Check if Neo4j is reachable.
+
+    Result is cached for ``_VERIFY_TTL_SECONDS`` after a successful ping.
+    A failed ping is NOT cached — the next caller re-tries immediately
+    so a recovered Neo4j is picked up without waiting for the TTL.
+    """
+    global _verify_cached_at, _verify_cached_result
+    now = time.monotonic()
+    if _verify_cached_result and (now - _verify_cached_at) < _VERIFY_TTL_SECONDS:
+        return True
     try:
         driver = get_driver()
         driver.verify_connectivity()
-        return True
     except Exception:
+        _verify_cached_result = False
         return False
+    _verify_cached_at = now
+    _verify_cached_result = True
+    return True
 
 
 def init_schema() -> None:
