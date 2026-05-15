@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1502,17 +1502,21 @@ def get_exploit_commands(ip: str, port: int, vuln_id: str):
 
 
 @app.patch("/api/v1/hosts/{ip}/owned")
-def update_host_owned(
-    ip: str, body: HostMarkerUpdate, background_tasks: BackgroundTasks,
-):
+def update_host_owned(ip: str, body: HostMarkerUpdate):
     """Mark/unmark a host as owned (compromised).
 
-    Side effect: schedules a background re-enrichment of host-OS CVEs.
-    Marking owned flows previously-skipped AV:L kernel-privesc edges
-    through ``_upsert_host_vulnerability`` (cache-only, no NVD round-trip).
-    Unmarking deletes those AV:L edges from this host. The PATCH returns
-    immediately with ``enrichment_queued=true`` so the UI can show a
-    "refreshing OS findings" indicator while the task completes.
+    Side effect: re-enriches host-OS CVEs synchronously. Marking owned
+    flows previously-skipped AV:L kernel-privesc edges through
+    ``_upsert_host_vulnerability`` (cache-only, no NVD round-trip).
+    Unmarking deletes those AV:L edges from this host.
+
+    The re-enrichment runs in the request thread rather than a FastAPI
+    BackgroundTask — the operation is fast (cache hit + ~10-20 MERGE
+    statements, typically under a second) and the simple sync path
+    avoids the timing race where the UI's delayed refetch fired before
+    the background task had finished writing the new edges, forcing
+    the operator to hit F5 to see the AV:L findings. A subsequent UI
+    refetch on the PATCH response is guaranteed to see the new state.
     """
     _check_neo4j()
     from cauldron.graph.ingestion import set_host_owned
@@ -1521,8 +1525,16 @@ def update_host_owned(
     if not set_host_owned(ip, body.value):
         raise HTTPException(status_code=404, detail=f"Host {ip} not found")
 
-    background_tasks.add_task(reenrich_host_os_on_ownership, ip, body.value)
-    return {"ok": True, "enrichment_queued": True}
+    enrichment = reenrich_host_os_on_ownership(ip, body.value)
+    return {
+        "ok": True,
+        "enrichment": {
+            "av_l_added": enrichment["av_l_added"],
+            "av_l_removed": enrichment["av_l_removed"],
+            "cache_miss": enrichment["cache_miss"],
+            "no_os_cpe": enrichment["no_os_cpe"],
+        },
+    }
 
 
 @app.patch("/api/v1/hosts/{ip}/target")
