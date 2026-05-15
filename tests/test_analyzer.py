@@ -757,8 +757,10 @@ class TestParseClassificationAnonymized:
 @pytest.mark.skipif(not verify_connection(), reason="Neo4j not available")
 class TestApplyTriageDismissAll:
     """Verdict ``dismiss-all`` mirrors the operator's bulk-FP shortcut —
-    one AI verdict marks every active edge for the CVE as FP. KEV CVEs
-    are protected (Rule 0 — operator must confirm)."""
+    one AI verdict marks every active edge for the CVE as FP. KEV no
+    longer blocks this path: NVD CPE attribution bugs and reverse-temporal
+    mismatches can flag KEV CVEs against products that don't actually
+    have the relevant feature, and AI should be able to dismiss those."""
 
     @pytest.fixture(autouse=True)
     def _clean_db(self):
@@ -825,10 +827,13 @@ class TestApplyTriageDismissAll:
         assert r["active"] == 0
         assert "ai_dismiss_all" in r["markers"]
 
-    def test_dismiss_all_blocked_for_kev(self):
-        """KEV CVEs must not be flipped by dismiss-all — Rule 0 protection.
-        AI's ``keep`` verdict on the host where dismiss-all was attempted
-        is preserved (operator can manually decide later)."""
+    def test_dismiss_all_works_on_kev(self):
+        """KEV CVEs are now subject to dismiss-all like any other CVE.
+        NVD CPE attribution bugs flag KEV CVEs against products that
+        don't actually carry the relevant feature (e.g. CVE-2022-2586
+        nftables tagged against kernel 2.6, CVE-2021-40438 Apache 2.4
+        mod_proxy tagged against 2.2.8) — AI must be able to clean
+        those up across every affected edge in one shot."""
         from cauldron.ai.analyzer import _apply_triage
 
         self._seed_multihost_cve("CVE-KEV-9999", kev=True, hosts=3)
@@ -836,24 +841,24 @@ class TestApplyTriageDismissAll:
         response = json.dumps([
             {"id": "host-1", "vulns": [{
                 "cve_id": "CVE-KEV-9999", "port": 22, "verdict": "dismiss-all",
-                "reason": "AI thinks universal — should be blocked by KEV exception",
+                "reason": "KEV exploit targets feature not present in this version — universal CPE mismatch",
             }]},
         ])
         reverse = {f"host-{i + 1}": f"10.0.0.{i + 1}" for i in range(3)}
 
         kept, dismissed, _ = _apply_triage(response, reverse)
-        # Host where dismiss-all was attempted should be counted as kept
-        assert kept >= 1
-        assert dismissed == 0  # KEV blocked
+        assert dismissed == 3  # all 3 edges flipped, KEV no longer blocks
 
         with get_session() as session:
             r = session.run(
                 """
                 MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: 'CVE-KEV-9999'})
-                RETURN count(CASE WHEN r.checked_status IS NULL THEN 1 END) AS active
+                RETURN count(CASE WHEN r.checked_status = 'false_positive' THEN 1 END) AS fp,
+                       count(CASE WHEN r.checked_status IS NULL THEN 1 END) AS active
                 """,
             ).single()
-        assert r["active"] == 3, "KEV edges must all stay active"
+        assert r["fp"] == 3
+        assert r["active"] == 0
 
     def test_dismiss_all_idempotent_within_batch(self):
         """If multiple hosts in the same batch carry dismiss-all for the

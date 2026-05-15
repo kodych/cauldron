@@ -1082,34 +1082,43 @@ def _cve_is_gold(
 ) -> bool:
     """Decide whether a CVE clears the "actionable gold" bar for a pentester.
 
-    Single gate: a CVE must have a public exploit to count as gold. When we
-    have a service version, ``_cve_applies_to`` upstream has already
-    confirmed the CVE's version range covers it. When we do not, we assume
-    the service runs the latest release — so we additionally drop exploits
-    that target ancient releases only (``versionless`` path, recency cut).
+    Single gate: a CVE must have an actionable-exploit signal. Either NVD's
+    ``has_exploit`` tag (public PoC / Metasploit module) OR a CISA-KEV
+    listing satisfies it — KEV means CISA observed in-the-wild exploitation,
+    so it carries the same "real attack code exists" weight as a tagged
+    reference. When we have a service version, ``_cve_applies_to`` upstream
+    has already confirmed the CVE's version range covers it. When we do not,
+    we assume the service runs the latest release — so we additionally drop
+    exploits that target ancient releases only (``versionless`` path,
+    recency cut).
 
     "Theoretical critical" CVEs (CVSS 9.x with no PoC) were the dominant
     noise pattern on real client scans: dozens of Apache/Samba CVEs
-    bulk-attached to every host with no actionable follow-up. Requiring
-    has_exploit cuts that entire class while preserving every CISA-KEV
-    entry via the override below.
+    bulk-attached to every host with no actionable follow-up. Requiring an
+    exploit signal cuts that entire class.
+
+    KEV is NOT a free pass — historically KEV got an unconditional override
+    that bypassed admin-required and versionless-recency gates. That let
+    KEV-flagged CVEs through with broken CPE attribution (NVD bugs like
+    CVE-2022-2586 nftables tagged against kernel 2.6) or reverse-temporal
+    mismatches (CVE-2021-40438 Apache 2.4 mod_proxy tagged against 2.2.8).
+    KEV now goes through the same applicability filters as any has_exploit
+    CVE; the override is gone.
 
     Order (first matching wins):
-      1. Hard rejects — AV:L/AV:P and pure-DoS drop even for KEV.
+      1. Hard rejects — AV:L/AV:P and pure-DoS drop regardless of KEV.
          CVE-2023-44487 (HTTP/2 Rapid Reset) is in CISA KEV but pure DoS.
-      2. CISA-KEV soft override — actively exploited in the wild beats the
-         has_exploit gate AND the versionless recency cut.
-      3. Admin-required reject — PR:H CVEs are post-exploitation, not a way in.
-      4. Versionless recency reject — for "assume latest" queries, drop
+      2. Admin-required reject — PR:H CVEs are post-exploitation, not a way in.
+      3. Versionless recency reject — for "assume latest" queries, drop
          exploits registered against releases too old to still be running.
          Carve-out for OS-typed CPE queries (``os_cpe=True``): the major OS
          version is encoded in the product name (``windows_7``,
          ``windows_server_2012``, …), not the version slot, so a wildcard
          version is the normal shape rather than "we don't know the
          release." EoL'd OS families retain CVE applicability indefinitely
-         — applying the 5-year recency cut to them drops every non-KEV
-         Win 7 / 2008 / XP CVE on a clearly-vulnerable legacy host.
-      5. Actionable-exploit gate — has_exploit.
+         — applying the 5-year recency cut to them drops every Win 7 /
+         2008 / XP CVE on a clearly-vulnerable legacy host.
+      4. Actionable-exploit gate — has_exploit OR in_cisa_kev.
     """
     # AV:L vs AV:P split is host-OS-context aware. For service-level
     # queries the operator is enumerating external attack surface, so
@@ -1125,9 +1134,6 @@ def _cve_is_gold(
     if _cve_is_dos_only(cve):
         return False
 
-    if cve.in_cisa_kev:
-        return True
-
     if _cve_requires_admin(cve):
         return False
 
@@ -1136,7 +1142,7 @@ def _cve_is_gold(
         if year is not None and year < datetime.now(timezone.utc).year - _VERSIONLESS_RECENCY_YEARS:
             return False
 
-    return cve.has_exploit
+    return cve.has_exploit or cve.in_cisa_kev
 
 
 # --- NVD API queries ---

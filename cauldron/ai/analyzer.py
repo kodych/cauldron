@@ -902,8 +902,14 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
 {''.join(lines)}
 
 === TRIAGE RULES ===
-0. Any vuln tagged KEV (CISA Known Exploited Vulnerabilities): KEEP. These
-   are confirmed in-the-wild exploitation — never dismiss.
+0. KEV (CISA Known Exploited Vulnerabilities) is a strong signal — CISA
+   observed in-the-wild exploitation. Treat KEV as equivalent to a public
+   exploit being available: it RAISES the bar for dismissal, it does NOT
+   exempt the CVE from the other rules. KEV CVEs CAN still be dismissed
+   when there is clear evidence of CPE mismatch, wrong product, wrong OS,
+   reverse-temporal impossibility (KEV exploit targets product version
+   newer than the one running here), or surface mismatch — apply the rules
+   below in full. When in doubt on a KEV, prefer KEEP and note the concern.
 1. Remote RCE/auth bypass on NON-OWNED hosts: KEEP (attack surface)
 2. Local privilege escalation on OWNED hosts: KEEP (we can use these for privesc)
 3. Local exploits on NON-OWNED hosts: DISMISS (we can't use these — no access)
@@ -948,8 +954,6 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     (c) Library-level CVE (krb5 in Samba, openssl in TLS services):
         the description names a library, the service embeds it → KEEP.
         Don't be fooled by the protocol mismatch in this case.
-    EXCEPTION for KEV throughout: never auto-DISMISS a KEV. Mark KEEP
-    and note the concern in the reason for operator review.
 12. UNIVERSAL DISMISSAL — when a CVE's precondition is the same on every
     affected host (Terrapin needs MITM regardless of host context;
     SCP-injection needs scp-usage regardless of role; user-enumeration
@@ -959,8 +963,7 @@ and are typically MORE actionable than NVD CVEs because they focus on pentester 
     consistency problem where the same noise gets dismissed on some
     hosts but kept on others across batches.
     Use dismiss-all sparingly and only when the precondition is truly
-    host-independent. Forbidden for KEV CVEs (operator must confirm
-    those manually). When in doubt, use plain "dismiss" for the
+    host-independent. When in doubt, use plain "dismiss" for the
     individual host.
 
 CRITICAL: Do NOT dismiss CAULDRON-* IDs just because they are not standard CVEs.
@@ -1027,8 +1030,10 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
     - "keep" — leave the edge as-is.
     - "dismiss" — mark THIS edge (host+port+cve) as FP.
     - "dismiss-all" — mark every active edge for THIS CVE across the
-      whole graph as FP (operator's "FP to all" mirror). Forbidden for
-      KEV CVEs — Rule 0 still rules; KEV findings need operator review.
+      whole graph as FP (operator's "FP to all" mirror). KEV no longer
+      blocks this path — KEV-flagged CVEs that turn out to be CPE-
+      mismatch noise (NVD attribution bugs, reverse-temporal mismatch)
+      get the same universal-dismiss treatment as any other CVE.
     """
     data = _parse_json_response(response)
     if not isinstance(data, list):
@@ -1074,9 +1079,8 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                     continue
 
                 if verdict == "dismiss-all":
-                    # Mirror of operator's bulk-FP. Skip KEV (Rule 0).
-                    # Skip if we already applied bulk for this CVE in
-                    # the current batch (idempotent).
+                    # Mirror of operator's bulk-FP. Idempotent within a
+                    # batch — skip if we already applied bulk for this CVE.
                     if cve_id in bulk_dismissed_cves:
                         continue
                     reason = v.get("reason", "AI universal dismiss — host-independent precondition")
@@ -1084,7 +1088,6 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                         """
                         MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
                         WHERE r.checked_status IS NULL
-                          AND coalesce(v.in_cisa_kev, false) = false
                         SET r.checked_status = 'false_positive',
                             r.ai_fp_reason = $reason,
                             r.ai_normalized = 'ai_dismiss_all'
@@ -1101,21 +1104,6 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                             "AI dismiss-all: %s — %d edges flipped — %s",
                             cve_id, affected, reason,
                         )
-                    else:
-                        # Either no active edges (already done) or KEV-blocked.
-                        # Check whether KEV blocked us so we can log clearly.
-                        kev_check = session.run(
-                            "MATCH (v:Vulnerability {cve_id: $c}) "
-                            "RETURN coalesce(v.in_cisa_kev, false) AS kev",
-                            c=cve_id,
-                        ).single()
-                        if kev_check and kev_check["kev"]:
-                            logger.info(
-                                "AI dismiss-all blocked by KEV exception: %s — kept on %s",
-                                cve_id, real_ip,
-                            )
-                            # Treat as plain keep on this host
-                            kept += 1
                 elif verdict == "dismiss":
                     reason = v.get("reason", "AI triage: not exploitable in engagement context")
                     if isinstance(port, int) and port > 0:

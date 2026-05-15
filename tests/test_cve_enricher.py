@@ -1056,16 +1056,15 @@ class TestCVEMatchesProduct:
 
 
 class TestCVEIsGold:
-    """Actionable-gold filter — single strict rule: keep only CVEs with a
-    public exploit. Version applicability is enforced upstream by
-    ``_cve_applies_to``; when no version is known, we assume the service
-    runs the latest release and keep the CVEs an operator could actually
-    run against it. CISA KEV overrides the has_exploit gate (actively
-    exploited in the wild beats every heuristic) but not the hard rejects
-    (local/physical vector, pure DoS, admin-required). This is deliberately
-    stricter than a CVSS-based rule — "theoretical critical" CVEs without
-    any PoC were the dominant noise pattern on real client scans, with
-    dozens of Apache/Samba 9.x CVEs bulk-attaching to every host.
+    """Actionable-gold filter — single strict rule: keep only CVEs with an
+    actionable-exploit signal (NVD ``has_exploit`` tag OR CISA-KEV listing,
+    both meaning real exploit code exists). Version applicability is
+    enforced upstream by ``_cve_applies_to``; when no version is known, we
+    assume the service runs the latest release and keep the CVEs an
+    operator could actually run against it. KEV counts as exploit signal
+    but does NOT bypass the other gates — hard rejects (local/physical
+    vector, pure DoS, admin-required) and the versionless recency cut
+    apply equally to KEV and to has_exploit-tagged CVEs.
     """
 
     def _cve(
@@ -1164,16 +1163,19 @@ class TestCVEIsGold:
                         vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
         assert _cve_is_gold(cve) is False
 
-    # --- CISA KEV override ---
+    # --- CISA KEV as exploit signal ---
 
-    def test_kev_overrides_missing_exploit(self):
-        """KEV-listed CVE kept even without NVD-tagged exploit — CISA itself
-        is confirming active in-the-wild exploitation."""
+    def test_kev_counts_as_exploit_signal(self):
+        """KEV-listed CVE clears the actionable-exploit gate even without
+        an NVD ``Exploit``-tagged reference. CISA itself confirms in-the-wild
+        exploitation — that carries the same "real exploit code exists"
+        weight as a tagged reference."""
         cve = self._cve(cvss=4.5, has_exploit=False, in_cisa_kev=True)
         assert _cve_is_gold(cve) is True
 
     def test_kev_does_not_override_local(self):
-        """Even KEV doesn't help on a network scan if vector is local-only."""
+        """KEV doesn't help on a network scan if vector is local-only —
+        the hard reject fires before the exploit-signal gate."""
         cve = self._cve(cvss=9.8, has_exploit=True, in_cisa_kev=True,
                         vector="CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
         assert _cve_is_gold(cve) is False
@@ -1183,6 +1185,15 @@ class TestCVEIsGold:
         Attack-in-the-wild yes, pentest gold on a netscan no."""
         cve = self._cve(cvss=7.5, has_exploit=True, in_cisa_kev=True,
                         vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H")
+        assert _cve_is_gold(cve) is False
+
+    def test_kev_does_not_override_admin_required(self):
+        """KEV is no longer a blanket override. A PR:H CVE — admin shell
+        is already required to exploit — drops even when flagged KEV.
+        Post-exploitation CVEs are not a way in regardless of in-the-wild
+        attack frequency."""
+        cve = self._cve(cvss=9.8, has_exploit=True, in_cisa_kev=True,
+                        vector="CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
         assert _cve_is_gold(cve) is False
 
     # --- Versionless "assume latest" recency cut ---
@@ -1212,12 +1223,17 @@ class TestCVEIsGold:
         recent = self._cve_with_year(2024, has_exploit=True)
         assert _cve_is_gold(recent, versionless=True) is True
 
-    def test_versionless_kev_overrides_recency(self):
-        """KEV beats the recency cut — actively exploited in the wild is
-        a stronger signal than an old publication date (SambaCry 2017)."""
+    def test_versionless_kev_subject_to_recency_cut(self):
+        """KEV is no longer a free pass through the versionless recency
+        cut. An ancient KEV-flagged CVE on a "we don't know the version"
+        service drops with the same logic as any other ancient CVE —
+        the recency cut exists because we have to assume the service
+        runs a current release, and NVD CPE attribution bugs (CVE
+        attached to a wildcard CPE despite being a much newer feature)
+        produce reverse-temporal noise that KEV used to mask."""
         ancient_kev = self._cve_with_year(
             2017, has_exploit=True, in_cisa_kev=True)
-        assert _cve_is_gold(ancient_kev, versionless=True) is True
+        assert _cve_is_gold(ancient_kev, versionless=True) is False
 
     def test_versioned_does_not_apply_recency(self):
         """When we have a service version, range matching upstream already
@@ -1264,11 +1280,13 @@ class TestCVEIsGold:
 
     def test_os_cpe_carve_out_still_requires_actionable_exploit(self):
         """The OS-CPE carve-out only lifts the recency cut — it does
-        not bypass the ``has_exploit`` gate. A theoretical 2014 RCE
-        with no public PoC stays out of the "gold" set even on a Win 7
-        host, otherwise the pipeline would flood every Windows scan
-        with hundreds of CVSS-9.x entries that nobody has tooling for.
-        KEV-flagged ancient CVEs still pass via the soft override."""
+        not bypass the exploit-signal gate. A theoretical 2014 RCE
+        with no public PoC and no KEV listing stays out of the "gold"
+        set even on a Win 7 host, otherwise the pipeline would flood
+        every Windows scan with hundreds of CVSS-9.x entries that
+        nobody has tooling for. KEV-flagged ancient CVEs pass because
+        KEV satisfies the exploit-signal gate AND ``os_cpe`` lifts
+        the recency cut for legacy OS families."""
         theoretical = self._cve_with_year(2014, has_exploit=False, in_cisa_kev=False)
         assert _cve_is_gold(theoretical, versionless=True, os_cpe=True) is False
         kev_ancient = self._cve_with_year(2010, has_exploit=False, in_cisa_kev=True)
