@@ -31,14 +31,32 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
   const [hostNotesStatus, setHostNotesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [ipCopied, setIpCopied] = useState(false);
   const [toggleBusy, setToggleBusy] = useState(false);
+  // Mark-as-Owned fires a server-side BackgroundTask that re-enriches
+  // host-OS CVEs from cache (AV:L kernel-privesc previously gated by
+  // ownership). The PATCH returns immediately; we show this pill until
+  // the second refetch lands so the operator knows new CVEs are
+  // incoming and the panel will change shape under them.
+  const [enriching, setEnriching] = useState(false);
   const hostNotesSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hostNotesClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const enrichRefetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Reset notes panel state when switching to a different host
   useEffect(() => {
     setHostNotesOpen(false);
     setHostNotesText('');
     setHostNotesStatus('idle');
+  }, [ip]);
+
+  // Clear pending re-enrichment refetch on unmount or host switch so the
+  // setTimeout callback doesn't fire against a stale HostDetail instance.
+  useEffect(() => {
+    return () => {
+      if (enrichRefetchRef.current) {
+        clearTimeout(enrichRefetchRef.current);
+        enrichRefetchRef.current = null;
+      }
+    };
   }, [ip]);
 
   // Esc closes the detail panel. This matches the modal-dismissal
@@ -97,9 +115,25 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
     if (!data) return;
     setToggleBusy(true);
     try {
-      await api.setHostOwned(ip, !data.owned);
+      const response = await api.setHostOwned(ip, !data.owned);
+      // First refetch picks up the ownership flag flip itself (host
+      // badge changes Owned ⇄ Mark Owned). The host-OS re-enrichment
+      // BackgroundTask is still running server-side — schedule a
+      // second refetch to land after it completes (~3-4s for cache
+      // read + Neo4j MERGE on ~10-20 edges). Cancel any in-flight
+      // schedule if the operator double-flips before it lands.
       refetch();
       onDataChanged?.();
+      if (response?.enrichment_queued) {
+        setEnriching(true);
+        if (enrichRefetchRef.current) {
+          clearTimeout(enrichRefetchRef.current);
+        }
+        enrichRefetchRef.current = setTimeout(() => {
+          refetch();
+          setEnriching(false);
+        }, 4000);
+      }
     } finally {
       setToggleBusy(false);
     }
@@ -239,6 +273,15 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
             <Unlock size={11} />
             {data.owned ? 'Owned' : 'Mark Owned'}
           </button>
+          {enriching && (
+            <span
+              className="flex items-center gap-1 rounded bg-blue-900/30 px-1.5 py-0.5 text-[10px] text-blue-300/80"
+              title="Re-enriching host-OS CVEs from cache (AV:L kernel-privesc now applicable)"
+            >
+              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
+              Refreshing OS findings…
+            </span>
+          )}
           <button
             onClick={handleToggleTarget}
             disabled={toggleBusy}

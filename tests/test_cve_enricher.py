@@ -1443,6 +1443,72 @@ class TestFilterHostOSCVEsByOwnership:
         assert skipped == 2
 
 
+class TestReenrichHostOSOnOwnership:
+    """Mark-as-Owned trigger — re-enriches a single host's host-OS CVE
+    edges from cache when ownership flips. Reads from ``CVECache`` only,
+    never re-queries NVD, deletes AV:L edges on un-own. Tests cover the
+    early-exit paths (missing host, no os_cpe, cold cache) and the
+    return-stats contract — the integration paths against a populated
+    Neo4j live elsewhere.
+    """
+
+    def test_host_missing_returns_gracefully(self):
+        """The PATCH endpoint already validated the host exists before
+        scheduling this BackgroundTask, but a concurrent reset/wipe
+        could remove the host between PATCH commit and task start.
+        Function must return cleanly with ``host_missing=true``, not
+        raise — re-enrichment failure cannot break the ownership flip."""
+        from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+
+        # No setup — bogus IP guaranteed to miss
+        stats = reenrich_host_os_on_ownership("203.0.113.255", owned=True)
+        assert stats["host_missing"] is True
+        assert stats["av_l_added"] == 0
+        assert stats["av_l_removed"] == 0
+
+    def test_host_missing_unowned_path(self):
+        """Symmetric path for owned=False — still no exception, same
+        graceful return shape."""
+        from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+
+        stats = reenrich_host_os_on_ownership("203.0.113.255", owned=False)
+        assert stats["host_missing"] is True
+
+    def test_stats_shape_contract(self):
+        """The BackgroundTask runner needs a stable return shape so
+        future logging / metrics can read fields without defensive
+        gets. Lock the key set."""
+        from cauldron.ai.cve_enricher import reenrich_host_os_on_ownership
+
+        stats = reenrich_host_os_on_ownership("203.0.113.255", owned=True)
+        expected_keys = {
+            "ip", "owned", "av_l_added", "av_l_removed",
+            "cache_miss", "no_os_cpe", "host_missing",
+        }
+        assert set(stats.keys()) == expected_keys
+
+    def test_never_raises_on_unexpected_failure(self, monkeypatch):
+        """BackgroundTask contract: exceptions inside the task must not
+        bubble out. The ownership PATCH already committed server-side
+        — only logging is the channel for re-enrichment errors."""
+        from cauldron.ai import cve_enricher
+        from cauldron.graph import connection
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("simulated Neo4j outage")
+
+        # ``reenrich_host_os_on_ownership`` does an in-function import
+        # of ``get_session``, so patch the source module to make every
+        # lookup land on the failing stub.
+        monkeypatch.setattr(connection, "get_session", boom)
+        # Must not raise — function catches and logs
+        stats = cve_enricher.reenrich_host_os_on_ownership("10.0.0.1", owned=True)
+        # No fields were populated because the exception fired early,
+        # but the dict must still come back well-formed.
+        assert stats["ip"] == "10.0.0.1"
+        assert stats["owned"] is True
+
+
 class TestKEVParsing:
     """Verify cisaExploitAdd is parsed off the NVD response into CVEInfo."""
 

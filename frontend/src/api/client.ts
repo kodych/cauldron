@@ -152,8 +152,16 @@ export const api = {
     }
   },
 
+  // ``enrichment_queued`` is set when the server schedules a
+  // BackgroundTask to re-enrich host-OS CVEs — the AV:L kernel-privesc
+  // edges previously gated by ownership in the host-OS pipeline.
+  // The UI uses it to show a "Refreshing OS findings…" pill and
+  // schedule a delayed refetch.
   setHostOwned: (ip: string, owned: boolean) =>
-    patch<{ ok: boolean }>(`/hosts/${ip}/owned`, { value: owned }),
+    patch<{ ok: boolean; enrichment_queued?: boolean }>(
+      `/hosts/${ip}/owned`,
+      { value: owned },
+    ),
 
   setHostTarget: (ip: string, target: boolean) =>
     patch<{ ok: boolean }>(`/hosts/${ip}/target`, { value: target }),

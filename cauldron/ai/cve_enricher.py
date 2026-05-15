@@ -2371,6 +2371,137 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
     return stats
 
 
+def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
+    """Re-enrich a single host's host-OS findings after a Mark-as-Owned flip.
+
+    Reads from ``CVECache`` only — no NVD round-trip. The cache holds the
+    full AV:L + AV:N result set per OS CPE (see ``CVECache`` as the
+    source-of-truth invariant); the per-host AV:L gate moved to upsert
+    time in piece A so this trigger can flow previously-skipped kernel-
+    privesc edges through without re-querying NVD.
+
+    Behaviour:
+      - ``owned=True`` — apply the ownership-aware filter with
+        ``host_is_owned=True`` and upsert every AV:L entry in cache. AV:N
+        entries are already attached from the initial enrichment pass;
+        only AV:L is new on the ownership flip.
+      - ``owned=False`` — purge every AV:L host-OS edge from this host.
+        AV:N edges (external attack surface) stay; orphan vulnerabilities
+        that lose their last edge get reaped on the next ``boil``.
+
+    Args:
+        ip: Host IP to re-enrich.
+        owned: New ownership state (already written to ``h.owned`` by the
+            caller — this function only handles the CVE-edge side).
+
+    Returns:
+        Stats dict with keys ``ip``, ``owned``, ``av_l_added``,
+        ``av_l_removed``, ``cache_miss``, ``no_os_cpe``, ``host_missing``.
+        Designed for FastAPI ``BackgroundTask`` use — exceptions are
+        caught and logged so a re-enrichment failure cannot break the
+        ownership PATCH that triggered it.
+    """
+    from cauldron.graph.connection import get_session
+
+    stats = {
+        "ip": ip,
+        "owned": owned,
+        "av_l_added": 0,
+        "av_l_removed": 0,
+        "cache_miss": False,
+        "no_os_cpe": False,
+        "host_missing": False,
+    }
+
+    try:
+        with get_session() as session:
+            record = session.run(
+                "MATCH (h:Host {ip: $ip}) RETURN h.os_cpe AS os_cpe",
+                ip=ip,
+            ).single()
+
+        if record is None:
+            stats["host_missing"] = True
+            logger.warning("Mark-as-Owned re-enrichment: host %s not found", ip)
+            return stats
+
+        cpe22 = record.get("os_cpe")
+
+        if not owned:
+            # Un-own — purge AV:L host-OS edges. AV:N stays; the next
+            # boil's orphan sweep handles any Vulnerability that loses
+            # its last edge.
+            with get_session() as session:
+                result = session.run(
+                    """
+                    MATCH (h:Host {ip: $ip})-[r:HAS_VULN]->(v:Vulnerability)
+                    WHERE v.cvss_vector CONTAINS 'AV:L'
+                    DELETE r
+                    RETURN count(r) AS removed
+                    """,
+                    ip=ip,
+                )
+                rec = result.single()
+                stats["av_l_removed"] = rec["removed"] if rec else 0
+            logger.info(
+                "Mark-as-Owned re-enrichment (unowned): %s — removed %d AV:L edges",
+                ip, stats["av_l_removed"],
+            )
+            return stats
+
+        # owned=True — read cache and upsert AV:L entries
+        if not cpe22:
+            stats["no_os_cpe"] = True
+            logger.info(
+                "Mark-as-Owned re-enrichment: %s has no os_cpe — nothing to add. "
+                "Run `cauldron boil --nvd` after a scan with OS fingerprinting.",
+                ip,
+            )
+            return stats
+
+        cpe23 = _cpe22_to_23(cpe22)
+        if not cpe23:
+            stats["no_os_cpe"] = True
+            return stats
+
+        cache = CVECache()
+        cached = cache.get(cpe23)
+        if cached is None:
+            stats["cache_miss"] = True
+            logger.warning(
+                "Mark-as-Owned re-enrichment: cache cold for %s (%s) — "
+                "run `cauldron boil --nvd` to populate, then re-mark.",
+                ip, cpe23,
+            )
+            return stats
+
+        av_l_cves = [c for c in cached if _cve_is_av_local(c)]
+        if not av_l_cves:
+            logger.info(
+                "Mark-as-Owned re-enrichment: %s — cache has %d CVEs, "
+                "none AV:L (no kernel privesc to add).",
+                ip, len(cached),
+            )
+            return stats
+
+        with get_session() as session:
+            for cve in av_l_cves:
+                _upsert_host_vulnerability(session, ip, cve)
+
+        stats["av_l_added"] = len(av_l_cves)
+        logger.info(
+            "Mark-as-Owned re-enrichment: %s — upserted %d AV:L edges from cache",
+            ip, stats["av_l_added"],
+        )
+        return stats
+    except Exception:  # noqa: BLE001
+        # Background-task contract: never raise out of this function. The
+        # ownership PATCH already succeeded server-side; logging is the
+        # only feedback channel for re-enrichment failures.
+        logger.exception("Mark-as-Owned re-enrichment failed for %s", ip)
+        return stats
+
+
 def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, float]:
     """Query FIRST.org for EPSS scores in a single batch request.
 
