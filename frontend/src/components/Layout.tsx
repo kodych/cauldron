@@ -274,7 +274,12 @@ export function Layout() {
           <div className="flex-1 overflow-y-auto">
             {/* Host detail overlays tab content but tabs stay mounted so filters/scroll survive */}
             {showHostDetail && selectedHost && (
-              <HostDetail ip={selectedHost} onBack={handleBackFromDetail} onDataChanged={bumpDataVersion} />
+              <HostDetail
+                ip={selectedHost}
+                onBack={handleBackFromDetail}
+                onDataChanged={bumpDataVersion}
+                refreshKey={dataVersion}
+              />
             )}
             {/* Scan source detail overlays the same slot as HostDetail.
                 It's the only detail view that handles standalone

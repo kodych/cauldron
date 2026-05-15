@@ -12,6 +12,14 @@ interface Props {
   ip: string;
   onBack: () => void;
   onDataChanged?: () => void;
+  // Bumped by the Layout when graph state mutates outside of this panel
+  // (e.g. GraphCanvas right-click Mark-as-Owned, scan re-import). Without
+  // it, HostDetail's vuln list stayed stale until the operator manually
+  // closed and reopened the panel — the panel only refetched on ``ip``
+  // change, which doesn't fire when the SAME host is mutated from another
+  // pane. Threaded into the ``useApi`` dependency list below so any
+  // external mutation forces a fresh GET.
+  refreshKey?: number;
 }
 
 const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: React.ReactNode }[] = [
@@ -20,8 +28,11 @@ const STATUS_OPTIONS: { value: VulnStatus; label: string; color: string; icon: R
   { value: 'mitigated', label: 'Mitigated', color: '#3b82f6', icon: <Shield size={12} strokeWidth={2.5} /> },
 ];
 
-export function HostDetail({ ip, onBack, onDataChanged }: Props) {
-  const { data, loading, error, refetch } = useApi<HostOut>(() => api.getHost(ip), [ip]);
+export function HostDetail({ ip, onBack, onDataChanged, refreshKey = 0 }: Props) {
+  const { data, loading, error, refetch } = useApi<HostOut>(
+    () => api.getHost(ip),
+    [ip, refreshKey],
+  );
   const [hostNotesOpen, setHostNotesOpen] = useState(false);
   const [hostNotesText, setHostNotesText] = useState('');
   // Auto-save state machine: 'saving' while debounce/request pending,
@@ -319,61 +330,103 @@ export function HostDetail({ ip, onBack, onDataChanged }: Props) {
   );
 }
 
-/** Group vulns by cve_id, merge ports, show deduped list. */
+/** Group vulns by cve_id, split active vs dismissed edges per CVE.
+ *
+ * Per-port FP is a real case (AI marks CVE-2009-3555 SSL renegotiation as
+ * FP on :80 because there is no TLS on plain HTTP, keeps it on :443).
+ * Folding both edges into one row was confusing: the operator saw the
+ * dismissed :80 port in the ports list of a row that was otherwise
+ * "active", and bulk-dismissing the row would flip the :443 edge to FP
+ * too. We now keep both edges in the same grouped row but track the
+ * port lists separately:
+ *   - ``activePorts`` drives the displayed port badges and the dismiss
+ *     button's scope (clicking dismiss FPs only the active ports).
+ *   - ``dismissedPorts`` surfaces as a muted "(× :80)" pill so the
+ *     operator can see at a glance which ports were already triaged
+ *     without polluting the live port list.
+ * Representative ``vuln`` is picked from the active edges when any
+ * exist (so the row's status colour reflects the active state); when
+ * every edge is dismissed we fall back to a dismissed edge.
+ */
 function VulnsList({ vulns, hostIp, onUpdated }: {
   vulns: HostOut['vulnerabilities'];
   hostIp: string;
   onUpdated: () => void;
 }) {
   const grouped = useMemo(() => {
-    const map = new Map<string, { vuln: VulnOut; ports: number[] }>();
+    interface Group {
+      activeVuln: VulnOut | null;
+      dismissedVuln: VulnOut | null;
+      activePorts: number[];
+      dismissedPorts: number[];
+    }
+    const map = new Map<string, Group>();
+
+    const isActive = (v: VulnOut) => v.checked_status !== 'false_positive';
+    const mergeMeta = (target: VulnOut, src: VulnOut): VulnOut => {
+      let out = target;
+      if (src.cvss > out.cvss) out = { ...out, cvss: src.cvss };
+      if (src.has_exploit && !out.has_exploit) out = { ...out, has_exploit: true };
+      if (src.exploit_url && !out.exploit_url) out = { ...out, exploit_url: src.exploit_url };
+      if (src.exploit_module && !out.exploit_module) out = { ...out, exploit_module: src.exploit_module };
+      // OR-merge ``version_unconfirmed`` across port-instances. Without
+      // this the badge flickered on re-fetch — the API returns one row
+      // per (cve_id, port) and Neo4j's ``collect(DISTINCT ...)`` order
+      // is arbitrary, so whichever instance came first decided the
+      // badge. Asymmetric cost favours "show if any": false positive
+      // is one extra '?' the operator can dismiss; false negative is
+      // the operator chasing a CVE on a service whose version is
+      // actually unknown.
+      if (src.version_unconfirmed && !out.version_unconfirmed) {
+        out = { ...out, version_unconfirmed: true };
+      }
+      return out;
+    };
+
     for (const v of vulns) {
-      const existing = map.get(v.cve_id);
-      if (existing) {
-        if (v.port != null && !existing.ports.includes(v.port)) {
-          existing.ports.push(v.port);
-        }
-        // Keep highest CVSS, exploit info, worst status
-        if (v.cvss > existing.vuln.cvss) existing.vuln = { ...existing.vuln, cvss: v.cvss };
-        if (v.has_exploit && !existing.vuln.has_exploit) existing.vuln = { ...existing.vuln, has_exploit: true };
-        if (v.exploit_url && !existing.vuln.exploit_url) existing.vuln = { ...existing.vuln, exploit_url: v.exploit_url };
-        if (v.exploit_module && !existing.vuln.exploit_module) existing.vuln = { ...existing.vuln, exploit_module: v.exploit_module };
-        // OR-merge ``version_unconfirmed`` across port-instances. Without
-        // this the badge flickered on re-fetch — the API returns one row
-        // per (cve_id, port) and each row computes the flag from its
-        // own service's version, but Neo4j's ``collect(DISTINCT ...)``
-        // gives the rows in arbitrary order, so whichever instance
-        // happened to come first decided the badge. Asymmetric cost
-        // favours "show if any": false positive is one extra '?' the
-        // operator can dismiss; false negative is the operator chasing
-        // a CVE on a service whose version is actually unknown.
-        if (v.version_unconfirmed && !existing.vuln.version_unconfirmed) {
-          existing.vuln = { ...existing.vuln, version_unconfirmed: true };
+      let entry = map.get(v.cve_id);
+      if (!entry) {
+        entry = { activeVuln: null, dismissedVuln: null, activePorts: [], dismissedPorts: [] };
+        map.set(v.cve_id, entry);
+      }
+      if (isActive(v)) {
+        entry.activeVuln = entry.activeVuln ? mergeMeta(entry.activeVuln, v) : v;
+        if (v.port != null && !entry.activePorts.includes(v.port)) {
+          entry.activePorts.push(v.port);
         }
       } else {
-        map.set(v.cve_id, { vuln: v, ports: v.port != null ? [v.port] : [] });
+        entry.dismissedVuln = entry.dismissedVuln ? mergeMeta(entry.dismissedVuln, v) : v;
+        if (v.port != null && !entry.dismissedPorts.includes(v.port)) {
+          entry.dismissedPorts.push(v.port);
+        }
       }
     }
-    // Sort ports within each group
-    for (const entry of map.values()) {
-      entry.ports.sort((a, b) => a - b);
-    }
-    return [...map.values()];
+
+    return [...map.values()].map(g => {
+      g.activePorts.sort((a, b) => a - b);
+      g.dismissedPorts.sort((a, b) => a - b);
+      // Prefer active vuln as row representative when any active edge
+      // exists; ``vuln.checked_status`` then reflects the row's true
+      // state and the dismiss button operates on the active ports
+      // only. Empty-active rows (everything dismissed) fall back to
+      // the dismissed vuln so the row still renders.
+      const vuln = (g.activeVuln ?? g.dismissedVuln) as VulnOut;
+      const ports = g.activeVuln ? g.activePorts : g.dismissedPorts;
+      return { vuln, ports, dismissedPorts: g.activeVuln ? g.dismissedPorts : [] };
+    });
   }, [vulns]);
 
-  // Header counts: explicit "active vs dismissed" so the visible row
-  // count never disagrees with the header. Earlier we showed only
-  // ``activeGroups.length`` and the operator saw e.g. "(1)" with 4 rows
-  // visible (3 of them FP-marked) — cognitive dissonance.
+  // Header counts: "active CVE / total active findings". Findings here
+  // counts edges (port-instances), so a CVE on 2 ports contributes 2.
+  // FP'd ports don't count toward findings — the operator already
+  // triaged them away.
   const headerLabel = (() => {
     const total = grouped.length;
     if (total === 0) return 'Vulnerabilities';
     const active = grouped.filter(g => g.vuln.checked_status !== 'false_positive').length;
     const dismissed = total - active;
-    const portCount = new Set(
-      vulns.map(v => v.port).filter((p): p is number => p != null),
-    ).size;
-    const portSuffix = portCount > 1 ? ` · ${portCount} ports` : '';
+    const portCount = grouped.reduce((n, g) => n + g.ports.length, 0);
+    const portSuffix = portCount > active ? ` · ${portCount} findings` : '';
     if (dismissed === 0) return `Vulnerabilities · ${active}${portSuffix}`;
     if (active === 0) return `Vulnerabilities · ${dismissed} dismissed${portSuffix}`;
     return `Vulnerabilities · ${active} active, ${dismissed} dismissed${portSuffix}`;
@@ -386,8 +439,15 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
         <span className="text-xs font-medium text-gray-400">{headerLabel}</span>
       </div>
       <div className="px-3 pb-2 space-y-1">
-        {grouped.map(({ vuln, ports }) => (
-          <VulnRow key={vuln.cve_id} vuln={vuln} ports={ports} hostIp={hostIp} onUpdated={onUpdated} />
+        {grouped.map(({ vuln, ports, dismissedPorts }) => (
+          <VulnRow
+            key={vuln.cve_id}
+            vuln={vuln}
+            ports={ports}
+            dismissedPorts={dismissedPorts}
+            hostIp={hostIp}
+            onUpdated={onUpdated}
+          />
         ))}
         {grouped.length === 0 && (
           <p className="text-xs text-gray-600">No vulnerabilities</p>
@@ -397,7 +457,18 @@ function VulnsList({ vulns, hostIp, onUpdated }: {
   );
 }
 
-function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: number[]; hostIp: string; onUpdated: () => void }) {
+function VulnRow({ vuln, ports, dismissedPorts, hostIp, onUpdated }: {
+  vuln: VulnOut;
+  ports: number[];
+  // Ports for this CVE that have already been FP-dismissed (per-port
+  // triage from AI Phase 3 — e.g. TLS CVE flagged FP on :80 because
+  // there's no TLS on plain HTTP, kept active on :443). Rendered as
+  // a muted strikethrough pill so the operator can see at a glance
+  // which ports were triaged without polluting the live port badges.
+  dismissedPorts: number[];
+  hostIp: string;
+  onUpdated: () => void;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [updating, setUpdating] = useState(false);
   // Unified FP modal: click "False Positive" status button → modal asks
@@ -516,6 +587,19 @@ function VulnRow({ vuln, ports, hostIp, onUpdated }: { vuln: VulnOut; ports: num
             title="Host-level OS vulnerability — affects this host's operating system, not a specific service"
           >
             OS
+          </span>
+        )}
+        {dismissedPorts.length > 0 && (
+          // Per-port FP indicator. The CVE has at least one active port
+          // shown above; this pill surfaces the other port(s) the AI
+          // (or operator) already marked FP so the operator knows the
+          // grouping isn't hiding a partial dismissal. Strikethrough
+          // styling reinforces "this port was already triaged away."
+          <span
+            className="font-mono text-[10px] text-gray-600 shrink-0 line-through decoration-gray-600"
+            title={`FP-dismissed on port${dismissedPorts.length > 1 ? 's' : ''} ${dismissedPorts.join(', ')} — different surface (e.g. CVE applies to HTTPS but not HTTP)`}
+          >
+            ×:{dismissedPorts[0]}{dismissedPorts.length > 1 && <span>+{dismissedPorts.length - 1}</span>}
           </span>
         )}
         {vuln.cvss > 0 && (
