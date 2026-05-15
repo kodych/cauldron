@@ -1090,7 +1090,8 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                         WHERE r.checked_status IS NULL
                         SET r.checked_status = 'false_positive',
                             r.ai_fp_reason = $reason,
-                            r.ai_normalized = 'ai_dismiss_all'
+                            r.ai_normalized = 'ai_dismiss_all',
+                            r.fp_source = 'ai'
                         RETURN count(r) AS affected
                         """,
                         cve_id=cve_id, reason=reason,
@@ -1113,7 +1114,8 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                                   -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
                             WHERE r.checked_status IS NULL
                             SET r.checked_status = 'false_positive',
-                                r.ai_fp_reason = $reason
+                                r.ai_fp_reason = $reason,
+                                r.fp_source = 'ai'
                             RETURN v.cve_id AS cve_id
                             """,
                             ip=real_ip, port=port, cve_id=cve_id, reason=reason,
@@ -1126,7 +1128,8 @@ def _apply_triage(response: str, reverse_map: dict[str, str]) -> tuple[int, int,
                                   -[r:HAS_VULN]->(v:Vulnerability {cve_id: $cve_id})
                             WHERE r.checked_status IS NULL
                             SET r.checked_status = 'false_positive',
-                                r.ai_fp_reason = $reason
+                                r.ai_fp_reason = $reason,
+                                r.fp_source = 'ai'
                             RETURN count(r) AS cnt
                             """,
                             ip=real_ip, cve_id=cve_id, reason=reason,

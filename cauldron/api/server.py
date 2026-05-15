@@ -102,6 +102,14 @@ class VulnOut(BaseModel):
     enables_pivot: bool | None = None
     checked_status: str | None = None
     ai_fp_reason: str | None = None
+    # ``'ai'`` when the reason was set by AI Phase 3 triage,
+    # ``'manual'`` when the operator entered it via the UI/CLI, and
+    # ``None`` on legacy edges that pre-date the source tracking (the
+    # UI falls back to "Reason: ..." with no source attribution in
+    # that case rather than guessing). Lets the UI render "AI: ..."
+    # only when the AI actually wrote the dismissal — operator FPs
+    # were being mislabelled as AI verdicts before this field landed.
+    fp_source: str | None = None
     port: int | None = None
     # ``+``-joined when multiple channels detected the same CVE
     # (e.g. ``"exploit_db+nvd"`` when CAULDRON-010 and the NVD CPE
@@ -335,6 +343,7 @@ def _parse_vuln_record(v: dict) -> VulnOut:
         enables_pivot=v.get("enables_pivot"),
         checked_status=v.get("checked_status"),
         ai_fp_reason=v.get("ai_fp_reason"),
+        fp_source=v.get("fp_source"),
         port=v.get("port"),
         source=v.get("source"),
         epss=v.get("epss"),
@@ -524,7 +533,7 @@ def list_hosts(
                      exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                      exploit_sources: coalesce(v.exploit_sources, ''),
                      confidence: coalesce(r.confidence, 'check'), description: v.description,
-                     enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
+                     enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason, fp_source: r.fp_source,
                      port: s.port, source: v.source, epss: v.epss,
                      in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
                      version_unconfirmed: coalesce(
@@ -546,7 +555,7 @@ def list_hosts(
                      exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
                      exploit_sources: coalesce(hv.exploit_sources, ''),
                      confidence: coalesce(hr.confidence, 'check'), description: hv.description,
-                     enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason,
+                     enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason, fp_source: hr.fp_source,
                      port: null, source: hv.source, epss: hv.epss,
                      in_cisa_kev: hv.in_cisa_kev, cisa_kev_added: hv.cisa_kev_added,
                      version_unconfirmed: coalesce(hr.version_unconfirmed, false)
@@ -642,7 +651,7 @@ def get_host(ip: str):
                      exploit_url: v.exploit_url, exploit_module: v.exploit_module,
                      exploit_sources: coalesce(v.exploit_sources, ''),
                      confidence: coalesce(r.confidence, 'check'), description: v.description,
-                     enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason,
+                     enables_pivot: v.enables_pivot, checked_status: r.checked_status, ai_fp_reason: r.ai_fp_reason, fp_source: r.fp_source,
                      port: s.port, source: v.source, epss: v.epss,
                      in_cisa_kev: v.in_cisa_kev, cisa_kev_added: v.cisa_kev_added,
                      version_unconfirmed: coalesce(
@@ -660,7 +669,7 @@ def get_host(ip: str):
                      exploit_url: hv.exploit_url, exploit_module: hv.exploit_module,
                      exploit_sources: coalesce(hv.exploit_sources, ''),
                      confidence: coalesce(hr.confidence, 'check'), description: hv.description,
-                     enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason,
+                     enables_pivot: hv.enables_pivot, checked_status: hr.checked_status, ai_fp_reason: hr.ai_fp_reason, fp_source: hr.fp_source,
                      port: null, source: hv.source, epss: hv.epss,
                      in_cisa_kev: hv.in_cisa_kev, cisa_kev_added: hv.cisa_kev_added,
                      version_unconfirmed: coalesce(hr.version_unconfirmed, false)
@@ -1592,12 +1601,22 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
     with get_session() as session:
         # Status is stored on the HAS_VULN relationship so the same CVE
         # on different ports can have independent checked status
+        # ``fp_source`` records who entered the FP reason so the UI can
+        # label it correctly. Manual-from-UI writes here always tag
+        # ``'manual'``. The AI Phase 3 path (cauldron/ai/analyzer.py)
+        # tags ``'ai'`` so the operator can tell at a glance whether a
+        # dismissal came from automatic triage (which they may want to
+        # spot-check) or from their own prior session (which they
+        # already vetted). Cleared status also clears the source so a
+        # stale tag doesn't outlive its verdict.
+        fp_source = "manual" if body.status == "false_positive" else None
         if body.port is not None:
             result = session.run(
                 """
                 MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service {port: $port})-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
                 SET r.checked_status = $status,
-                    r.ai_fp_reason = $reason
+                    r.ai_fp_reason = $reason,
+                    r.fp_source = $fp_source
                 RETURN v.cve_id AS cve_id
                 """,
                 ip=ip,
@@ -1605,6 +1624,7 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
                 vuln_id=vuln_id,
                 status=body.status,
                 reason=reason,
+                fp_source=fp_source,
             )
         else:
             # No port specified — update all relationships for this CVE on this host
@@ -1612,13 +1632,15 @@ def update_vuln_status(ip: str, vuln_id: str, body: VulnStatusUpdate):
                 """
                 MATCH (h:Host {ip: $ip})-[:HAS_SERVICE]->(s:Service)-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
                 SET r.checked_status = $status,
-                    r.ai_fp_reason = $reason
+                    r.ai_fp_reason = $reason,
+                    r.fp_source = $fp_source
                 RETURN v.cve_id AS cve_id
                 """,
                 ip=ip,
                 vuln_id=vuln_id,
                 status=body.status,
                 reason=reason,
+                fp_source=fp_source,
             )
         record = result.single()
         if not record:
@@ -1656,7 +1678,8 @@ def bulk_update_vuln_status(vuln_id: str, body: VulnBulkStatusUpdate):
             MATCH ()-[r:HAS_VULN]->(v:Vulnerability {cve_id: $vuln_id})
             WHERE r.checked_status IS NULL
             SET r.checked_status = 'false_positive',
-                r.ai_fp_reason = $reason
+                r.ai_fp_reason = $reason,
+                r.fp_source = 'manual'
             RETURN count(r) AS affected
             """,
             vuln_id=vuln_id,

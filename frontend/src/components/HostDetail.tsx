@@ -768,12 +768,15 @@ function VulnRow({ vuln, edges, hostIp, onUpdated }: {
             </Badge>
           </span>
         ))}
-        {/* Inline status quick-picker — primary triage action, must be
-            visibly affordant as a button group, not a row of three
-            naked icons that newcomers can't recognize. Implemented as a
-            segmented control: bordered container, divided cells, active
-            cell tinted in its own colour, inactive cells with a clear
-            hover state. Tooltip carries the full action name. */}
+        {/* Inline status quick-picker — primary triage action in the
+            collapsed view. Hidden when the row is expanded because
+            the expanded view shows per-port status pickers that would
+            otherwise duplicate this segmented control verbatim
+            (operator complaint: "купа кнопок, що дублюються"). The
+            chevron at the row's end still toggles expand/collapse, so
+            this is the only entry point for the aggregate "FP every
+            active port" shortcut when the row is collapsed. */}
+        {!expanded && (
         <span
           className="flex items-stretch shrink-0 ml-2 rounded border border-gray-700 overflow-hidden divide-x divide-gray-700"
           onClick={(e) => e.stopPropagation()}
@@ -807,6 +810,7 @@ function VulnRow({ vuln, edges, hostIp, onUpdated }: {
             );
           })}
         </span>
+        )}
         {expanded ? <ChevronUp size={12} className="text-gray-600" /> : <ChevronDown size={12} className="text-gray-600" />}
       </button>
 
@@ -843,8 +847,16 @@ function VulnRow({ vuln, edges, hostIp, onUpdated }: {
               buttons. Lets the operator triage ":80 FP, :443 active"
               from the UI (mirrors AI Phase 3's per-port granularity).
               Single-edge rows still get the sub-row for consistency
-              (and to surface the edge's ai_fp_reason inline). */}
-          <div className="rounded border border-gray-800/70 divide-y divide-gray-800/50">
+              (and to surface the edge's ai_fp_reason inline). The
+              section heading appears only when there is more than one
+              edge — for single-port CVEs the sub-row is identifiable
+              from context alone. */}
+          {edges.length > 1 && (
+            <p className="text-[10px] uppercase tracking-wider text-gray-600 font-semibold mt-1">
+              Per-port status
+            </p>
+          )}
+          <div className="rounded border border-gray-800/70 bg-gray-950/40 divide-y divide-gray-800/50">
             {edges.map((edge) => (
               <EdgeStatusRow
                 key={`${edge.cve_id}:${edge.port ?? 'os'}`}
@@ -1016,11 +1028,17 @@ function EdgeStatusRow({
         </span>
       )}
       {edge.ai_fp_reason && (
+        // Label depends on who entered the reason:
+        //   - AI Phase 3 triage → "AI: …" (yellow italic, operator may want to spot-check)
+        //   - operator FP modal → "Reason: …" (no source attribution)
+        //   - legacy edges without ``fp_source`` → "Reason: …" (we can't claim AI authored it)
         <span
-          className="text-[11px] italic text-yellow-600/80 truncate flex-1 min-w-0"
+          className={`text-[11px] italic truncate flex-1 min-w-0 ${
+            edge.fp_source === 'ai' ? 'text-yellow-600/80' : 'text-gray-400/80'
+          }`}
           title={edge.ai_fp_reason}
         >
-          AI: {edge.ai_fp_reason}
+          {edge.fp_source === 'ai' ? 'AI: ' : 'Reason: '}{edge.ai_fp_reason}
         </span>
       )}
       {!edge.ai_fp_reason && <span className="flex-1" />}

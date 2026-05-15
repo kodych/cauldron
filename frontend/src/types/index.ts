@@ -39,6 +39,12 @@ export interface VulnOut {
   enables_pivot: boolean | null;
   checked_status: string | null;
   ai_fp_reason: string | null;
+  // ``'ai'`` if AI Phase 3 set the reason, ``'manual'`` if the operator
+  // entered it through the FP modal, ``null`` on legacy edges. The UI
+  // uses this to label the reason ("AI: ..." vs "Reason: ...") rather
+  // than tagging every reason as AI — operator-entered notes were
+  // being mislabelled as AI verdicts before this field landed.
+  fp_source: string | null;
   port: number | null;
   source: string | null; // exploit_db, nvd, ai
   // ``+``-joined set of channels that confirmed a public exploit exists
