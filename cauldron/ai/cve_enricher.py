@@ -1221,10 +1221,28 @@ def _cve_is_gold(
         # bypass is overwhelmed by graph clutter on every owned host.
         # Applied here -- before the actionable-exploit gate below -- so
         # has_exploit is checked only on CVEs that already cleared the
-        # severity bar. Empirical effect on Linux 2.6.9: kernel-CVE
-        # universe shrinks from 413 to ~110 actionable findings, both
-        # canonical sock_sendpage / udp_sendmsg LPE CVEs retained.
+        # severity bar.
         if (cve.cvss or 0.0) < 7.0:
+            return False
+        # Host-OS exploitation-probability floor. After CVSS the gate
+        # narrows further on FIRST.org's EPSS score (probability of
+        # exploitation in the next 30 days). CISA-KEV overrides: an
+        # in-the-wild listing is direct evidence that beats prediction.
+        # Otherwise require EPSS >= 0.1 -- empirically all canonical
+        # E0 sanity-check kernel exploits (CVE-2009-2692 sock_sendpage
+        # 0.176, CVE-2009-2698 udp_sendmsg 0.261) sit well above this
+        # floor, while the partial-info-leak / capability-bypass band
+        # that survives the CVSS 7+ gate sits below it.
+        #
+        # Fail-open when EPSS data is missing (FIRST.org hasn't scored
+        # the CVE yet, or transient fetch error): defer to the
+        # has_exploit gate. Don't let a brittle dependency hide
+        # otherwise-actionable findings.
+        if (
+            not cve.in_cisa_kev
+            and cve.epss is not None
+            and cve.epss < 0.1
+        ):
             return False
     elif _cve_is_local_only(cve):
         return False
@@ -1359,6 +1377,43 @@ def _query_nvd_cpe(
     version_pinned = has_version or bool(version_hint)
     for cve in cves:
         cve.matched_version_pinned = version_pinned
+
+    # Host-OS path: batch-fetch EPSS BEFORE the gold filter so the
+    # severity-tier gate has both CVSS (point-in-time NVD score) and
+    # EPSS (FIRST.org's dynamic exploitation-probability model). The
+    # kernel-CPE NVD universe is thousands of CVEs and CVSS alone --
+    # even with the 7.0 floor -- still leaves hundreds of "scored but
+    # not actively exploited" entries that clutter every owned host.
+    # EPSS reflects real-world exploitation telemetry and updates as
+    # the threat landscape shifts, which matches the "ловити кожен
+    # раз актуальне" design intent better than any static heuristic.
+    # Service-level queries skip this -- their result sets are small
+    # enough that EPSS adds no signal.
+    #
+    # Chunked via ``_EPSS_BATCH_SIZE`` (100) because FIRST.org rejects
+    # over-long URIs with HTTP 414 when the comma-joined CVE list
+    # exceeds a few thousand IDs; the kernel-CPE response routinely
+    # crosses that threshold. ``EPSSCache`` reuse keeps repeated CVEs
+    # across alt-CPE queries (linux_kernel:2.6, :2.6.9, :2.6.30) to a
+    # single fetch.
+    if host_os and cves:
+        epss_cache = EPSSCache()
+        scores: dict[str, float] = {}
+        to_fetch: list[str] = []
+        for cve in cves:
+            cached_score = epss_cache.get(cve.cve_id)
+            if cached_score is not None:
+                scores[cve.cve_id] = cached_score
+            else:
+                to_fetch.append(cve.cve_id)
+        for start in range(0, len(to_fetch), _EPSS_BATCH_SIZE):
+            batch = to_fetch[start : start + _EPSS_BATCH_SIZE]
+            fetched = _fetch_epss_batch(batch)
+            if fetched:
+                epss_cache.put_batch(fetched)
+                scores.update(fetched)
+        for cve in cves:
+            cve.epss = scores.get(cve.cve_id)
 
     # Coarse pentester filter first (CWE + pattern), then the gold filter
     # requires an actionable public exploit (KEV overrides). Hard rejects
