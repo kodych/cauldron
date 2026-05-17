@@ -608,6 +608,21 @@ NVD_CPE_BASE = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 # so we don't match "foo/bar".
 _BANNER_TOKEN_RE = re.compile(r"\b([A-Za-z][\w.-]{1,})/(\d[\w.-]*)")
 
+# Bare version-like substring, used when the service has a known product but
+# nmap left the version field empty. NSE scripts often emit the version glued
+# to a product alias (irc-info: ``Unreal3.2.8.1``) that neither the slash nor
+# the space form catches. Matched substring is paired downstream with the
+# known service product; junk extractions (IP addresses, timestamps) self-
+# filter via NVD's virtualMatchString returning zero CVEs for fake CPEs.
+# Requires at least one dot to drop bare integers (port numbers, counts).
+#
+# Uses negative lookbehind/lookahead for digits rather than ``\b`` because
+# ``\b`` does not match between a letter and a digit (both are "word" chars),
+# so ``\b\d+`` against "Unreal3.2.8.1" would skip the leading "3." and capture
+# only "2.8.1". ``(?<!\d)\d+...`` skips matches mid-version-string while still
+# anchoring at letter-to-digit transitions.
+_BARE_VERSION_RE = re.compile(r"(?<!\d)(\d+\.\d+(?:\.\d+){0,3}[a-z]?)(?!\d)")
+
 # Same shape but space-separated: "Drupal 7" from http-generator NSE output,
 # "Samba 2.2.1a" from smb-os-discovery, "IIS 7.5" from http-server-header.
 # Stricter than the slash form because plain prose is full of "Word number"
@@ -627,6 +642,39 @@ _BANNER_TOKEN_SPACE_RE = re.compile(r"(?:^|[\s(\[])([A-Z][\w.-]{2,})\s+(\d[\w.-]
 # Value = canonical CPE 2.3 string, or "" sentinel meaning "queried, NVD has
 # no record" -- both avoid repeat lookups within a single boil --nvd run.
 _cpe_resolution_cache: dict[tuple[str, str], str] = {}
+
+
+def _extract_bare_versions(*sources: str | None) -> list[str]:
+    """Pull every version-shaped substring out of free-form text.
+
+    Used when a Service has a known ``product`` but the nmap ``version``
+    attribute is empty — NSE script outputs (irc-info, http-generator,
+    snmp-info, etc.) often carry the version glued to a product alias
+    that ``_BANNER_TOKEN_RE`` / ``_BANNER_TOKEN_SPACE_RE`` cannot split
+    (``Unreal3.2.8.1`` has no slash and no space between name and
+    version). The caller pairs each extracted version with the already-
+    known product and synthesises a CPE candidate ``cpe:2.3:a:*:<product>:
+    <version>:*`` for downstream NVD virtualMatchString validation.
+
+    Junk extractions are expected and harmless: IP addresses, dates
+    written ``2010.03.17``, and uptime fragments all match the regex
+    shape. NVD's virtualMatchString returns zero CVEs for nonsense
+    product+version pairs, so the candidates self-filter without us
+    needing a "is this a real version" allow-list.
+
+    Returns deduplicated version strings preserving first-seen order.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for src in sources:
+        if not src:
+            continue
+        for m in _BARE_VERSION_RE.finditer(src):
+            v = m.group(1)
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    return out
 
 
 def _extract_banner_tokens(*sources: str | None) -> list[tuple[str, str]]:
@@ -843,6 +891,29 @@ def _build_cpe_candidates(
 
     for name, ver in _extract_banner_tokens(*sources):
         _add(_resolve_banner_token(name, ver))
+
+    # Versionless service with a known single-word product: NSE scripts may
+    # report the version glued to a product alias (irc-info: ``Unreal3.2.8.1``
+    # for UnrealIRCd) that the slash and space banner regexes cannot split.
+    # Pair every version-shaped token from script outputs and extra_info with
+    # the known service product and synthesise the CPE directly — no CPE
+    # Dictionary probe because the dictionary is curated and incomplete:
+    # CVE-2010-2075 references ``unrealircd:unrealircd:3.2.8.1`` in its config
+    # tree but that exact CPE has zero entries in the dictionary, so the
+    # probe would reject the only candidate that actually finds the CVE.
+    # NVD's virtualMatchString is the validator downstream.
+    #
+    # Multi-word products ("Apache httpd", "Postfix smtpd") already resolve
+    # through the PRODUCT_CPE_MAP primary path and don't need this fallback;
+    # skipping them avoids polluting the candidate list with malformed CPEs
+    # ("apache httpd" is not a valid CPE product slot).
+    if (
+        product and not version and script_outputs
+        and " " not in product.strip()
+    ):
+        product_slot = product.strip().lower()
+        for v in _extract_bare_versions(extra_info, *script_outputs):
+            _add(f"cpe:2.3:a:*:{product_slot}:{v}:*:*:*:*:*:*:*")
 
     return candidates
 
@@ -1292,6 +1363,19 @@ def _query_nvd_cpe(
     # each tier. A low-CVSS CVE with a Metasploit module is more useful
     # than a high-CVSS theoretical one.
     cves.sort(key=_cve_priority_key)
+    # Result cap. The host-OS pass needs a larger window than service-level
+    # queries: the kernel CPE universe is thousands of CVEs deep and the
+    # priority-sorted band of CVSS 7-8 LPE bugs (the actionable post-foothold
+    # privesc tier) starts around position 20 on legacy kernels like Linux
+    # 2.6. Without a wider cap, sister LPE CVEs at the same CVSS tier (e.g.
+    # CVE-2009-2692 sock_sendpage at position 21 next to CVE-2009-2698
+    # udp_sendmsg at 22) get split by the cap and only one of the pair
+    # surfaces. 200 keeps the full actionable band on every Linux host-OS
+    # query while still bounding the per-host attachment. Service-level
+    # queries keep the historical 20/50 caps -- their universe is much
+    # smaller and the same band-splitting risk doesn't apply.
+    if host_os:
+        return cves[:200]
     return cves[:20 if has_version else 50]
 
 
@@ -2607,6 +2691,7 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
             MATCH (h:Host)
             WHERE h.os_cpe IS NOT NULL AND h.os_accuracy = 100
             RETURN h.ip AS ip, h.os_cpe AS os_cpe, h.os_name AS os_name,
+                   coalesce(h.os_cpe_alts, []) AS os_cpe_alts,
                    coalesce(h.owned, false) AS owned
             ORDER BY h.ip
             """,
@@ -2626,31 +2711,55 @@ def enrich_host_os_from_graph(progress_callback=None) -> dict:
             stats["skipped"] += 1
             continue
 
-        stats["hosts_checked"] += 1
-        cache_key = cpe23
+        # Alternative OS CPE anchors derived by the parser from
+        # ``<osmatch name>`` (specific kernel versions when osclass is
+        # generation-only). NVD virtualMatchString matches asymmetrically
+        # against config-tree version ranges, so querying just the
+        # generation-only CPE silently misses CVEs pinned with
+        # versionStart/End markers. Each alt is queried in addition to
+        # the primary CPE and the results merged.
+        alt_cpe22s = list(record.get("os_cpe_alts") or [])
+        alt_cpe23s = []
+        for alt22 in alt_cpe22s:
+            alt23 = _cpe22_to_23(alt22)
+            if alt23 and alt23 != cpe23 and alt23 not in alt_cpe23s:
+                alt_cpe23s.append(alt23)
 
-        cached = cache.get(cache_key)
-        if cached is not None:
-            cves = cached
-            stats["from_cache"] += 1
-        else:
-            try:
-                fetched = _query_nvd_cpe(cpe23, host_os=True)
-            except NvdTransientError as e:
-                logger.warning("Host-OS NVD failure for %s (%s): %s", ip, cpe23, e)
-                stats["errors"] += 1
-                if progress_callback:
-                    progress_callback(idx + 1, total, f"{ip}: NVD error")
-                continue
-            if fetched is None:
-                # 404 — CPE not recognised by NVD. Cache an empty
-                # result so we don't hit the API again for the same
-                # CPE on the next pass.
-                cves = []
+        stats["hosts_checked"] += 1
+
+        # Fetch the primary CPE plus each alt anchor, merging into one
+        # de-duplicated CVE set per host. Each CPE has its own cache
+        # entry so warm runs only pay the dedup cost.
+        merged: dict[str, CVEInfo] = {}
+        any_transient = False
+        for query_cpe in [cpe23, *alt_cpe23s]:
+            cached = cache.get(query_cpe)
+            if cached is not None:
+                fetched_list: list[CVEInfo] = list(cached)
+                stats["from_cache"] += 1
             else:
-                cves = fetched
-            stats["api_calls"] += 1
-            cache.put(cache_key, cves)
+                try:
+                    fetched = _query_nvd_cpe(query_cpe, host_os=True)
+                except NvdTransientError as e:
+                    logger.warning(
+                        "Host-OS NVD failure for %s (%s): %s",
+                        ip, query_cpe, e,
+                    )
+                    stats["errors"] += 1
+                    any_transient = True
+                    break
+                fetched_list = list(fetched) if fetched is not None else []
+                stats["api_calls"] += 1
+                cache.put(query_cpe, fetched_list)
+            for cve in fetched_list:
+                merged.setdefault(cve.cve_id, cve)
+
+        if any_transient:
+            if progress_callback:
+                progress_callback(idx + 1, total, f"{ip}: NVD error")
+            continue
+
+        cves = list(merged.values())
 
         # Per-host AV:L ownership gate. Cache always carries the full
         # AV:L+AV:N result for the CPE; the filter happens here at

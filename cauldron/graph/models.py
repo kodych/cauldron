@@ -108,6 +108,17 @@ class Host:
     # OS-attributed bugs (Linux kernel privesc, Windows OS RCEs) that
     # don't surface through any single service-level CPE.
     os_cpe: str | None = None
+    # Additional OS CPE candidates derived from nmap's free-form
+    # ``<osmatch>`` name attribute. The structured ``<osclass><cpe>`` is
+    # typically generation-only ("linux_kernel:2.6") and NVD's
+    # virtualMatchString does not match generation-only CPEs against
+    # CVE config trees that pin specific version ranges
+    # (e.g. CVE-2009-2692 with versionEndExcluding=2.6.30.5). The
+    # parser walks osmatch.name for specific version anchors and stores
+    # them here so the host-OS enricher can query each in addition to
+    # the primary ``os_cpe``. Empty list when osmatch.name has no
+    # extra version info or when SMB-os-discovery overrode the OS CPE.
+    os_cpe_alts: list[str] = field(default_factory=list)
     ttl: int | None = None
     services: list[Service] = field(default_factory=list)
     traceroute: list[TracerouteHop] = field(default_factory=list)

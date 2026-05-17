@@ -14,6 +14,59 @@ from pathlib import Path
 from cauldron.graph.models import Host, ScanResult, ScriptResult, Service, TracerouteHop
 
 
+# Matches a version-like substring inside an osmatch ``name`` attribute
+# (e.g. "Linux 2.6.9 - 2.6.30" → ["2.6.9", "2.6.30"]). Greedy in the trailing
+# component count so the longest matching anchor wins; the dot-after-bound
+# (``2.``, ``2.0``, ``2.6.9``) keeps junk single-digit tokens out.
+_OSMATCH_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+){0,3})\b")
+
+
+def _osmatch_alt_cpes(osmatch_name: str | None, base_cpe: str | None) -> list[str]:
+    """Derive specific-version OS CPEs from an osmatch ``name`` string.
+
+    nmap's ``<osmatch>`` element exposes both a free-form ``name`` ("Linux
+    2.6.9 - 2.6.30") and a structured ``<osclass><cpe>`` that is typically
+    generation-only (``cpe:/o:linux:linux_kernel:2.6``, no minor). NVD's
+    ``virtualMatchString`` matches asymmetrically: a query with the
+    generation-only CPE misses every CVE whose config tree pins a specific
+    version range. CVE-2009-2692 (sock_sendpage) has
+    ``versionEndExcluding=2.6.30.5`` — querying ``linux_kernel:2.6`` does
+    not return it even though our kernel is in range; querying
+    ``linux_kernel:2.6.9`` does.
+
+    Walk the osmatch name for version anchors and synthesise additional
+    CPEs by overwriting the version slot of ``base_cpe``. The downstream
+    NVD ``virtualMatchString`` validates each anchor empirically — junk
+    anchors return zero CVEs and silently drop, so we don't need a static
+    "is this a valid kernel version" allow-list.
+
+    Returns a list of CPE 2.2 URIs (the form nmap emits), deduplicated and
+    excluding ``base_cpe`` itself. Returns an empty list when the base CPE
+    is malformed or the name has no version anchors.
+    """
+    if not osmatch_name or not base_cpe:
+        return []
+    parts = base_cpe.split(":")
+    # CPE 2.2 shape: ``cpe:/o:vendor:product[:version][:update][:edition]``.
+    # Need at least 4 parts to have a vendor:product to anchor against.
+    if len(parts) < 4 or parts[0] != "cpe":
+        return []
+    base_version = parts[4] if len(parts) > 4 else ""
+    prefix = ":".join(parts[:4])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _OSMATCH_VERSION_RE.finditer(osmatch_name):
+        v = m.group(1)
+        if v == base_version:
+            continue
+        cpe = f"{prefix}:{v}"
+        if cpe not in seen:
+            seen.add(cpe)
+            out.append(cpe)
+    return out
+
+
 def parse_nmap_xml(source: str | Path) -> ScanResult:
     """Parse an Nmap XML file into a ScanResult.
 
@@ -129,6 +182,14 @@ def _parse_host(elem: ET.Element) -> Host | None:
             osclass_cpe = osclass_elem.find("cpe")
             if osclass_cpe is not None and osclass_cpe.text:
                 host.os_cpe = osclass_cpe.text.strip()
+        # The osmatch ``name`` carries more specific version info than the
+        # structured ``<osclass><cpe>`` for kernel fingerprints (Linux
+        # "2.6.9 - 2.6.30" vs osclass "2.6"). NVD's virtualMatchString does
+        # not match generation-only kernel CPEs against config-tree ranges
+        # like ``versionEndExcluding=2.6.30.5``; the specific-version
+        # anchors below fill that gap. Always populated when a base CPE
+        # exists; the helper returns [] when there are no extra anchors.
+        host.os_cpe_alts = _osmatch_alt_cpes(host.os_name, host.os_cpe)
 
     # Ports & Services
     for port_elem in elem.findall("ports/port"):
@@ -196,6 +257,14 @@ def _parse_host(elem: ET.Element) -> Host | None:
             # host-level OS CPE so the host-OS enricher queries the
             # specific build NVD knows about.
             host.os_cpe = smb_os_cpe
+            # The osmatch-derived alternative CPEs (kernel version anchors
+            # from the free-form osmatch.name) are now stale: SMB-os-discovery
+            # may have overridden a Linux fingerprint with a Windows one,
+            # or vice versa, so anchors against the previous base CPE no
+            # longer apply. Windows OS CPEs encode the major version in the
+            # product slot (``windows_7``, ``windows_server_2012``) rather
+            # than the version slot, so no alt anchors are needed here.
+            host.os_cpe_alts = []
             # Attach the OS CPE to SMB-stack services (139 netbios-ssn,
             # 445 microsoft-ds). These are the surfaces where OS-level
             # CVEs (MS17-010, MS08-067, SMBGhost) are exploited, so the
