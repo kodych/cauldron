@@ -138,27 +138,26 @@ deliberately).
 
 ## Architecture
 
-```
-┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  Nmap XML   │────▶│   Parsers    │────▶│   Neo4j graph    │
-│  Masscan    │     │  + ingestion │     │   Host / Svc /   │
-└─────────────┘     └──────────────┘     │   Vuln / Path    │
-                                          └────────┬─────────┘
-                    ┌──────────────┐               │
-                    │  NVD / KEV / │◀──────────────┤
-                    │  EPSS / NSE  │     enrichment
-                    └──────────────┘               │
-                    ┌──────────────┐               │
-                    │  Claude AI   │◀──────────────┤
-                    │  triage +    │   anonymized
-                    │  attack chains│  context
-                    └──────────────┘               │
-                                                   │
-                    ┌──────────────┐               │
-                    │  Web UI      │◀──────────────┘
-                    │  React +     │       FastAPI
-                    │  Sigma.js    │
-                    └──────────────┘
+```mermaid
+flowchart LR
+    subgraph SCAN["Scan sources"]
+        N[Nmap XML]
+        M[Masscan XML / JSON]
+    end
+    P["Parsers<br/>+ Ingestion"]
+    G[("Neo4j Graph<br/>Host · Service<br/>Vuln · Path")]
+    NVD["NVD / CISA KEV<br/>EPSS / NSE scripts"]
+    EXP["ExploitIndex<br/>Metasploit · Exploit-DB"]
+    AI["Claude AI<br/>Phase 1: CPE inference<br/>Phase 3: FP triage"]
+    UI["Web UI<br/>React 19 + Sigma.js"]
+
+    N --> P
+    M --> P
+    P --> G
+    G <-->|enrichment| NVD
+    G <-->|exploit availability| EXP
+    G <-->|anonymized context| AI
+    G -->|FastAPI| UI
 ```
 
 For deeper detail, see [docs/architecture.md](docs/architecture.md).
