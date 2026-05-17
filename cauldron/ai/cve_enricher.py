@@ -2916,7 +2916,8 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
         with get_session() as session:
             record = session.run(
                 "MATCH (h:Host {ip: $ip}) "
-                "RETURN h.os_cpe AS os_cpe, h.os_accuracy AS os_accuracy",
+                "RETURN h.os_cpe AS os_cpe, h.os_accuracy AS os_accuracy, "
+                "coalesce(h.os_cpe_alts, []) AS os_cpe_alts",
                 ip=ip,
             ).single()
 
@@ -2927,6 +2928,7 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
 
         cpe22 = record.get("os_cpe")
         os_accuracy = record.get("os_accuracy")
+        alt_cpe22s = list(record.get("os_cpe_alts") or [])
 
         if not owned:
             # Un-own — purge AV:L host-OS edges. AV:N stays; the next
@@ -2987,9 +2989,19 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
             stats["no_os_cpe"] = True
             return stats
 
+        # Mirror the primary-plus-alts merge from enrich_host_os_from_graph
+        # so AV:L LPEs that only NVD-match against a specific version anchor
+        # (e.g. sock_sendpage CVE-2009-2692 against linux_kernel:2.6.9, not
+        # the generation-only 2.6) actually surface on Mark-as-Owned.
+        alt_cpe23s: list[str] = []
+        for alt22 in alt_cpe22s:
+            alt23 = _cpe22_to_23(alt22)
+            if alt23 and alt23 != cpe23 and alt23 not in alt_cpe23s:
+                alt_cpe23s.append(alt23)
+
         cache = CVECache()
-        cached = cache.get(cpe23)
-        if cached is None:
+        primary_cached = cache.get(cpe23)
+        if primary_cached is None:
             stats["cache_miss"] = True
             logger.warning(
                 "Mark-as-Owned re-enrichment: cache cold for %s (%s) — "
@@ -2998,7 +3010,17 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
             )
             return stats
 
-        av_l_cves = [c for c in cached if _cve_is_av_local(c)]
+        merged: dict[str, CVEInfo] = {}
+        for cve in primary_cached:
+            merged.setdefault(cve.cve_id, cve)
+        for alt23 in alt_cpe23s:
+            alt_cached = cache.get(alt23)
+            if alt_cached is None:
+                continue
+            for cve in alt_cached:
+                merged.setdefault(cve.cve_id, cve)
+
+        av_l_cves = [c for c in merged.values() if _cve_is_av_local(c)]
         if not av_l_cves:
             logger.info(
                 "Mark-as-Owned re-enrichment: %s — cache has %d CVEs, "
