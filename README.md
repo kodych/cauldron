@@ -179,6 +179,29 @@ All settings are environment variables prefixed with `CAULDRON_`. See
 | `CAULDRON_SEGMENT_PREFIX_LEN` | `24` | Default subnet width for segmentation |
 | `CAULDRON_CORS_ORIGINS` | _local dev_ | Override allowed CORS origins |
 
+## Troubleshooting
+
+- **`Cannot connect to the Docker daemon`** — `sudo systemctl start
+  docker`, or check that your user is in the `docker` group (you may
+  need to log out / back in even after `newgrp docker`).
+- **Port 7474 or 8000 already in use** — another local service is
+  holding the port. Either stop it or change the host-side mapping
+  in [docker-compose.yml](docker-compose.yml) (e.g. `8001:8000`).
+- **Neo4j unhealthy on first start** — the JVM needs ~30 s on cold
+  boot. `docker compose ps` should clear it; if not, `docker compose
+  logs neo4j` will show the heap / pagecache error.
+- **NVD enrichment is slow without a key** — the unauthenticated tier
+  is 5 requests / 30 s; a key bumps that to 50 / 30 s. Grab one (free)
+  at https://nvd.nist.gov/developers/request-an-api-key and set
+  `CAULDRON_NVD_API_KEY` in `.env`.
+- **AI phases skipped** — check the `boil` output for
+  `CAULDRON_ANTHROPIC_API_KEY not set`. Set it in `.env` (Path A) or
+  export it in your shell (Path B), then re-run `cauldron boil --ai`.
+- **Bind to LAN, not just localhost** — edit
+  [docker-compose.yml](docker-compose.yml) and change `"8000:8000"`
+  to `"0.0.0.0:8000:8000"`. Cauldron ships **without authentication**,
+  so do this only on a trusted Kali / lab segment.
+
 ## Development
 
 ```bash
