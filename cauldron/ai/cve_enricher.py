@@ -623,6 +623,14 @@ _BANNER_TOKEN_RE = re.compile(r"\b([A-Za-z][\w.-]{1,})/(\d[\w.-]*)")
 # anchoring at letter-to-digit transitions.
 _BARE_VERSION_RE = re.compile(r"(?<!\d)(\d+\.\d+(?:\.\d+){0,3}[a-z]?)(?!\d)")
 
+# Identifier-shaped alpha-leading tokens >= 5 chars. Hyphens split on
+# purpose so "Red-Hat" splits into "Red"(3) + "Hat"(3) and both fall
+# below the threshold — the rare distro-name embed in extrainfo
+# shouldn't synthesise CPE candidates. Underscores stay inside the
+# token so "mod_ssl" survives intact and the dedup pass below can
+# match it against an existing paired-token candidate.
+_BARE_PRODUCT_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,}")
+
 # Same shape but space-separated: "Drupal 7" from http-generator NSE output,
 # "Samba 2.2.1a" from smb-os-discovery, "IIS 7.5" from http-server-header.
 # Stricter than the slash form because plain prose is full of "Word number"
@@ -642,6 +650,34 @@ _BANNER_TOKEN_SPACE_RE = re.compile(r"(?:^|[\s(\[])([A-Z][\w.-]{2,})\s+(\d[\w.-]
 # Value = canonical CPE 2.3 string, or "" sentinel meaning "queried, NVD has
 # no record" -- both avoid repeat lookups within a single boil --nvd run.
 _cpe_resolution_cache: dict[tuple[str, str], str] = {}
+
+
+def _extract_bare_product_names(*sources: str | None) -> list[str]:
+    """Pull every alpha-leading identifier token out of free-form text.
+
+    Symmetric counterpart to ``_extract_bare_versions``. Used when a
+    Service has a known ``version`` but extra_info carries an unpaired
+    product alias the banner-token regex can't extract (port 10000:
+    ``product="MiniServ" version="1.890" extrainfo="Webmin httpd"`` -
+    "Webmin" never reaches the candidate list because it has no
+    version glued to it). Each name returned here gets paired with
+    the service's known version downstream.
+
+    De-duplicates case-insensitively and preserves first-seen ordering
+    so callers can iterate deterministically.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for src in sources:
+        if not src:
+            continue
+        for m in _BARE_PRODUCT_NAME_RE.finditer(src):
+            name = m.group(0)
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(name)
+    return out
 
 
 def _extract_bare_versions(*sources: str | None) -> list[str]:
@@ -914,6 +950,30 @@ def _build_cpe_candidates(
         product_slot = product.strip().lower()
         for v in _extract_bare_versions(extra_info, *script_outputs):
             _add(f"cpe:2.3:a:*:{product_slot}:{v}:*:*:*:*:*:*:*")
+
+    # Symmetric path: service has a version, extrainfo carries an
+    # unpaired product alias (port 10000: MiniServ 1.890 with extra=
+    # "Webmin httpd" - "Webmin" doesn't reach the candidates list
+    # because the banner-token regex requires a Name/Version pair).
+    # Tokenise extra_info for alpha-leading >= 5-char identifiers,
+    # pair each with the known version, emit cpe with wildcard vendor.
+    # NVD's virtualMatchString resolves the vendor downstream; junk
+    # tokens (protocol, Ubuntu, workgroup) self-filter via zero-result
+    # NVD responses, no static stop-list needed. Dedup against tokens
+    # already present in earlier candidates so a "mod_ssl/2.8.4" pair
+    # captured by _extract_banner_tokens doesn't spawn a redundant
+    # (and version-shifted) cpe:*:mod_ssl:<service_version> candidate.
+    if version and extra_info:
+        seen_lower = {
+            part.lower()
+            for cpe in candidates
+            for part in cpe.split(":")
+        }
+        for name in _extract_bare_product_names(extra_info):
+            name_l = name.lower()
+            if name_l in seen_lower:
+                continue
+            _add(f"cpe:2.3:a:*:{name_l}:{version}:*:*:*:*:*:*:*")
 
     return candidates
 
