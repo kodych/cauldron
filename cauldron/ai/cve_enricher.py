@@ -3085,7 +3085,7 @@ def reenrich_host_os_on_ownership(ip: str, owned: bool) -> dict:
             logger.info(
                 "Mark-as-Owned re-enrichment: %s — cache has %d CVEs, "
                 "none AV:L (no kernel privesc to add).",
-                ip, len(cached),
+                ip, len(merged),
             )
             return stats
 
