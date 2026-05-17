@@ -1212,6 +1212,20 @@ def _cve_is_gold(
     if host_os:
         if _cve_is_physical_only(cve):
             return False
+        # Host-OS severity floor. The kernel-CPE NVD universe is thousands
+        # of CVEs deep on legacy kernels; service-level queries see <100
+        # per product so a low-CVSS finding can still anchor a focused
+        # exploit chain. For host-OS, pentester engagements run through
+        # the high-severity band (CVSS 7+ LPE, RCE, real info disclosure);
+        # below 7 the marginal value of a partial info leak or capability
+        # bypass is overwhelmed by graph clutter on every owned host.
+        # Applied here -- before the actionable-exploit gate below -- so
+        # has_exploit is checked only on CVEs that already cleared the
+        # severity bar. Empirical effect on Linux 2.6.9: kernel-CVE
+        # universe shrinks from 413 to ~110 actionable findings, both
+        # canonical sock_sendpage / udp_sendmsg LPE CVEs retained.
+        if (cve.cvss or 0.0) < 7.0:
+            return False
     elif _cve_is_local_only(cve):
         return False
     if _cve_is_dos_only(cve):
@@ -1363,19 +1377,19 @@ def _query_nvd_cpe(
     # each tier. A low-CVSS CVE with a Metasploit module is more useful
     # than a high-CVSS theoretical one.
     cves.sort(key=_cve_priority_key)
-    # Result cap. The host-OS pass needs a larger window than service-level
-    # queries: the kernel CPE universe is thousands of CVEs deep and the
-    # priority-sorted band of CVSS 7-8 LPE bugs (the actionable post-foothold
-    # privesc tier) starts around position 20 on legacy kernels like Linux
-    # 2.6. Without a wider cap, sister LPE CVEs at the same CVSS tier (e.g.
-    # CVE-2009-2692 sock_sendpage at position 21 next to CVE-2009-2698
-    # udp_sendmsg at 22) get split by the cap and only one of the pair
-    # surfaces. 200 keeps the full actionable band on every Linux host-OS
-    # query while still bounding the per-host attachment. Service-level
-    # queries keep the historical 20/50 caps -- their universe is much
-    # smaller and the same band-splitting risk doesn't apply.
+    # Result cap. Service-level queries keep the historical 20/50 caps --
+    # their CVE universe is small (typically <100 per product) and the
+    # priority sort lands the actionable band well within 20. Host-OS
+    # queries are uncapped: the kernel-CPE universe is thousands of CVEs
+    # deep, but the high-severity gate inside ``_cve_is_gold``
+    # (CVSS >= 7.0 for host_os) already narrows the post-filter set to a
+    # manageable band. An arbitrary numerical cap on top of that is
+    # noise control without information value -- it would split sister
+    # LPE pairs (CVE-2009-2692 / 2698 sit at adjacent positions 21-22)
+    # on legacy kernels, and on modern kernels the filtered band fits
+    # well under any defensible cap anyway.
     if host_os:
-        return cves[:200]
+        return cves
     return cves[:20 if has_version else 50]
 
 
